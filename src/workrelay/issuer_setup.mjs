@@ -2,10 +2,10 @@
 // Ordinary startup remains disabled pending independent issuer review.
 import { generateKeyPairSync, randomBytes } from 'node:crypto';
 import { openSync, closeSync, fstatSync, readFileSync, writeFileSync, lstatSync,
-  unlinkSync, linkSync, fsyncSync, renameSync, constants } from 'node:fs';
-import { join, resolve } from 'node:path';
+  unlinkSync, linkSync, fsyncSync, renameSync, readdirSync, constants } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { privateDirectory, provisionLocalHuman } from './issuer_interactions.mjs';
+import { privateDirectory, provisionLocalHuman, hashLocalHumanPassword } from './issuer_interactions.mjs';
 import { CHATGPT_CIMD_ID, CHATGPT_CIMD_REDIRECT } from './issuer_policy.mjs';
 
 const error = () => Error('private issuer setup unavailable');
@@ -14,13 +14,13 @@ const filename = 'issuer.json';
 const related = ['issuer.sqlite', 'issuer.sqlite-wal', 'issuer.sqlite-shm', 'issuer.sqlite-journal',
   'interactions.sqlite', 'interactions.sqlite-wal', 'interactions.sqlite-shm', 'interactions.sqlite-journal'];
 
-function readPrivate(path, maxBytes = 200000) {
+function readPrivate(path, maxBytes = 200000, readContent = true) {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const stat = fstatSync(fd), link = lstatSync(path);
     if (!stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o077) ||
         stat.size > maxBytes || stat.dev !== link.dev || stat.ino !== link.ino) throw error();
-    return readFileSync(fd, { encoding: 'utf8' });
+    return readContent ? readFileSync(fd, { encoding: 'utf8' }) : undefined;
   } finally { closeSync(fd); }
 }
 
@@ -44,7 +44,12 @@ function freshSigningKey() {
   return { ...privateJwk, kid: randomBytes(24).toString('base64url'), alg: 'RS256', use: 'sig' };
 }
 
-function writeNewPrivate(directory, name, value) {
+function syncDirectory(directory) {
+  const fd = openSync(directory, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try { fsyncSync(fd); } finally { closeSync(fd); }
+}
+
+function writeNewPrivate(directory, name, value, { raw = false, onCreated } = {}) {
   privateDirectory(directory);
   const path = join(directory, name);
   // No overwrites. A temp file in the same private directory is fully written
@@ -53,21 +58,23 @@ function writeNewPrivate(directory, name, value) {
   const temporary = join(directory, `.issuer-setup-${randomBytes(16).toString('hex')}`);
   const fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
   try {
-    writeFileSync(fd, JSON.stringify(value));
+    writeFileSync(fd, raw ? value : JSON.stringify(value));
     const stat = fstatSync(fd);
     if (!stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o077)) throw error();
     // link(2) is exclusive; rename(2) would overwrite a concurrent setup.
     fsyncSync(fd);
     privateDirectory(directory);
     linkSync(temporary, path);
+    onCreated?.(path, fstatSync(fd));
+    syncDirectory(directory);
   } finally { closeSync(fd); unlinkSync(temporary); }
-  readPrivate(path);
+  readPrivate(path, 200000, !raw);
 }
 
 // For tests, a synthetic human.json may be prepared in a disposable directory.
 // In production this function only accepts an already TTY-provisioned verifier.
 export function finalizeIssuerSetup({ directory, accountId, origin, clientId, redirectUris,
-  clientRegistration = 'static' }) {
+  clientRegistration = 'static', onCreated }) {
   publicInputs({ origin, clientId, redirectUris, clientRegistration });
   if (!idPattern.test(accountId)) throw error();
   privateDirectory(directory);
@@ -79,9 +86,70 @@ export function finalizeIssuerSetup({ directory, accountId, origin, clientId, re
   if (human.accountId !== accountId || typeof human.verifier !== 'string' ||
       !human.verifier.startsWith('$argon2id$')) throw Error('human account mismatch');
   writeNewPrivate(directory, filename, { version: 1, accountId, origin, jwks: { keys: [freshSigningKey()] },
-    cookieKeys: [randomBytes(48).toString('base64url')], clientId, redirectUris, clientRegistration });
+    cookieKeys: [randomBytes(48).toString('base64url')], clientId, redirectUris, clientRegistration }, { onCreated });
   return { issuer_mode: 'self-hosted', issuer_state_dir: directory, public_origin: origin,
     issuer: origin, audience: `${origin}/mcp`, principal: accountId, clientId, redirectUris, clientRegistration };
+}
+
+// Explicit local non-interactive alternative: the secret is generated here,
+// never supplied as an argument/env var or returned to stdout. The caller
+// retrieves it only from the explicitly named mode-0600 delivery file, which
+// may be outside the private issuer state (e.g. an owner-only sync directory).
+export async function provisionGeneratedChatGPT({ directory, origin, deliveryFile, random = randomBytes,
+  beforeWrite, afterWrite } = {}) {
+  publicInputs({ origin, clientId: CHATGPT_CIMD_ID, redirectUris: [CHATGPT_CIMD_REDIRECT],
+    clientRegistration: 'chatgpt-cimd' });
+  const sourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+  if (typeof directory !== 'string' || directory === sourceRoot || directory.startsWith(`${sourceRoot}/`) ||
+      typeof deliveryFile !== 'string' || deliveryFile === sourceRoot ||
+      deliveryFile.startsWith(`${sourceRoot}/`))
+    throw Error('generated issuer state and delivery must be outside the project');
+  privateDirectory(directory);
+  if (deliveryFile !== resolve(deliveryFile) ||
+      deliveryFile === directory || deliveryFile.startsWith(`${directory}/`) ||
+      deliveryFile !== join(dirname(deliveryFile), basename(deliveryFile)))
+    throw Error('normalized external private delivery path required');
+  const deliveryDirectory = dirname(deliveryFile);
+  privateDirectory(deliveryDirectory);
+  try { lstatSync(deliveryFile); throw Error('existing delivery file; no overwrite'); }
+  catch (e) { if (e.code !== 'ENOENT') throw e; }
+  if (readdirSync(directory).length !== 0) throw Error('existing issuer state; no overwrite');
+  const accountId = randomBytes(24).toString('base64url');
+  const created = [];
+  const onCreated = (path, identity) => created.push({ path, dev: identity.dev, ino: identity.ino });
+  let entropy, password;
+  try {
+    entropy = random(48);
+    if (!Buffer.isBuffer(entropy) || entropy.length !== 48) throw Error('invalid generated entropy');
+    password = Buffer.from(entropy.toString('base64url'), 'utf8');
+    const verifier = await hashLocalHumanPassword(password);
+    beforeWrite?.(basename(deliveryFile));
+    writeNewPrivate(deliveryDirectory, basename(deliveryFile), password, { raw: true, onCreated });
+    beforeWrite?.('human.json');
+    writeNewPrivate(directory, 'human.json', { accountId, verifier }, { onCreated });
+    beforeWrite?.(filename);
+    finalizeIssuerSetup({ directory, accountId, origin, clientId: CHATGPT_CIMD_ID,
+      redirectUris: [CHATGPT_CIMD_REDIRECT], clientRegistration: 'chatgpt-cimd', onCreated });
+    syncDirectory(directory);
+    afterWrite?.();
+    return { status: 'provisioned', path: deliveryFile };
+  } catch {
+    // Only remove inodes this attempt created; never remove a concurrent
+    // replacement or pre-existing credential, including after partial setup.
+    for (const entry of created.reverse()) {
+      try {
+        const current = lstatSync(entry.path);
+        if (current.isFile() && current.dev === entry.dev && current.ino === entry.ino)
+          unlinkSync(entry.path);
+      } catch (cleanupError) { if (cleanupError.code !== 'ENOENT') throw error(); }
+    }
+    syncDirectory(directory);
+    syncDirectory(deliveryDirectory);
+    throw error();
+  } finally {
+    password?.fill(0);
+    entropy?.fill(0);
+  }
 }
 
 export function issuerReferences(directory) {
@@ -149,10 +217,18 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   } else if (verb === 'rotate' && process.argv.length === 4 && process.stdin.isTTY && process.stdout.isTTY) {
     try { rotateIssuer({ directory }); console.log('Offline issuer keys rotated; private backup retained.'); }
     catch { console.error('Offline issuer rotation refused; no active state may be present.'); process.exitCode = 1; }
+  } else if (verb === 'init-chatgpt-cimd-generated' && process.argv.length === 6) {
+    try {
+      const result = await provisionGeneratedChatGPT({ directory, origin, deliveryFile: clientId });
+      console.log(`Issuer ${result.status}; owner-only password file: ${result.path}`);
+    } catch {
+      console.error('Generated issuer setup refused; inspect private state offline before retrying.');
+      process.exitCode = 1;
+    }
   } else if (!((verb === 'init' && process.argv.length === 7) ||
       (verb === 'init-chatgpt-cimd' && process.argv.length === 5)) ||
       !process.stdin.isTTY || !process.stdout.isTTY) {
-    console.error('Usage: node issuer_setup.mjs reference PRIVATE_DIR; or local TTY: node issuer_setup.mjs init PRIVATE_DIR HTTPS_ORIGIN CLIENT_ID EXACT_HTTPS_REDIRECT; node issuer_setup.mjs init-chatgpt-cimd PRIVATE_DIR HTTPS_ORIGIN; node issuer_setup.mjs rotate PRIVATE_DIR (unused issuer only)');
+    console.error('Usage: node issuer_setup.mjs reference PRIVATE_DIR; node issuer_setup.mjs init-chatgpt-cimd-generated PRIVATE_DIR HTTPS_ORIGIN PRIVATE_DELIVERY_FILE; or local TTY: node issuer_setup.mjs init PRIVATE_DIR HTTPS_ORIGIN CLIENT_ID EXACT_HTTPS_REDIRECT; node issuer_setup.mjs init-chatgpt-cimd PRIVATE_DIR HTTPS_ORIGIN; node issuer_setup.mjs rotate PRIVATE_DIR (unused issuer only)');
     process.exitCode = 2;
   } else {
     try {

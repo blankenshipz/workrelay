@@ -57,6 +57,11 @@ function send(res, status, body = '') {
 
 // No programmatic password argument: only an interactive terminal may create
 // or rotate the single human verifier. No default password or account ID.
+export async function hashLocalHumanPassword(password) {
+  if (!Buffer.isBuffer(password) || password.length < 16 || password.length > 256)
+    throw Error('password length invalid');
+  return argon2.hash(password, { type: argon2.argon2id });
+}
 export async function provisionLocalHuman({ directory, accountId }) {
   if (!allowedId(accountId) || !process.stdin.isTTY || !process.stdout.isTTY) throw Error('local TTY and explicit account ID required');
   const path = statePath(directory, 'human.json');
@@ -80,8 +85,9 @@ export async function provisionLocalHuman({ directory, accountId }) {
     }
   } finally { stty('echo'); writeFileSync(tty, '\n'); closeSync(tty); }
   if (password.length < 16) throw Error('password length invalid');
-  const verifier = await argon2.hash(password, { type: argon2.argon2id });
-  password.fill(0);
+  let verifier;
+  try { verifier = await hashLocalHumanPassword(password); }
+  finally { password.fill(0); }
   // exclusive creation prevents accidental credential overwrite
   writeFileSync(path, JSON.stringify({ accountId, verifier }), { flag: 'wx', mode: 0o600 });
   privateDirectory(directory); privateFile(path);
