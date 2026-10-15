@@ -1,20 +1,25 @@
 // Model-free MCP HTTP facade. TLS is terminated by an explicitly configured tunnel/proxy;
-// this process MUST remain on loopback. There is no authorization server here.
+// this process MUST remain on loopback. Optional issuer routes require private provisioning.
 import { createServer } from 'node:http';
-import { readFileSync, statSync, lstatSync, openSync, fstatSync, readSync, writeSync, closeSync, fsyncSync, renameSync, unlinkSync, constants } from 'node:fs';
-import { createHash, randomBytes } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { Readable } from 'node:stream';
+import { readFileSync, statSync, lstatSync, realpathSync, openSync, fstatSync, readSync, writeSync, closeSync, fsyncSync, renameSync, unlinkSync, constants } from 'node:fs';
+import { createHash, createPublicKey, randomBytes } from 'node:crypto';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { resolve, dirname } from 'node:path';
+import { resolve, dirname, basename, join, parse } from 'node:path';
 import { McpServer, createMcpHandler, ProtocolError } from '@modelcontextprotocol/server';
 import { z } from 'zod';
-import { createRemoteJWKSet, jwtVerify } from 'jose';
+import { createLocalJWKSet, createRemoteJWKSet, jwtVerify } from 'jose';
 import { createEventsService } from './events.mjs';
+import { createIssuerAdapter } from './oidc_adapter.mjs';
+import { createUnexposedIssuerPolicy } from './issuer_policy.mjs';
+import { createLocalInteractions } from './issuer_interactions.mjs';
 const loopback = new Set(['127.0.0.1', '::1']);
 const key = z.string().regex(/^[A-Za-z0-9_-]{1,80}$/);
 const grantId = z.string().regex(/^grant_[0-9a-f]{32}$/);
 const text = z.string().trim().min(1).max(16000);
 const MAX_REQUEST_BYTES = 100000;
+const MAX_ISSUER_BYTES = 16384;
 const MAX_RESPONSE_BYTES = 2_000_000;
 async function relayResponse(response, req, res, abort) {
   const isSSE = response.headers.get('content-type')?.toLowerCase().startsWith('text/event-stream');
@@ -49,7 +54,7 @@ async function relayResponse(response, req, res, abort) {
   }
 }
 
-function boundedBody(req) {
+function boundedBody(req, limit = MAX_REQUEST_BYTES) {
   return new Promise((resolveBody, rejectBody) => {
     let bytes = 0;
     const parts = [];
@@ -61,7 +66,7 @@ function boundedBody(req) {
     };
     const data = chunk => {
       bytes += chunk.length;
-      if (bytes > MAX_REQUEST_BYTES) {
+      if (bytes > limit) {
         cleanup();
         req.resume(); // Drain without buffering so a keepalive connection cannot poison a later request.
         rejectBody(new Error('too_large'));
@@ -85,18 +90,35 @@ const schema = {
 
 export function validateConfig(config, { testIssuer = false } = {}) {
   if (!config || typeof config !== 'object') throw Error('invalid MCP configuration');
+  if (config.issuer_mode === 'self-hosted' && !config.issuer_state_dir)
+    throw Error('self-hosted issuer is not safely available without private state');
+  const publicProxy = config.issuer_mode === 'self-hosted' && config.issuer_exposure === 'public-proxy';
+  if (config.issuer_mode === 'self-hosted' && !['local-only', 'public-proxy'].includes(config.issuer_exposure))
+    throw Error('self-hosted issuer requires explicit exposure mode');
+  if (config.issuer_mode && !['external', 'self-hosted'].includes(config.issuer_mode)) throw Error('unknown issuer mode');
   const origin = new URL(config.public_origin);
-  const issuer = new URL(config.issuer);
+  const selfHosted = config.issuer_mode === 'self-hosted';
+  const issuer = new URL(selfHosted ? config.public_origin : config.issuer);
   if (origin.protocol !== 'https:' || origin.username || origin.password || origin.pathname !== '/' ||
       origin.search || origin.hash || issuer.username || issuer.password || issuer.search || issuer.hash ||
       (issuer.protocol !== 'https:' && !(testIssuer && issuer.protocol === 'http:' && loopback.has(issuer.hostname))))
     throw Error('canonical HTTPS public origin and trusted issuer required');
+  if (publicProxy && (config.public_origin !== origin.origin ||
+      config.issuer_public_proxy?.origin !== origin.origin ||
+      config.issuer_public_proxy?.acknowledge_tls_terminator_and_loopback_exclusivity !== true ||
+      !config.revocation_file || typeof config.revocation_file !== 'string' ||
+      !config.revocation_file.startsWith('/')))
+    throw Error('public-proxy issuer requires explicit origin, operator contract and revocation reference');
   if (!config.audience || typeof config.audience !== 'string' || !config.principal ||
       typeof config.principal !== 'string' || !key.safeParse(config.owner).success ||
       !config.bridge_config || typeof config.bridge_config !== 'string')
     throw Error('explicit audience, principal, owner and private bridge config required');
-  if (!config.jwks_uri || typeof config.jwks_uri !== 'string') throw Error('explicit issuer JWKS URI required');
-  const jwks = new URL(config.jwks_uri);
+  if (selfHosted && (typeof config.issuer_state_dir !== 'string' || !config.issuer_state_dir.startsWith('/') ||
+      config.issuer !== undefined && config.issuer !== origin.origin ||
+      config.jwks_uri !== undefined && config.jwks_uri !== `${origin.origin}/jwks` ||
+      config.audience !== `${origin.origin}/mcp`)) throw Error('invalid self-hosted issuer configuration');
+  if (!selfHosted && (!config.jwks_uri || typeof config.jwks_uri !== 'string')) throw Error('explicit issuer JWKS URI required');
+  const jwks = new URL(selfHosted ? `${origin.origin}/jwks` : config.jwks_uri);
   if (jwks.protocol !== issuer.protocol || jwks.hostname !== issuer.hostname || jwks.port !== issuer.port ||
       jwks.username || jwks.password || jwks.hash) throw Error('JWKS must be same-origin with issuer');
   if (!Number.isSafeInteger(config.port) || config.port < 1 || config.port > 65535)
@@ -115,11 +137,54 @@ export function validateConfig(config, { testIssuer = false } = {}) {
   return { ...config, public_origin: origin.origin, issuer: issuer.href.replace(/\/$/, ''), jwks_uri: jwks.href };
 }
 
+function privateIssuerFile(directory, name, maxBytes = 200000) {
+  try { return readPrivateIssuerFile(directory, name, maxBytes); }
+  catch { throw Error('private issuer unavailable'); }
+}
+
+function readPrivateIssuerFile(directory, name, maxBytes) {
+  if (!directory || !directory.startsWith('/') || resolve(directory) !== directory) throw Error('private issuer unavailable');
+  // SQLite opens its sidecars by pathname: no attacker-writable ancestor or
+  // caller-owned symlink may redirect the state directory during operation.
+  for (let path = directory; ; path = dirname(path)) {
+    const entry = lstatSync(path);
+    if (entry.isSymbolicLink()) {
+      if (entry.uid !== 0) throw Error('private issuer unavailable');
+    } else if (!entry.isDirectory() || ![0, process.getuid()].includes(entry.uid) || entry.mode & 0o022)
+      throw Error('private issuer unavailable');
+    if (path === parse(path).root) break;
+  }
+  const root = realpathSync(directory);
+  for (let path = root; ; path = dirname(path)) {
+    const entry = lstatSync(path);
+    if (!entry.isDirectory() || ![0, process.getuid()].includes(entry.uid) || entry.mode & 0o022)
+      throw Error('private issuer unavailable');
+    if (path === parse(path).root) break;
+  }
+  const state = lstatSync(directory);
+  if (state.isSymbolicLink() || state.uid !== process.getuid() || state.mode & 0o077)
+    throw Error('private issuer unavailable');
+  const file = join(directory, name);
+  const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const entry = fstatSync(fd);
+    if (!entry.isFile() || entry.uid !== process.getuid() || entry.mode & 0o077 || entry.size < 1 || entry.size > maxBytes)
+      throw Error('private issuer unavailable');
+    const bytes = Buffer.alloc(entry.size + 1);
+    if (readSync(fd, bytes, 0, bytes.length, 0) !== entry.size) throw Error('private issuer unavailable');
+    return JSON.parse(bytes.toString('utf8', 0, entry.size));
+  } finally { closeSync(fd); }
+}
+
 export function readPrivateConfig(path) {
-  const info = statSync(path);
-  if (!info.isFile() || info.uid !== process.getuid() || (info.mode & 0o077) !== 0)
-    throw Error('private MCP config permissions denied');
-  return validateConfig(JSON.parse(readFileSync(path, 'utf8')));
+  try {
+    if (typeof path !== 'string' || !path.startsWith('/') || resolve(path) !== path)
+      throw Error('unsafe private config path');
+    // Use the same protected ancestor chain as the optional issuer store.
+    // O_NOFOLLOW + fstat + one bounded descriptor read make the validated
+    // inode the one actually parsed, even if the pathname is later replaced.
+    return validateConfig(privateIssuerFile(dirname(path), basename(path), 131072));
+  } catch { throw Error('private MCP config permissions denied'); }
 }
 
 function bridge(config, command, input) {
@@ -193,6 +258,34 @@ function mcp(config, invoke, events) {
 
 export function createGateway(rawConfig, options = {}) {
   const config = validateConfig(rawConfig, options);
+  const publicProxy = config.issuer_mode === 'self-hosted' && config.issuer_exposure === 'public-proxy';
+  let issuerProvider = null, issuerInteraction = null, localJwks = null;
+  if (config.issuer_mode === 'self-hosted') {
+    const settings = privateIssuerFile(config.issuer_state_dir, 'issuer.json');
+    const human = privateIssuerFile(config.issuer_state_dir, 'human.json', 4096);
+    if (settings.version !== 1 || settings.accountId !== config.principal ||
+        settings.accountId !== human.accountId || settings.origin !== config.public_origin ||
+        typeof config.clientId !== 'string' || settings.clientId !== config.clientId ||
+        !Array.isArray(config.redirectUris) || config.redirectUris.length !== 1 ||
+        !Array.isArray(settings.redirectUris) || settings.redirectUris.length !== 1 ||
+        settings.redirectUris[0] !== config.redirectUris[0] ||
+        typeof human.verifier !== 'string' ||
+        !human.verifier.startsWith('$argon2id$')) throw Error('private issuer unavailable');
+    issuerProvider = createUnexposedIssuerPolicy({ origin: config.public_origin, principal: config.principal,
+      jwks: settings.jwks, cookieKeys: settings.cookieKeys, clientId: settings.clientId,
+      redirectUris: settings.redirectUris, adapter: createIssuerAdapter(config.issuer_state_dir),
+      findAccount: async (_ctx, id) => id === config.principal ? {
+        accountId: id, claims: async () => ({ sub: id }),
+      } : undefined });
+    localJwks = createLocalJWKSet({ keys: settings.jwks.keys.map(key => ({
+      ...createPublicKey({ key, format: 'jwk' }).export({ format: 'jwk' }),
+      kid: key.kid, alg: key.alg, use: 'sig',
+    })) });
+    issuerProvider.proxy = true; // trusted X-Forwarded-Proto is checked before these routes.
+    issuerInteraction = createLocalInteractions({ provider: issuerProvider,
+      directory: config.issuer_state_dir, origin: config.public_origin,
+      clientId: settings.clientId, resource: `${config.public_origin}/mcp` });
+  }
   // Local-admin-only file. Any token hash revocation conservatively disables
   // this sole principal and its subscriptions until an explicit admin re-enable.
   // There is no verified issuer disconnect hook or token-to-subscription map.
@@ -216,6 +309,18 @@ export function createGateway(rawConfig, options = {}) {
     } catch { return false; }
     finally { if (fd !== undefined) closeSync(fd); }
   };
+  if (publicProxy) {
+    if (!active()) throw Error('private revocation unavailable');
+    // Require actual private SQLite adapter admission before any listener exists.
+    // No credential or record content is supplied on argv or returned to logs.
+    const ready = spawnSync('/usr/bin/python3', ['-m', 'workrelay.oidc_store', config.issuer_state_dir], {
+      env: { PATH: '/usr/bin:/bin', PYTHONPATH: resolve(dirname(fileURLToPath(import.meta.url)), '..') },
+      input: JSON.stringify({ model: 'Issuer', action: 'find', id: 'startup-readiness' }),
+      encoding: 'utf8', timeout: 3000, maxBuffer: 256,
+    });
+    if (ready.error || ready.status !== 0 || ready.stdout.trim() !== 'null')
+      throw Error('private issuer store unavailable');
+  }
   const invoke = options.invoke ?? bridge;
   const authorized = async (_principal, task) => {
     if (!active() || !approved() || unsafeMarker || markerState() === 'pending' || !key.safeParse(task).success) return false;
@@ -327,11 +432,11 @@ export function createGateway(rawConfig, options = {}) {
     return null;
   }
   const handler = options.sdkHandler ?? createMcpHandler(() => mcp(config, invoke, events));
-  const jwks = createRemoteJWKSet(new URL(config.jwks_uri), { timeoutDuration: 3000, cooldownDuration: 1000 });
+  const jwks = localJwks ?? createRemoteJWKSet(new URL(config.jwks_uri), { timeoutDuration: 3000, cooldownDuration: 1000 });
   const metadataUrl = `${config.public_origin}/.well-known/oauth-protected-resource/mcp`;
   const resource = `${config.public_origin}/mcp`;
   const hostname = new URL(config.public_origin).host;
-  const localHost = `127.0.0.1:${config.port}`;
+  const localHostFor = address => address === '::1' ? `[::1]:${config.port}` : `127.0.0.1:${config.port}`;
   const metadata = JSON.stringify({ resource, authorization_servers: [config.issuer], scopes_supported: ['workrelay:tasks'],
     bearer_methods_supported: ['header'] });
   const failure = (res, code, reason) => {
@@ -339,16 +444,149 @@ export function createGateway(rawConfig, options = {}) {
       ...(code === 401 || code === 403 ? { 'WWW-Authenticate': `Bearer realm="workrelay", resource_metadata="${metadataUrl}", error="${reason}"` } : {}) });
     res.end(JSON.stringify({ error: reason }));
   };
+  const issuerCallback = issuerProvider?.callback();
+  const issuerHttp = issuerCallback && options.issuerTestWrap ?
+    options.issuerTestWrap(issuerCallback) : issuerCallback;
+  const pendingAdmissions = new Map();
+  async function admitIssuer(remote, kind) {
+    const pending = pendingAdmissions.get(kind) ?? 0;
+    // Cap simultaneous admission workers independently by route class so a
+    // discovery/revocation flood cannot starve an ordinary code exchange.
+    if (pending >= 8) return false;
+    pendingAdmissions.set(kind, pending + 1);
+    try { return await new Promise(resolveAdmission => {
+      const child = spawn('/usr/bin/python3', ['-m', 'workrelay.oidc_store', config.issuer_state_dir], {
+        env: { PATH: '/usr/bin:/bin', PYTHONPATH: resolve(dirname(fileURLToPath(import.meta.url)), '..') },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      let output = '', failed = false;
+      const timer = setTimeout(() => { failed = true; child.kill('SIGKILL'); }, 3000);
+      child.stdout.on('data', chunk => { output += chunk; if (output.length > 128) { failed = true; child.kill('SIGKILL'); } });
+      child.stderr.resume();
+      child.on('error', () => { failed = true; clearTimeout(timer); resolveAdmission(null); });
+      child.on('close', code => {
+        clearTimeout(timer);
+        if (failed || code !== 0) return resolveAdmission(null);
+        try { const value = JSON.parse(output); resolveAdmission(typeof value === 'boolean' ? value : null); }
+        catch { resolveAdmission(null); }
+      });
+      child.stdin.on('error', () => { failed = true; });
+      child.stdin.end(JSON.stringify({ model: 'Issuer', action: 'admit', id: remote, kind }));
+    }); } finally { pendingAdmissions.set(kind, pendingAdmissions.get(kind) - 1); }
+  }
   const server = createServer(async (req, res) => {
     // Never trust forwarded identity or a caller-supplied owner. The public Host is
     // canonical; the local Host is only available to a real loopback peer.
     const remote = req.socket.remoteAddress;
-    if (!loopback.has(remote) || ![hostname, localHost].includes(req.headers.host) ||
-        (req.headers.host === localHost && !loopback.has(remote)) ||
-        (req.headers.origin && req.headers.origin !== config.public_origin) ||
-        (req.headers['x-forwarded-host'] && req.headers['x-forwarded-host'] !== hostname) ||
-        (req.headers['x-forwarded-proto'] && req.headers['x-forwarded-proto'] !== 'https') ||
+    const localHost = localHostFor(remote);
+    const selfHosted = config.issuer_mode === 'self-hosted';
+    const rawNames = selfHosted ? req.rawHeaders.filter((_, index) => index % 2 === 0)
+      .map(name => name.toLowerCase()) : [];
+    const exclusiveHeaders = ['host', 'origin', 'content-length', 'transfer-encoding', 'content-type'];
+    if (!loopback.has(remote) ||
+        (selfHosted ? rawNames.filter(name => name === 'host').length !== 1 ||
+          exclusiveHeaders.some(name => rawNames.filter(value => value === name).length > 1) ||
+          rawNames.some(name => name === 'forwarded' || name === 'x-real-ip' || name.startsWith('x-forwarded-')) ||
+          req.headers.host !== (publicProxy ? hostname : localHost) ||
+          (req.headers.origin && req.headers.origin !== (publicProxy ? config.public_origin : `http://${localHost}`)) ||
+          (publicProxy && (typeof req.url !== 'string' || !req.url.startsWith('/') || req.url.startsWith('//') ||
+            req.url.length > 4096 || req.url.includes('#') || req.rawHeaders.reduce((size, part) =>
+              size + Buffer.byteLength(part), 0) > 8192 || req.headers['content-encoding'] ||
+            req.headers['transfer-encoding'] && req.headers['content-length'])) :
+          ![hostname, localHost].includes(req.headers.host) ||
+          (req.headers.origin && req.headers.origin !== config.public_origin) ||
+          (req.headers['x-forwarded-host'] && req.headers['x-forwarded-host'] !== hostname) ||
+          (req.headers['x-forwarded-proto'] && req.headers['x-forwarded-proto'] !== 'https')) ||
         req.headers.forwarded || req.headers['x-forwarded-prefix']) return failure(res, 400, 'invalid_origin');
+    if (publicProxy && !active()) return failure(res, 503, 'issuer_unavailable');
+    if (issuerHttp && req.url !== '/mcp' && req.url !== '/.well-known/oauth-protected-resource/mcp') {
+      // Locally accepted requests acquire the provider's HTTPS identity only
+      // after all client-supplied forwarding and public-Host claims are denied.
+      // This is a protocol fixture, not authorization to connect a tunnel.
+      const rejectIssuer = (code, reason) => {
+        res.setHeader('Connection', 'close');
+        req.resume();
+        return failure(res, code, reason);
+      };
+      if (typeof req.url !== 'string' || !req.url.startsWith('/') || req.url.startsWith('//') ||
+          req.url.length > 4096 || req.url.includes('#') ||
+          req.rawHeaders.reduce((size, part) => size + Buffer.byteLength(part), 0) > 8192 ||
+          req.headers['content-encoding']) return rejectIssuer(400, 'invalid_request');
+      const exclusiveIssuerHeaders = new Set(['host', 'origin', 'content-length', 'transfer-encoding',
+        'x-forwarded-host', 'x-forwarded-proto', 'content-type']);
+      const seen = new Set();
+      for (let index = 0; index < req.rawHeaders.length; index += 2) {
+        const header = req.rawHeaders[index].toLowerCase();
+        if (exclusiveIssuerHeaders.has(header) && seen.has(header)) return rejectIssuer(400, 'invalid_request');
+        seen.add(header);
+      }
+      let path;
+      try {
+        const url = new URL(req.url, config.public_origin);
+        if (url.origin !== config.public_origin) throw Error('invalid request target');
+        path = url.pathname;
+      } catch { return rejectIssuer(400, 'invalid_request'); }
+      const methods = path === '/auth' || /^\/auth\/[A-Za-z0-9._~-]{1,128}$/.test(path) ||
+        /^\/interaction\/[A-Za-z0-9._~-]{1,128}$/.test(path) ?
+        (path.startsWith('/interaction/') ? ['GET', 'POST'] : ['GET']) :
+        path === '/token' || path === '/token/revocation' ? ['POST', 'OPTIONS'] :
+        ['/jwks', '/.well-known/oauth-authorization-server', '/.well-known/openid-configuration'].includes(path) ?
+        ['GET', 'OPTIONS'] : [];
+      if (!methods.includes(req.method)) return rejectIssuer(methods.length ? 405 : 404, 'not_found');
+      if (req.headers['transfer-encoding']) return rejectIssuer(411, 'length_required');
+      const isPost = req.method === 'POST';
+      const length = req.headers['content-length'];
+      if (isPost && (length === undefined || !/^\d+$/.test(length)))
+        return rejectIssuer(411, 'length_required');
+      if (!isPost && length !== undefined && length !== '0') return rejectIssuer(400, 'invalid_request');
+      if (length !== undefined && Number(length) > MAX_ISSUER_BYTES)
+        return rejectIssuer(413, 'too_large');
+      if (isPost && !/^application\/x-www-form-urlencoded(?:;\s*charset=utf-8)?$/i.test(req.headers['content-type'] ?? ''))
+        return rejectIssuer(415, 'unsupported_encoding');
+      try {
+        const kind = path === '/auth' || path.startsWith('/auth/') ? 'authorization' :
+          path.startsWith('/interaction/') ? 'interaction' :
+          path === '/token' ? 'token' : path === '/token/revocation' ? 'revocation' : 'discovery';
+        const admitted = await admitIssuer(remote, kind); // socket IP, never forwarded IP
+        if (admitted !== true) return rejectIssuer(admitted === false ? 429 : 503,
+          admitted === false ? 'rate_limited' : 'issuer_unavailable');
+        // The provider receives only a fully bounded body. Never hand it a
+        // live unbounded chunked stream, even on a route it does not know.
+        let checked = req;
+        if (isPost) {
+          const raw = await boundedBody(req, MAX_ISSUER_BYTES);
+          if (raw.length !== Number(length)) return rejectIssuer(400, 'invalid_body');
+          checked = Readable.from([raw]);
+          Object.assign(checked, { headers: req.headers, rawHeaders: req.rawHeaders, method: req.method,
+            url: req.url, socket: req.socket, connection: req.connection, httpVersion: req.httpVersion });
+        }
+        checked.headers = { ...checked.headers, host: hostname,
+          'x-forwarded-host': hostname, 'x-forwarded-proto': 'https',
+          ...(checked.headers.origin ? { origin: config.public_origin } : {}) };
+        if (await issuerInteraction(checked, res)) return;
+        return await issuerHttp(checked, res);
+      } catch (error) {
+        if (!res.headersSent) return rejectIssuer(error.message === 'too_large' ? 413 :
+          error.message === 'body_timeout' ? 408 : 400,
+        error.message === 'too_large' ? 'too_large' : 'invalid_request');
+        res.destroy(); return;
+      }
+    }
+    if (publicProxy) {
+      // The operator's TLS terminator is a local trust contract, not an
+      // authenticated fact inferable from a caller-controlled forwarding header.
+      // The issuer is still loopback-bound and JWT validation remains mandatory.
+      if (req.headers['content-length'] !== undefined &&
+          (!/^\d+$/.test(req.headers['content-length']) || Number(req.headers['content-length']) > MAX_REQUEST_BYTES))
+        return failure(res, 413, 'too_large');
+      if (req.url !== '/mcp' && req.url !== '/.well-known/oauth-protected-resource/mcp')
+        return failure(res, 404, 'not_found');
+      if (req.url === '/mcp' && !['GET', 'POST', 'DELETE'].includes(req.method))
+        return failure(res, 405, 'not_allowed');
+      if (req.method !== 'POST' &&
+          (req.headers['transfer-encoding'] || ![undefined, '0'].includes(req.headers['content-length'])))
+        return failure(res, 400, 'invalid_request');
+    }
     if (req.url === '/.well-known/oauth-protected-resource/mcp' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       return res.end(metadata);
@@ -398,6 +636,14 @@ export function createGateway(rawConfig, options = {}) {
     }
     catch { if (!res.headersSent) failure(res, 500, 'mcp_unavailable'); }
   });
+  if (config.issuer_mode === 'self-hosted') {
+    const listen = server.listen.bind(server);
+    server.listen = (port, host, callback) => {
+      if (port !== config.port || !loopback.has(host))
+        throw Error('self-hosted issuer requires explicit loopback binding');
+      return listen(port, host, callback);
+    };
+  }
   if (events) {
     let busy = false;
     let activeTick = Promise.resolve();

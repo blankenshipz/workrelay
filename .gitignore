@@ -1,4 +1,5 @@
 .bridge/
+.runtime/
 *.sqlite*
 __pycache__/
 *.pyc
