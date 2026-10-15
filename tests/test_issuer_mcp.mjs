@@ -479,6 +479,8 @@ db.execute('PRAGMA wal_checkpoint(TRUNCATE)');db.close()`, join(directory, 'issu
   await waitForGateway(publicCli, publicDiagnostics, 'ordinary public-proxy CLI');
   assert.equal((await request('/jwks', { headers: { host: `127.0.0.1:${port}` } })).response.status, 400);
   assert.equal((await request('/jwks', { headers: { 'x-forwarded-proto': 'https' } })).response.status, 400);
+  assert.equal((await request('/jwks', { headers: { 'x-forwarded-for': '198.51.100.17' } })).response.status, 400,
+    'public-proxy without XFF opt-in still rejects forwarding metadata');
   assert.equal((await request('/jwks', { headers: { forwarded: 'for=127.0.0.1;proto=https' } })).response.status, 400);
   assert.equal((await request('/jwks', { headers: { origin: 'https://wrong.example.test' } })).response.status, 400);
   const rawStatus = async requestText => new Promise((resolve, reject) => {
@@ -541,7 +543,7 @@ db.execute('PRAGMA wal_checkpoint(TRUNCATE)');db.close()`, join(directory, 'issu
     redirectUris: [CHATGPT_CIMD_REDIRECT], clientRegistration: 'chatgpt-cimd' }));
   const cimdConfig = { ...publicConfig,
     issuer_public_proxy: { ...publicConfig.issuer_public_proxy,
-      require_parsed_x_forwarded_proto_https: true }, clientId: CHATGPT_CIMD_ID,
+      require_parsed_x_forwarded_proto_https: true, discard_validated_x_forwarded_for: true }, clientId: CHATGPT_CIMD_ID,
     redirectUris: [CHATGPT_CIMD_REDIRECT], clientRegistration: 'chatgpt-cimd' };
   await fs.writeFile(publicConfigPath, JSON.stringify(cimdConfig));
   const fixturePath = join(directory, 'client-document-fixture.mjs');
@@ -562,6 +564,24 @@ db.execute('PRAGMA wal_checkpoint(TRUNCATE)');db.close()`, join(directory, 'issu
   parsedProxyMode = true;
   const cimdDiagnostics = observeChild(cimdCli);
   await waitForGateway(cimdCli, cimdDiagnostics, 'ordinary CIMD public-proxy CLI');
+  assert.equal((await request('/jwks', { headers: { 'x-forwarded-for': '198.51.100.17' } })).response.status, 200,
+    'explicit public-proxy contract admits Cloudflare XFP plus XFF without trusting client identity');
+  assert.equal((await request('/jwks', { headers: { 'x-forwarded-for': '198.51.100.17, 2001:db8::1' } })).response.status, 200);
+  for (const value of ['', 'unknown', '198.51.100.17,', '198.51.100.17:443', '[2001:db8::1]',
+    'fe80::1%lo0', '198.51.100.17 192.0.2.1', Array(9).fill('192.0.2.1').join(','), '1'.repeat(513)]) {
+    assert.equal((await request('/jwks', { headers: { 'x-forwarded-for': value } })).response.status, 400,
+      'malformed or over-budget XFF rejected');
+  }
+  assert.equal(await rawStatus('GET /jwks HTTP/1.1\r\nHost: workrelay.example.test\r\nX-Forwarded-Proto: https\r\nX-Forwarded-For: 192.0.2.1\r\nx-FoRwArDeD-fOr: 192.0.2.2\r\n\r\n'), 400);
+  assert.equal(await rawStatus('GET /jwks HTTP/1.1\r\nHost: workrelay.example.test\r\nX-Forwarded-For: 192.0.2.1\r\n\r\n'), 400,
+    'XFF cannot substitute for required HTTPS proto');
+  for (const address of ['127.0.0.1', '198.51.100.17', '2001:db8::1']) {
+    const challenge = await request('/mcp', { method: 'POST', headers: {
+      'x-forwarded-for': address, 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 24, method: 'tools/list', params: {} }) });
+    assert.equal(challenge.response.status, 401, 'forged client address never grants authorization');
+    assert.ok(challenge.response.headers.get('www-authenticate')?.includes('Bearer'));
+  }
   assert.equal((await request('/jwks', { headers: { 'x-forwarded-proto': 'HTTPS' } })).response.status, 400);
   assert.equal((await request('/jwks', { headers: { 'x-forwarded-proto': 'http' } })).response.status, 400);
   assert.equal((await request('/jwks', { headers: { 'x-forwarded-proto': 'https,https' } })).response.status, 400);
@@ -631,6 +651,7 @@ db.execute('PRAGMA wal_checkpoint(TRUNCATE)');db.close()`, join(directory, 'issu
   const cimdToken = safeJson(cimdExchange.text, 'CIMD exchange').access_token;
   assert.ok(cimdToken);
   const cimdProfile = await request('/mcp', { method: 'POST', headers: {
+    'x-forwarded-for': '198.51.100.17',
     authorization: `Bearer ${cimdToken}`, 'content-type': 'application/json',
     accept: 'application/json, text/event-stream', 'mcp-protocol-version': '2025-11-25',
   }, body: JSON.stringify({ jsonrpc: '2.0', id: 22, method: 'tools/call',

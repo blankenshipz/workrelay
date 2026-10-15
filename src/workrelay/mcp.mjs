@@ -1,6 +1,7 @@
 // Model-free MCP HTTP facade. TLS is terminated by an explicitly configured tunnel/proxy;
 // this process MUST remain on loopback. Optional issuer routes require private provisioning.
 import { createServer } from 'node:http';
+import { isIP } from 'node:net';
 import { Readable } from 'node:stream';
 import { readFileSync, statSync, lstatSync, realpathSync, openSync, fstatSync, readSync, writeSync, closeSync, fsyncSync, renameSync, unlinkSync, constants } from 'node:fs';
 import { createHash, createPublicKey, randomBytes } from 'node:crypto';
@@ -488,12 +489,27 @@ export function createGateway(rawConfig, options = {}) {
     const proxyProtoCount = rawNames.filter(name => name === 'x-forwarded-proto').length;
     const requireProxyProto = publicProxy &&
       config.issuer_public_proxy?.require_parsed_x_forwarded_proto_https === true;
+    // XFF is untrusted transport metadata, never identity or a quota key.
+    // Only the explicitly acknowledged parsed-HTTPS proxy may opt in; validate
+    // a small IP-only list and discard it before any issuer/MCP handler runs.
+    const discardProxyFor = requireProxyProto &&
+      config.issuer_public_proxy?.discard_validated_x_forwarded_for === true;
+    const proxyForCount = rawNames.filter(name => name === 'x-forwarded-for').length;
+    const proxyFor = req.headers['x-forwarded-for'];
+    const validProxyFor = proxyForCount === 0 || discardProxyFor && proxyForCount === 1 &&
+      typeof proxyFor === 'string' && proxyFor.length <= 512 &&
+      proxyFor.split(',').length <= 8 && proxyFor.split(',').every(part => {
+        const ip = part.trim();
+        return !ip.includes('%') && isIP(ip) !== 0;
+      });
     const exclusiveHeaders = ['host', 'origin', 'content-length', 'transfer-encoding', 'content-type'];
     if (!loopback.has(remote) ||
         (selfHosted ? rawNames.filter(name => name === 'host').length !== 1 ||
           exclusiveHeaders.some(name => rawNames.filter(value => value === name).length > 1) ||
+          !validProxyFor ||
           rawNames.some(name => name === 'forwarded' || name === 'x-real-ip' ||
-            name.startsWith('x-forwarded-') && name !== 'x-forwarded-proto') ||
+            name.startsWith('x-forwarded-') && name !== 'x-forwarded-proto' &&
+              !(discardProxyFor && name === 'x-forwarded-for')) ||
           (requireProxyProto ? proxyProtoCount !== 1 || req.headers['x-forwarded-proto'] !== 'https' :
             proxyProtoCount !== 0) ||
           req.headers.host !== (publicProxy ? hostname : localHost) ||
@@ -507,6 +523,13 @@ export function createGateway(rawConfig, options = {}) {
           (req.headers['x-forwarded-host'] && req.headers['x-forwarded-host'] !== hostname) ||
           (req.headers['x-forwarded-proto'] && req.headers['x-forwarded-proto'] !== 'https')) ||
         req.headers.forwarded || req.headers['x-forwarded-prefix']) return failure(res, 400, 'invalid_origin');
+    if (discardProxyFor) {
+      delete req.headers['x-forwarded-for'];
+      req.rawHeaders = req.rawHeaders.reduce((headers, value, index, raw) => {
+        if (index % 2 === 0 && value.toLowerCase() !== 'x-forwarded-for') headers.push(value, raw[index + 1]);
+        return headers;
+      }, []);
+    }
     if (publicProxy && !active()) return failure(res, 503, 'issuer_unavailable');
     if (issuerHttp && req.url !== '/mcp' && req.url !== '/.well-known/oauth-protected-resource/mcp') {
       // Locally accepted requests acquire the provider's HTTPS identity only

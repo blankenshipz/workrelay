@@ -1,13 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { readPrivateConfig } from '../src/workrelay/mcp.mjs';
 
+// Use protected project-parent ancestry, outside the public candidate. System
+// temp directories can have writable ancestors that production rightly rejects.
+const fixtureParent = fileURLToPath(new URL('../../', import.meta.url));
+
 test('config path requires protected ancestry and an owned regular 0600 inode', async t => {
-  const root = await fs.mkdtemp(join(tmpdir(), 'workrelay-config-path-'));
+  const root = await fs.mkdtemp(join(fixtureParent, '.workrelay-config-path-'));
   await fs.chmod(root, 0o700);
   t.after(() => fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));
   const parent = join(root, 'private');
@@ -19,6 +23,10 @@ test('config path requires protected ancestry and an owned regular 0600 inode', 
     owner: 'person1', bridge_config: '/unused-fixture', port: 29450 });
   await fs.writeFile(file, fixture, { mode: 0o600 });
   assert.equal(readPrivateConfig(file).principal, 'person1');
+  await fs.chmod(root, 0o777);
+  assert.throws(() => readPrivateConfig(file), /private MCP config permissions denied/,
+    'writable ancestor rejected even when the immediate parent is private');
+  await fs.chmod(root, 0o700);
   await fs.chmod(parent, 0o777);
   assert.throws(() => readPrivateConfig(file), /private MCP config permissions denied/);
   await fs.chmod(parent, 0o700);
@@ -41,7 +49,7 @@ test('config path requires protected ancestry and an owned regular 0600 inode', 
 });
 
 test('two-process pathname swap cannot promote a symlink as private MCP config', async t => {
-  const root = await fs.mkdtemp(join(tmpdir(), 'workrelay-config-swap-'));
+  const root = await fs.mkdtemp(join(fixtureParent, '.workrelay-config-swap-'));
   await fs.chmod(root, 0o700);
   t.after(() => fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));
   const file = join(root, 'config.json');
@@ -54,6 +62,7 @@ test('two-process pathname swap cannot promote a symlink as private MCP config',
   await fs.writeFile(good, JSON.stringify(config), { mode: 0o600 });
   await fs.writeFile(target, JSON.stringify({ ...config, principal: 'other' }), { mode: 0o600 });
   await fs.copyFile(good, file);
+  assert.equal(readPrivateConfig(file).principal, 'person1', 'safe fixture accepted before pathname race');
   const writer = `import { promises as fs } from 'node:fs';
     const [file,good,target] = process.argv.slice(1);
     for (let i=0; i<150; i++) {
