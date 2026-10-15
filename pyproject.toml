@@ -1,0 +1,19 @@
+[project]
+name = "workrelay"
+version = "0.1.0"
+description = "Connect personal agents to OpenCode"
+requires-python = ">=3.10"
+
+[project.scripts]
+workrelay = "workrelay.cli:main"
+workrelay-attest = "workrelay.attestor:main"
+# Temporary compatibility for a previously installed local skill. Remove only
+# after private installation migration and a verified rollback window.
+agent-computer-bridge = "workrelay.cli:main"
+agent-computer-bridge-attest = "workrelay.attestor:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+workrelay = ["*.mjs"]
