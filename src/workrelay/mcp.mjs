@@ -269,11 +269,14 @@ export function createGateway(rawConfig, options = {}) {
         !Array.isArray(config.redirectUris) || config.redirectUris.length !== 1 ||
         !Array.isArray(settings.redirectUris) || settings.redirectUris.length !== 1 ||
         settings.redirectUris[0] !== config.redirectUris[0] ||
+        (settings.clientRegistration ?? 'static') !== (config.clientRegistration ?? 'static') ||
         typeof human.verifier !== 'string' ||
         !human.verifier.startsWith('$argon2id$')) throw Error('private issuer unavailable');
     issuerProvider = createUnexposedIssuerPolicy({ origin: config.public_origin, principal: config.principal,
       jwks: settings.jwks, cookieKeys: settings.cookieKeys, clientId: settings.clientId,
-      redirectUris: settings.redirectUris, adapter: createIssuerAdapter(config.issuer_state_dir),
+      redirectUris: settings.redirectUris, clientRegistration: settings.clientRegistration ?? 'static',
+      fetchClientDocument: options.fetchClientDocument,
+      adapter: createIssuerAdapter(config.issuer_state_dir),
       findAccount: async (_ctx, id) => id === config.principal ? {
         accountId: id, claims: async () => ({ sub: id }),
       } : undefined });

@@ -6,6 +6,7 @@ import { openSync, closeSync, fstatSync, readFileSync, writeFileSync, lstatSync,
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { privateDirectory, provisionLocalHuman } from './issuer_interactions.mjs';
+import { CHATGPT_CIMD_ID, CHATGPT_CIMD_REDIRECT } from './issuer_policy.mjs';
 
 const error = () => Error('private issuer setup unavailable');
 const idPattern = /^[A-Za-z0-9._~-]{1,128}$/;
@@ -23,15 +24,19 @@ function readPrivate(path, maxBytes = 200000) {
   } finally { closeSync(fd); }
 }
 
-function publicInputs({ origin, clientId, redirectUris }) {
+function publicInputs({ origin, clientId, redirectUris, clientRegistration = 'static' }) {
   if (typeof origin !== 'string' || origin.length > 2048 || !/^https:\/\//.test(origin) ||
       new URL(origin).origin !== origin || typeof clientId !== 'string' ||
       !/^[\x21-\x7e]{1,2048}$/.test(clientId) ||
       !Array.isArray(redirectUris) || redirectUris.length !== 1 ||
       redirectUris.some(uri => typeof uri !== 'string' || uri.length > 2048 ||
         !uri.startsWith('https://') || new URL(uri).href !== uri || new URL(uri).hash ||
-        new URL(uri).username || new URL(uri).password || new URL(uri).hostname.includes('*'))) throw Error('exact HTTPS origin/client/redirect required');
-  return { origin, clientId, redirectUris };
+         new URL(uri).username || new URL(uri).password || new URL(uri).hostname.includes('*')) ||
+       !['static', 'chatgpt-cimd'].includes(clientRegistration) ||
+       clientRegistration === 'chatgpt-cimd' &&
+         (clientId !== CHATGPT_CIMD_ID || redirectUris[0] !== CHATGPT_CIMD_REDIRECT))
+    throw Error('exact HTTPS origin/client/redirect required');
+  return { origin, clientId, redirectUris, clientRegistration };
 }
 
 function freshSigningKey() {
@@ -61,8 +66,9 @@ function writeNewPrivate(directory, name, value) {
 
 // For tests, a synthetic human.json may be prepared in a disposable directory.
 // In production this function only accepts an already TTY-provisioned verifier.
-export function finalizeIssuerSetup({ directory, accountId, origin, clientId, redirectUris }) {
-  publicInputs({ origin, clientId, redirectUris });
+export function finalizeIssuerSetup({ directory, accountId, origin, clientId, redirectUris,
+  clientRegistration = 'static' }) {
+  publicInputs({ origin, clientId, redirectUris, clientRegistration });
   if (!idPattern.test(accountId)) throw error();
   privateDirectory(directory);
   for (const name of [filename, ...related]) {
@@ -73,16 +79,16 @@ export function finalizeIssuerSetup({ directory, accountId, origin, clientId, re
   if (human.accountId !== accountId || typeof human.verifier !== 'string' ||
       !human.verifier.startsWith('$argon2id$')) throw Error('human account mismatch');
   writeNewPrivate(directory, filename, { version: 1, accountId, origin, jwks: { keys: [freshSigningKey()] },
-    cookieKeys: [randomBytes(48).toString('base64url')], clientId, redirectUris });
+    cookieKeys: [randomBytes(48).toString('base64url')], clientId, redirectUris, clientRegistration });
   return { issuer_mode: 'self-hosted', issuer_state_dir: directory, public_origin: origin,
-    issuer: origin, audience: `${origin}/mcp`, principal: accountId, clientId, redirectUris };
+    issuer: origin, audience: `${origin}/mcp`, principal: accountId, clientId, redirectUris, clientRegistration };
 }
 
 export function issuerReferences(directory) {
   privateDirectory(directory);
-  const { version, accountId, origin, clientId, redirectUris, jwks, cookieKeys } =
+  const { version, accountId, origin, clientId, redirectUris, clientRegistration = 'static', jwks, cookieKeys } =
     JSON.parse(readPrivate(join(directory, filename)));
-  publicInputs({ origin, clientId, redirectUris });
+  publicInputs({ origin, clientId, redirectUris, clientRegistration });
   const human = JSON.parse(readPrivate(join(directory, 'human.json'), 4096));
   if (version !== 1 || !idPattern.test(accountId) || !Array.isArray(jwks?.keys) ||
       jwks.keys.length !== 1 || !jwks.keys[0].d ||
@@ -91,7 +97,7 @@ export function issuerReferences(directory) {
       !Array.isArray(cookieKeys) || cookieKeys.length !== 1 || cookieKeys[0].length < 32 ||
       human.accountId !== accountId || !human.verifier?.startsWith('$argon2id$')) throw error();
   return { issuer_mode: 'self-hosted', issuer_state_dir: directory, public_origin: origin,
-    issuer: origin, audience: `${origin}/mcp`, principal: accountId, clientId, redirectUris };
+    issuer: origin, audience: `${origin}/mcp`, principal: accountId, clientId, redirectUris, clientRegistration };
 }
 
 // Pre-start rotation only. Running or previously started issuers have durable
@@ -143,12 +149,18 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   } else if (verb === 'rotate' && process.argv.length === 4 && process.stdin.isTTY && process.stdout.isTTY) {
     try { rotateIssuer({ directory }); console.log('Offline issuer keys rotated; private backup retained.'); }
     catch { console.error('Offline issuer rotation refused; no active state may be present.'); process.exitCode = 1; }
-  } else if (verb !== 'init' || process.argv.length !== 7 || !process.stdin.isTTY || !process.stdout.isTTY) {
-    console.error('Usage: node issuer_setup.mjs reference PRIVATE_DIR; or local TTY: node issuer_setup.mjs init PRIVATE_DIR HTTPS_ORIGIN CLIENT_ID EXACT_HTTPS_REDIRECT; node issuer_setup.mjs rotate PRIVATE_DIR (unused issuer only)');
+  } else if (!((verb === 'init' && process.argv.length === 7) ||
+      (verb === 'init-chatgpt-cimd' && process.argv.length === 5)) ||
+      !process.stdin.isTTY || !process.stdout.isTTY) {
+    console.error('Usage: node issuer_setup.mjs reference PRIVATE_DIR; or local TTY: node issuer_setup.mjs init PRIVATE_DIR HTTPS_ORIGIN CLIENT_ID EXACT_HTTPS_REDIRECT; node issuer_setup.mjs init-chatgpt-cimd PRIVATE_DIR HTTPS_ORIGIN; node issuer_setup.mjs rotate PRIVATE_DIR (unused issuer only)');
     process.exitCode = 2;
   } else {
     try {
-      publicInputs({ origin, clientId, redirectUris: [redirect] });
+      const cimd = verb === 'init-chatgpt-cimd';
+      const selectedClient = cimd ? CHATGPT_CIMD_ID : clientId;
+      const selectedRedirect = cimd ? CHATGPT_CIMD_REDIRECT : redirect;
+      const clientRegistration = cimd ? 'chatgpt-cimd' : 'static';
+      publicInputs({ origin, clientId: selectedClient, redirectUris: [selectedRedirect], clientRegistration });
       privateDirectory(directory);
       for (const name of ['human.json', filename, ...related]) {
         try { lstatSync(join(directory, name)); throw Error('existing issuer state'); }
@@ -156,7 +168,8 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
       }
       const accountId = randomBytes(24).toString('base64url');
       await provisionLocalHuman({ directory, accountId });
-      finalizeIssuerSetup({ directory, accountId, origin, clientId, redirectUris: [redirect] });
+      finalizeIssuerSetup({ directory, accountId, origin, clientId: selectedClient,
+        redirectUris: [selectedRedirect], clientRegistration });
       console.log('Issuer state provisioned privately. Configure the local bridge using issuerReferences; do not publish issuer.json.');
     } catch { console.error('Issuer setup failed; inspect private state offline before retrying.'); process.exitCode = 1; }
   }

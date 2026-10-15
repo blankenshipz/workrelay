@@ -6,7 +6,114 @@ import { promises as fs } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createIssuerAdapter } from '../src/workrelay/oidc_adapter.mjs';
-import { createUnexposedIssuerPolicy } from '../src/workrelay/issuer_policy.mjs';
+import { createUnexposedIssuerPolicy, restrictedClientDocument, CHATGPT_CIMD_ID,
+  CHATGPT_CIMD_REDIRECT } from '../src/workrelay/issuer_policy.mjs';
+
+test('CIMD transport caps streamed bytes, rejects redirects, wrong content and dangerous metadata', async () => {
+  const doc = { client_id: CHATGPT_CIMD_ID, redirect_uris: [CHATGPT_CIMD_REDIRECT],
+    token_endpoint_auth_method: 'private_key_jwt', token_endpoint_auth_methods_supported: ['none', 'private_key_jwt'],
+    grant_types: ['authorization_code'], response_types: ['code'] };
+  const options = { redirect: 'manual' };
+  let called = 0;
+  const reply = (value, extras = {}) => async () => { called++; return new Response(value, {
+    status: extras.status ?? 200, headers: { 'content-type': extras.type ?? 'application/json',
+      ...(extras.length ? { 'content-length': extras.length } : {}) } }); };
+  await assert.rejects(restrictedClientDocument('https://127.0.0.1/private', options,
+    reply(JSON.stringify(doc))), /fetch denied/);
+  assert.equal(called, 0, 'unknown/private URL never fetched');
+  await assert.rejects(restrictedClientDocument(CHATGPT_CIMD_ID, options, reply('', { status: 302 })),
+    /response denied/);
+  await assert.rejects(restrictedClientDocument(CHATGPT_CIMD_ID, options, async () => {
+    const redirected = new Response('{}', { headers: { 'content-type': 'application/json' } });
+    Object.defineProperty(redirected, 'url', { value: 'https://evil.example.test/metadata' });
+    return redirected;
+  }), /response denied/);
+  await assert.rejects(restrictedClientDocument(CHATGPT_CIMD_ID, options, reply('', { type: 'text/html' })),
+    /response denied/);
+  await assert.rejects(restrictedClientDocument(CHATGPT_CIMD_ID, options,
+    reply(JSON.stringify(doc), { length: '8193' })), /response denied/);
+  let bytesEnqueued = 0;
+  const streamed = async () => new Response(new ReadableStream({ pull(controller) {
+    bytesEnqueued += 2048;
+    controller.enqueue(new Uint8Array(2048));
+  } }), { headers: { 'content-type': 'application/json' } });
+  await assert.rejects(restrictedClientDocument(CHATGPT_CIMD_ID, options, streamed), /too large/);
+  assert.ok(bytesEnqueued <= 12288, 'does not consume unbounded chunked metadata');
+  const stalled = async () => new Response(new ReadableStream({ start() {} }),
+    { headers: { 'content-type': 'application/json' } });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20);
+  await assert.rejects(restrictedClientDocument(CHATGPT_CIMD_ID,
+    { ...options, signal: controller.signal }, stalled), /timed out/);
+  clearTimeout(timeout);
+  for (const modified of [{ client_id: 'https://evil.example.test/doc' },
+    { redirect_uris: ['https://evil.example.test/'] },
+    { token_endpoint_auth_methods_supported: ['private_key_jwt'] },
+    { jwks_uri: 'http://127.0.0.1/key' }, { jwks: { keys: [] } },
+    { token_endpoint: 'https://evil.example.test/token' }]) {
+    await assert.rejects(restrictedClientDocument(CHATGPT_CIMD_ID, options,
+      reply(JSON.stringify({ ...doc, ...modified }))), /metadata denied/);
+  }
+  const valid = await restrictedClientDocument(CHATGPT_CIMD_ID, options, reply(JSON.stringify(doc)));
+  assert.deepEqual(await valid.json(), { client_id: CHATGPT_CIMD_ID,
+    redirect_uris: [CHATGPT_CIMD_REDIRECT], token_endpoint_auth_method: 'none',
+    grant_types: ['authorization_code', 'refresh_token'], response_types: ['code'] });
+});
+
+test('exact ChatGPT CIMD fixture reaches maintained provider without arbitrary metadata fetch', async t => {
+  const directory = await fs.mkdtemp(join(tmpdir(), 'workrelay-cimd-policy-'));
+  await fs.chmod(directory, 0o700);
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const key = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ format: 'jwk' });
+  const doc = { client_id: CHATGPT_CIMD_ID, redirect_uris: [CHATGPT_CIMD_REDIRECT],
+    token_endpoint_auth_method: 'private_key_jwt', token_endpoint_auth_methods_supported: ['none', 'private_key_jwt'],
+    grant_types: ['authorization_code', 'refresh_token'], response_types: ['code'] };
+  let fetched = 0;
+  const config = { origin: 'https://issuer.example.test', principal: 'person1',
+    jwks: { keys: [{ ...key, kid: 'cimd-test', alg: 'RS256', use: 'sig' }] },
+    cookieKeys: [randomBytes(32).toString('base64url')], clientId: CHATGPT_CIMD_ID,
+    redirectUris: [CHATGPT_CIMD_REDIRECT], clientRegistration: 'chatgpt-cimd',
+    adapter: createIssuerAdapter(directory), findAccount: async () => undefined,
+    fetchClientDocument: async (url, options) => {
+      fetched++;
+      assert.equal(url, CHATGPT_CIMD_ID);
+      assert.equal(options.redirect, 'manual');
+      return new Response(JSON.stringify(doc), { status: 200,
+        headers: { 'content-type': 'application/json' } });
+    } };
+  assert.throws(() => createUnexposedIssuerPolicy({ ...config, redirectUris: ['https://evil.example.test/'] }));
+  const provider = createUnexposedIssuerPolicy(config);
+  provider.proxy = true; // synthetic loopback fixture, not a trusted public route
+  const server = createServer(provider.callback());
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const metadata = await (await fetch(base + '/.well-known/oauth-authorization-server')).json();
+    assert.equal(metadata.client_id_metadata_document_supported, true);
+    assert.ok(metadata.code_challenge_methods_supported.includes('S256'));
+    assert.equal(metadata.authorization_response_iss_parameter_supported, true);
+    assert.deepEqual(metadata.token_endpoint_auth_methods_supported, ['none']);
+    const auth = (client, redirect, resource = config.origin + '/mcp') => base + '/auth?' + new URLSearchParams({
+      response_type: 'code', client_id: client, redirect_uri: redirect,
+      resource, scope: 'workrelay:tasks', state: 'synthetic',
+      code_challenge: 'a'.repeat(43), code_challenge_method: 'S256' });
+    const local = { redirect: 'manual', headers: { 'x-forwarded-proto': 'https' } };
+    const good = await fetch(auth(CHATGPT_CIMD_ID, CHATGPT_CIMD_REDIRECT), local);
+    assert.equal(good.status, 303, await good.text());
+    assert.match(good.headers.get('location'), /^\/interaction\//);
+    assert.equal(fetched, 1);
+    const wrong = await fetch(auth('https://example.test/metadata', CHATGPT_CIMD_REDIRECT), local);
+    assert.notEqual(wrong.status, 303);
+    assert.equal(fetched, 1, 'unapproved metadata URL never fetched');
+    const wrongRedirect = await fetch(auth(CHATGPT_CIMD_ID, 'https://evil.example.test/'), local);
+    assert.doesNotMatch(wrongRedirect.headers.get('location') ?? '', /evil\.example\.test/);
+    const wrongResource = await fetch(auth(CHATGPT_CIMD_ID, CHATGPT_CIMD_REDIRECT, 'https://evil.example.test/mcp'),
+      local);
+    const location = wrongResource.headers.get('location');
+    assert.equal(new URL(location).searchParams.get('iss'), config.origin);
+    assert.equal(new URL(location).searchParams.get('error'), 'invalid_target');
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
 
 test('maintained issuer policy advertises S256/JWKS but refuses unregistered clients and redirects', async t => {
   const directory = await fs.mkdtemp(join(tmpdir(), 'workrelay-issuer-policy-'));

@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import argon2 from 'argon2';
 import { createGateway, readPrivateConfig } from '../src/workrelay/mcp.mjs';
+import { CHATGPT_CIMD_ID, CHATGPT_CIMD_REDIRECT } from '../src/workrelay/issuer_policy.mjs';
 
 test('production local-only loopback gateway requires provisioned state and rejects proxy claims', async t => {
   const directory = await fs.mkdtemp(join(tmpdir(), 'workrelay-issuer-mcp-'));
@@ -239,7 +240,7 @@ test('production local-only loopback gateway requires provisioned state and reje
   assert.ok([...tokenFlood, ...revokeFlood].every(status => [200, 400, 401, 403, 429].includes(status)),
     `no overload or unbounded provider exceptions: token ${tokenFlood}, revoke ${revokeFlood}`);
   const flood = [];
-  for (let n = 0; n < 32; n += 4)
+  for (let n = 0; n < 64; n += 4)
     flood.push(...await Promise.all(Array.from({ length: 4 }, () => request(auth()))));
   assert.ok(flood.some(item => item.response.status === 429), 'actual provider admission must return 429');
   assert.ok(flood.every(item => [303, 429].includes(item.response.status)),
@@ -404,4 +405,92 @@ db.execute('PRAGMA wal_checkpoint(TRUNCATE)');db.close()`, join(directory, 'issu
   assert.equal((await request('/jwks')).response.status, 503, 'runtime revocation blocks issuer routes');
   publicCli.kill('SIGTERM');
   if (publicCli.exitCode === null) await new Promise(resolve => publicCli.once('exit', resolve));
+  // Offline switch of this disposable fixture; ordinary spawned CLI, real
+  // oidc-provider and real SQLite adapter. Only its outgoing client-document
+  // fetch is replaced with the exact official-document-shaped local fixture.
+  await fs.writeFile(publicConfig.revocation_file, JSON.stringify({ revoked_principals: [], revoked_tokens: [] }));
+  await fs.writeFile(settingsPath, JSON.stringify({ ...issuerSettings, clientId: CHATGPT_CIMD_ID,
+    redirectUris: [CHATGPT_CIMD_REDIRECT], clientRegistration: 'chatgpt-cimd' }));
+  const cimdConfig = { ...publicConfig, clientId: CHATGPT_CIMD_ID,
+    redirectUris: [CHATGPT_CIMD_REDIRECT], clientRegistration: 'chatgpt-cimd' };
+  await fs.writeFile(publicConfigPath, JSON.stringify(cimdConfig));
+  const fixturePath = join(directory, 'client-document-fixture.mjs');
+  const fixture = { client_id: CHATGPT_CIMD_ID, redirect_uris: [CHATGPT_CIMD_REDIRECT],
+    token_endpoint_auth_method: 'private_key_jwt', token_endpoint_auth_methods_supported: ['none', 'private_key_jwt'],
+    grant_types: ['authorization_code', 'refresh_token'], response_types: ['code'],
+    jwks_uri: 'https://chatgpt.com/oauth/jwks.json' };
+  await fs.writeFile(fixturePath, `globalThis.fetch = async (url, options) => {
+    if (url !== ${JSON.stringify(CHATGPT_CIMD_ID)} || !options.dispatcher || options.redirect !== 'manual')
+      throw Error('synthetic outbound fetch denied');
+    const response = new Response(${JSON.stringify(JSON.stringify(fixture))},
+      { headers: { 'content-type': 'application/json' } });
+    Object.defineProperty(response, 'url', { value: url });
+    return response;
+  };`, { mode: 0o600 });
+  const cimdCli = spawn(process.execPath, ['--import', fixturePath, 'src/workrelay/mcp.mjs', publicConfigPath],
+    { cwd: process.cwd(), stdio: ['ignore', 'ignore', 'pipe'] });
+  cimdCli.stderr.resume();
+  t.after(() => { if (cimdCli.exitCode === null) cimdCli.kill('SIGTERM'); });
+  let cimdReady = false;
+  for (let attempt = 0; attempt < 50; attempt++) {
+    if (cimdCli.exitCode !== null) break;
+    try { if ((await request('/jwks')).response.status === 200) { cimdReady = true; break; } }
+    catch { /* CLI not yet ready */ }
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  assert.equal(cimdReady, true, 'spawned CLI reaches maintained issuer');
+  const cimdDiscovery = JSON.parse((await request('/.well-known/oauth-authorization-server')).text);
+  assert.equal(cimdDiscovery.client_id_metadata_document_supported, true);
+  assert.deepEqual(cimdDiscovery.token_endpoint_auth_methods_supported, ['none']);
+  assert.equal(cimdDiscovery.authorization_response_iss_parameter_supported, true);
+  assert.ok(cimdDiscovery.code_challenge_methods_supported.includes('S256'));
+  const cimdAuth = (client = CHATGPT_CIMD_ID, target = origin + '/mcp') =>
+    auth(client, target).replace(encodeURIComponent(redirect), encodeURIComponent(CHATGPT_CIMD_REDIRECT));
+  assert.notEqual((await request(cimdAuth('https://127.0.0.1/private'))).response.status, 303,
+    'private-address metadata cannot be fetched');
+  const cimdWrong = await request(cimdAuth(CHATGPT_CIMD_ID, 'https://wrong.example.test/mcp'));
+  assert.equal(cimdWrong.response.status, 303);
+  assert.equal(new URL(cimdWrong.response.headers.get('location')).searchParams.get('iss'), origin);
+  const cimdNoPkce = await request(cimdAuth().replace('&code_challenge=' + challenge + '&code_challenge_method=S256', ''));
+  assert.equal(cimdNoPkce.response.status, 303);
+  assert.equal(new URL(cimdNoPkce.response.headers.get('location')).searchParams.get('iss'), origin);
+  assert.doesNotMatch((await request(cimdAuth().replace(encodeURIComponent(CHATGPT_CIMD_REDIRECT),
+    encodeURIComponent('https://wrong.example.test/redirect')))).response.headers.get('location') ?? '',
+  /wrong\.example\.test/);
+  jar.clear();
+  let step = await request(cimdAuth());
+  let sawLogin = false, sawConsent = false, cimdCode;
+  for (let i = 0; i < 12; i++) {
+    assert.equal(step.response.status, 303, step.text);
+    const nextUrl = new URL(step.response.headers.get('location'), base);
+    if (nextUrl.origin === 'https://chatgpt.com') {
+      assert.equal(nextUrl.pathname, '/connector_platform_oauth_redirect');
+      assert.equal(nextUrl.searchParams.get('iss'), origin);
+      cimdCode = nextUrl.searchParams.get('code'); break;
+    }
+    step = await request(nextUrl.pathname + nextUrl.search);
+    if (step.response.status === 200 && nextUrl.pathname.startsWith('/interaction/')) {
+      const login = step.text.includes('name="password"');
+      if (login) sawLogin = true; else sawConsent = true;
+      step = await post(nextUrl.pathname, hidden(step.text), login ? { password } : { decision: 'approve' });
+    }
+  }
+  assert.ok(cimdCode && sawLogin && sawConsent, 'fresh synthetic human login and consent issue code');
+  const cimdExchange = await request('/token', { method: 'POST', headers: {
+    'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({
+    grant_type: 'authorization_code', client_id: CHATGPT_CIMD_ID, code: cimdCode,
+    redirect_uri: CHATGPT_CIMD_REDIRECT, code_verifier: verifier, resource: origin + '/mcp',
+  }) });
+  assert.equal(cimdExchange.response.status, 200, cimdExchange.text);
+  const cimdToken = JSON.parse(cimdExchange.text).access_token;
+  assert.ok(cimdToken);
+  const cimdProfile = await request('/mcp', { method: 'POST', headers: {
+    authorization: `Bearer ${cimdToken}`, 'content-type': 'application/json',
+    accept: 'application/json, text/event-stream', 'mcp-protocol-version': '2025-11-25',
+  }, body: JSON.stringify({ jsonrpc: '2.0', id: 22, method: 'tools/call',
+    params: { name: 'workrelay_profile', arguments: {} } }) });
+  assert.equal(cimdProfile.response.status, 200, cimdProfile.text);
+  assert.match(cimdProfile.text, /person1/);
+  cimdCli.kill('SIGTERM');
+  if (cimdCli.exitCode === null) await new Promise(resolve => cimdCli.once('exit', resolve));
 });
