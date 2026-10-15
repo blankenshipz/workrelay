@@ -1,0 +1,45 @@
+# Experimental remote MCP gateway (local installation)
+
+Workrelay's MCP2 gateway lets a remote MCP client invoke model-free tools over HTTPS and routes them to the existing local Workrelay adapter/OpenCode service. It is not a hosted service, and it does not expose OpenCode. MCP Events (`events/list`, `events/subscribe`, `events/unsubscribe`) and signed HTTPS webhook delivery are implemented; local protocol and controlled-network tests cover event subscription/delivery behavior. Those tests do not prove a public tunnel, independently operated issuer, external callback receiver, or real Dot/mobile round trip. None of those external components has been verified together. Polling remains available. Example issuer and tunnel values below are placeholders, not installed or provisioned services.
+
+## One-time setup and prerequisites
+
+The current source uses `@modelcontextprotocol/server` 2.3.1 and `@modelcontextprotocol/node` 2.1.1, Streamable HTTP, and Node >=22. Install dependencies with `npm ci`; run `node src/workrelay/mcp.mjs /absolute/path/to/private-mcp.json`. The process listens on loopback only. Keep the existing authenticated OpenCode service on loopback too; **never forward, publish, or disable authentication on OpenCode**. The gateway calls the existing private CLI configuration and does not replace the local OAuth/quota safeguards.
+
+Create a private JSON config owned by the service user with mode `0600` (parent directory private as well). It contains references and non-secret identifiers only; do not put bearer tokens, passwords, private keys, or secret values in it, the repository, prompts, or logs:
+
+```json
+{
+  "port": 9000,
+  "public_origin": "https://your-owned-tunnel.example",
+  "issuer": "https://your-established-oauth-issuer.example",
+  "jwks_uri": "https://your-established-oauth-issuer.example/jwks",
+  "audience": "https://your-owned-tunnel.example/mcp",
+  "principal": "immutable-issuer-subject",
+  "owner": "configured-local-owner",
+  "bridge_config": "/absolute/path/to/existing-private-bridge-config",
+  "events_enabled": true,
+  "events_state_path": "/private/path/to/events.sqlite",
+  "revocation_file": "/private/path/to/principal-revocations.json"
+}
+```
+
+The three Events/revocation entries are optional for tools-only mode; enable all three for Events. Keep the state and revocation files in a user-owned private directory (mode `0700`), with private files (mode `0600`). The revocation file is local administrator-controlled data, not an externally supplied credential. The gateway also maintains generation-bound local approval/cleanup markers beside the Events state; protect and back them up consistently with that private state. Do not copy these paths or state into a public deployment.
+
+The exact HTTPS `public_origin` is the canonical public origin without a path. `audience` must match the resource URL `/mcp`. `issuer` and same-origin `jwks_uri` identify a **separately operated, trusted OAuth issuer** that issues RS256/ES256 JWTs with the configured issuer, audience, immutable `sub`, `exp`, `iat`, and `workrelay:tasks` scope. The gateway validates those claims and advertises OAuth **protected-resource metadata** at `/.well-known/oauth-protected-resource/mcp` with a Bearer challenge. It is not an OAuth authorization server: it does not provide login, consent, token issuance, issuer discovery/selection, or client registration. Configure the issuer/client authorization separately. Do not mistake the metadata's `authorization_servers` entry for a built-in issuer.
+
+Expose only the gateway through a provider-neutral HTTPS tunnel or reverse proxy that you operate and trust (for example, an already available ngrok tunnel; no purchase or account signup is implied). Route the exact public hostname to the local gateway port. The proxy must terminate valid public TLS, preserve the canonical `Host` (and `X-Forwarded-Host` if present), send `X-Forwarded-Proto: https` if present, and strip other forwarded identity/prefix headers. Requests must arrive to the gateway over loopback; arbitrary network access to the listener is rejected. The gateway checks Host, Origin, and forwarded host/proto against configured values. Never use caller-supplied owner labels or forwarded identity as authentication. Ensure the tunnel cannot route to the OpenCode port.
+
+This gateway configuration currently has one allowlisted `principal`, one `owner`, and one configured workspace. The single `workrelay:tasks` scope permits that authenticated principal to call `profile`, `start`, `status`, `result`, `enrolled_result`, `respond`, and `cancel`; when Events are enabled it can also list and manage subscriptions for `task.decision` / `task.completed`. There are no finer per-tool scopes. `profile`, `status`, `result`, and `enrolled_result` are read-only. `enrolled_result` only reads a pre-existing session through an opaque grant issued by the separate local administrator workflow; MCP cannot enroll, adopt, mutate, respond to, or cancel that session. `start` and `respond` submit task/follow-up text; `cancel` interrupts only the owned root session and **does not stop descendants**. `result` reports lifecycle evidence, not transcript or verified final answer. Tool text is passed to the local CLI via stdin, not argv. Existing OpenCode permissions and human approval remain in force; `respond` is not a permission-decision reply.
+
+Bearer JWT expiry is checked, but the gateway has no issuer disconnect/introspection hook: an unexpired self-contained token can remain valid until expiry unless the local principal revocation control disables access. For Events mode, a safe private `revocation_file` is required. A local administrator's change to its contents or file generation invalidates the prior generation-bound approval; the gateway fails closed, purges prior subscriptions during reconciliation, and only records approval for the current generation after cleanup. Do not roll back the revocation file, Events store, and approval markers together to restore old subscriptions. Re-enabling requires a deliberate local administrator update and reconciliation; changing the issuer alone does not revoke existing tokens here. On shutdown, disable the public route at the tunnel/proxy too. Restart requires the private config, state, revocation file, and valid issuer/JWKS; these do not imply the external route or credentials are safe/active. Rotate/disable credentials through the issuer and use the local revocation control when immediate local denial is needed. Do not change or remove the existing OpenCode subscription guard or unrelated credentials.
+
+## Normal use and external acceptance
+
+After one-time setup, add the configured HTTPS MCP URL and issuer-authorized credentials to a compatible remote MCP client. The intended journey is: connect; inspect `workrelay_profile`; start a small authorized task with `workrelay_start`; observe progress with `workrelay_status` / `workrelay_result` or subscribe to `task.decision` / `task.completed`; make any actual permission decision in the local OpenCode/OpenChamber UI; optionally send conversational follow-up to the same task with `workrelay_respond`; then stop using the MCP connection or cancel the owned root with `workrelay_cancel`. Reconnect and repeat status using the same task key. Events are implemented and locally tested, but live delivery through your public HTTPS tunnel to an external receiver—and its use by Dot/mobile—remains unverified. Polling is available as a fallback.
+
+Actual remote acceptance still requires a compatible Dot account/client that supports custom remote MCP, its issuer/client authorization and credentials, an available user-controlled tunnel/reverse proxy with public TLS and hostname, local Node/OpenCode prerequisites, and a human able to observe OpenCode/OpenChamber decisions. These prerequisites have not been exercised together. A local MCP protocol test, CLI test, or synthetic issuer test is not proof of a real Dot/mobile round trip.
+
+## Local checks
+
+For isolated protocol and synthetic signed-issuer checks use `npm run test:mcp`; for event-store and controlled callback transport checks use `node --test tests/test_events.mjs tests/test_mcp_integration.mjs`; for legacy adapter checks use `PYTHONPATH=src python3 -m unittest discover -s tests`. Local event tests exercise generated signatures and controlled HTTPS/callback behavior, not an independently operated issuer, user-selected public tunnel, real external receiver, Dot, or mobile behavior.

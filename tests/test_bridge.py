@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 from unittest.mock import patch
 
 from workrelay import cli
@@ -184,6 +185,107 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.run_bridge("cancel", "--key", "terminal", "--owner", "dot-work")[0], 2)
         self.assertFalse(any("interrupt" in path for _, path in FakeClient.calls[count:]))
         self.assertEqual(self.run_bridge("respond", "--key", "terminal", "--owner", "dot-work", "--feedback-key", "f", "--text", "follow up")[0], 0)
+
+    def result_fixture(self):
+        rc, out, err = self.run_bridge("start", "--key", "result-task", "--owner", "dot-work", "--text", "approved")
+        self.assertEqual((rc, err), (0, ""))
+        sid = json.loads(out)["session"]
+        pages, permissions = [], []
+
+        class ResultClient(FakeClient):
+            def request(self, method, path, body=None):
+                if "/message?" in path:
+                    self.calls.append((method, path))
+                    if method != "GET": raise AssertionError("read-only result")
+                    query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+                    if query.get("type") != ["assistant"]: raise AssertionError("assistant filter missing")
+                    if "cursor" in query and "order" in query: raise AssertionError("invalid cursor query")
+                    index = int(query.get("cursor", ["0"])[0])
+                    return pages[index] if pages else {"data": [], "cursor": {"next": None}}
+                if path == f"/api/session/{sid}/permission":
+                    self.calls.append((method, path))
+                    if method != "GET": raise AssertionError("read-only result")
+                    return {"data": permissions}
+                return super().request(method, path, body)
+
+        return sid, pages, permissions, ResultClient
+
+    def test_result_verified_owned_session_is_read_only_without_quota(self):
+        sid, pages, _, client = self.result_fixture()
+        pages.append({"data": [{"id": "msg_answer", "type": "assistant", "time": {"completed": 1},
+                                "content": [{"type": "text", "text": "useful response"}]}],
+                      "cursor": {"next": None}})
+        (self.config.parent / "quota").write_text("#!/bin/sh\nexit 1\n")
+        count = len(FakeClient.calls)
+        rc, out, err = self.run_bridge("result", "--key", "result-task", "--owner", "dot-work", client_type=client)
+        self.assertEqual((rc, err), (0, ""))
+        result = json.loads(out)
+        self.assertEqual(result["session"], sid)
+        self.assertEqual(result["assistant_output"]["text"], "useful response")
+        self.assertEqual(result["access"], "owned")
+        self.assertFalse(result["terminal"])
+        self.assertTrue(all(method == "GET" for method, _ in FakeClient.calls[count:]))
+
+    def test_result_pending_permission_and_terminal_outcome(self):
+        sid, _, permissions, client = self.result_fixture()
+        permissions.append({"id": "per_pending", "sessionID": sid, "resources": ["private-credential"]})
+        rc, out, err = self.run_bridge("result", "--key", "result-task", "--owner", "dot-work", client_type=client)
+        self.assertEqual((rc, err), (0, ""))
+        result = json.loads(out)
+        self.assertEqual(result["phase"], "decision_needed")
+        self.assertTrue(result["decision_needed"])
+        self.assertNotIn("private-credential", out)
+        permissions.clear()
+        FakeClient.sessions[sid]["outcome"] = "succeeded"
+        rc, out, err = self.run_bridge("result", "--key", "result-task", "--owner", "dot-work", client_type=client)
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(json.loads(out)["phase"], "succeeded")
+        self.assertTrue(json.loads(out)["terminal"])
+
+    def test_result_stale_cross_project_and_forged_owner_refused(self):
+        sid, _, _, client = self.result_fixture()
+        count = len(FakeClient.calls)
+        self.assertEqual(self.run_bridge("result", "--key", "result-task", "--owner", "forged", client_type=client)[0], 2)
+        self.assertEqual(len(FakeClient.calls), count)
+        FakeClient.sessions[sid]["location"]["directory"] = "/another-project"
+        rc, out, err = self.run_bridge("result", "--key", "result-task", "--owner", "dot-work", client_type=client)
+        self.assertEqual(rc, 2)
+        self.assertEqual(out, "")
+        self.assertNotIn("/another-project", err)
+        self.assertFalse(any("message?" in path for _, path in FakeClient.calls[count:]))
+        FakeClient.sessions.pop(sid)
+        self.assertEqual(self.run_bridge("result", "--key", "result-task", "--owner", "dot-work", client_type=client)[0], 2)
+
+    def test_result_paginated_bounded_redacted_assistant_only(self):
+        _, pages, _, client = self.result_fixture()
+        pages.extend([
+            {"data": [{"id": "msg_partial", "type": "assistant", "time": {}, "content": []}], "cursor": {"next": "1"}},
+            {"data": [{"id": "msg_answer", "type": "assistant", "time": {"completed": 1}, "content": [
+                {"type": "tool", "state": {"output": "untrusted tool instructions"}},
+                {"type": "reasoning", "text": "private reasoning"},
+                {"type": "text", "text": "Bearer sensitive-token password=private-credential " + "x" * 9000}]}],
+             "cursor": {"next": None}}])
+        rc, out, err = self.run_bridge("result", "--key", "result-task", "--owner", "dot-work", client_type=client)
+        self.assertEqual((rc, err), (0, ""))
+        result = json.loads(out)
+        self.assertEqual(len(result["assistant_output"]["text"]), 8000)
+        for secret in ("sensitive-token", "private-credential", "untrusted tool instructions", "private reasoning"):
+            self.assertNotIn(secret, out)
+        pages[:] = [{"data": [], "cursor": {"next": str(i + 1)}} for i in range(5)]
+        before = len(FakeClient.calls)
+        rc, out, err = self.run_bridge("result", "--key", "result-task", "--owner", "dot-work", client_type=client)
+        self.assertEqual((rc, err), (0, ""))
+        self.assertTrue(json.loads(out)["message_scan_bounded"])
+        self.assertEqual(sum("message?" in p for _, p in FakeClient.calls[before:]), 5)
+
+    def test_result_supervision_errors_are_safe_json(self):
+        sid, _, permissions, client = self.result_fixture()
+        permissions.append({"id": "per_other", "sessionID": "ses_other", "resources": ["private-credential"]})
+        rc, out, err = self.run_bridge("result", "--key", "result-task", "--owner", "dot-work", client_type=client)
+        self.assertEqual(rc, 2)
+        self.assertEqual(out, "")
+        self.assertEqual(json.loads(err)["error"], "permission ownership mismatch")
+        self.assertNotIn("private-credential", err)
 
     def test_oauth_proof_absent_blocks_even_when_quota_succeeds(self):
         FakeClient.metadata["/api/plugin"] = []
@@ -364,6 +466,235 @@ class BridgeTests(unittest.TestCase):
         missing = invoke("GET",f"/api/session/{sid}")
         self.assertEqual(missing.returncode,0,missing.stderr)
         self.assertEqual(json.loads(missing.stdout)["status"],404)
+
+    def test_transport_bounded_result_reads_and_hostile_queries(self):
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is required for installed-client result reads")
+        root = self.config.parent
+        sid, mid = "ses_bridge_" + "e" * 32, "msg_" + "f" * 32
+        workspace, owner = str(Path(self.data["directory"]).resolve()), self.data["authorized_owner"]
+        self.data["directory"] = workspace
+        session = {"id": sid, "location": {"directory": workspace}, "outcome": "succeeded",
+                   "metadata": {"agentComputerBridge": "read-result", "agentComputerBridgeOwner": owner}}
+        hits, mode, extra_sessions = [], {"value": "normal"}, {}
+        permission_path = f"/api/session/{sid}/permission"
+        message_path = f"/api/session/{sid}/message?limit=20&type=assistant&order=desc"
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_): pass
+            def do_GET(self):
+                hits.append(self.path)
+                is_session = self.path == f"/api/session/{sid}" or self.path in extra_sessions
+                if mode["value"] == "session-redirect" or (not is_session and mode["value"] == "redirect"):
+                    self.send_response(302)
+                    self.send_header("Location", "/must-not-follow")
+                    self.end_headers()
+                    return
+                if not is_session and mode["value"] == "error":
+                    raw = b'{"error":"Bearer private-provider-secret"}'
+                    status = 500
+                elif not is_session and mode["value"] == "oversize":
+                    raw, status = b"x" * 2_000_001, 200
+                else:
+                    status = 200
+                    if is_session:
+                        data = {"data": session if self.path == f"/api/session/{sid}" else extra_sessions[self.path]}
+                    elif self.path.endswith("/permission"):
+                        data = {"data": []}
+                    else:
+                        data = {"data": [{"id": "msg_answer", "type": "assistant", "time": {"completed": 1},
+                                          "content": [{"type": "text", "text": "Useful result token=private-provider-secret"}]}],
+                                "cursor": {"next": None}}
+                    raw = json.dumps(data).encode()
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                try: self.wfile.write(raw)
+                except (BrokenPipeError, ConnectionResetError): pass
+            def do_POST(self):
+                hits.append("POST " + self.path)
+                self.send_response(405); self.end_headers()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close); self.addCleanup(server.shutdown)
+        self.data["server"] = f"http://127.0.0.1:{server.server_port}"
+        module = root / "client" / "dist" / "promise" / "service.js"
+        module.parent.mkdir(parents=True)
+        (root / "client" / "package.json").write_text('{"type":"module"}')
+        module.write_text(f"export async function discover() {{return {{url:'{self.data['server']}',auth:{{username:'test',password:'dummy'}}}};}}\n"
+                          "export function headers() {return {authorization:'Basic synthetic'};}")
+        registration = root / "service.json"
+        registration.write_text("{}"); registration.chmod(0o600)
+        self.data.update(transport="installed-client", client_service_module=str(module),
+                         service_registration=str(registration), node_executable=node)
+        self.write_config()
+        db = cli.database(root / "state")
+        self.addCleanup(db.close)
+        db.execute("INSERT INTO tasks(task_key,session_id,prompt_id,workspace,request_hash,phase,owner) VALUES(?,?,?,?,?,?,?)",
+                   ("read-result", sid, mid, workspace, "hash", "running", owner))
+        script = str(Path(cli.__file__).with_name("transport.mjs"))
+
+        def invoke(path, method="GET", body=None, **authority):
+            return subprocess.run([node, script, str(self.config)],
+                                  input=json.dumps({"method": method, "path": path, "body": body, **authority}),
+                                  capture_output=True, text=True, timeout=10)
+
+        # Exercise real InstalledClient subprocess + fake HTTP endpoint, no model.
+        rc, out, err = self.run_bridge("result", "--key", "read-result", "--owner", owner)
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(json.loads(out)["phase"], "succeeded")
+        self.assertIn("Useful result", out)
+        self.assertNotIn("private-provider-secret", out)
+        for path in (permission_path, message_path,
+                     f"/api/session/{sid}/message?limit=1&type=assistant&cursor=opaque%2B%2F%3D%3F",
+                     f"/api/session/{sid}/message?type=assistant&order=desc&limit=50"):
+            before = len(hits)
+            response = invoke(path)
+            self.assertEqual(response.returncode, 0, response.stderr)
+            self.assertEqual(hits[before:], [f"/api/session/{sid}", path], "revalidate every request")
+
+        hostile_queries = ["", "limit=20&type=assistant", "limit=0&type=assistant&order=desc",
+                           "limit=51&type=assistant&order=desc", "limit=02&type=assistant&order=desc",
+                           "limit=20&type=user&order=desc", "limit=20&type=assistant&order=asc",
+                           "limit=20&type=assistant&order=desc&extra=yes",
+                           "limit=20&type=assistant&order=desc&limit=20",
+                           "limit=20&type=assistant&order=desc&cursor=abc",
+                           "limit=20&type=assistant&cursor=", "limit=20&type=assistant&cursor=%00",
+                           "limit=20&type=assistant&cursor=%ZZ", "limit=20&type=assistant&cursor=%FF",
+                           "limit=20&type=assistant&cursor=" + "a" * 4097]
+        for query in hostile_queries:
+            with self.subTest(query=query[:100]):
+                before = len(hits)
+                path = f"/api/session/{sid}/message" + ("?" + query if query else "")
+                response = invoke(path)
+                self.assertEqual(response.returncode, 2)
+                self.assertEqual(hits[before:], [], "invalid query must not reach endpoint")
+                self.assertEqual(response.stdout, "")
+        for path, method, body in ((permission_path + "?limit=20", "GET", None),
+                                   (message_path, "POST", {}), (permission_path, "POST", None),
+                                   (message_path, "GET", {}), (permission_path, "GET", {}),
+                                   (message_path.replace(sid, "ses_unowned"), "GET", None),
+                                   (message_path.replace(sid, "ses_bridge_" + "a" * 32), "GET", None),
+                                   (message_path + "#fragment", "GET", None),
+                                   (message_path.replace(sid, sid + "/.."), "GET", None)):
+            before = len(hits)
+            self.assertEqual(invoke(path, method, body).returncode, 2)
+            self.assertEqual(hits[before:], [])
+
+        for field in ("directory", "owner", "key", "id"):
+            original = json.loads(json.dumps(session))
+            if field == "directory": session["location"]["directory"] = "/other-project"
+            elif field == "owner": session["metadata"]["agentComputerBridgeOwner"] = "other-owner"
+            elif field == "key": session["metadata"]["agentComputerBridge"] = "other-key"
+            else: session["id"] = "ses_other"
+            for path in (message_path, permission_path):
+                before = len(hits)
+                self.assertEqual(invoke(path).returncode, 2)
+                self.assertEqual(hits[before:], [f"/api/session/{sid}"])
+            session.clear(); session.update(original)
+        db.execute("UPDATE tasks SET owner='other-owner' WHERE task_key='read-result'")
+        before = len(hits)
+        self.assertEqual(invoke(message_path).returncode, 2)
+        self.assertEqual(hits[before:], [])
+        db.execute("UPDATE tasks SET owner=? WHERE task_key='read-result'", (owner,))
+        for state in ("redirect", "session-redirect", "oversize"):
+            mode["value"] = state
+            response = invoke(message_path)
+            self.assertEqual(response.returncode, 2)
+            self.assertEqual(response.stdout, "")
+            self.assertNotIn("private-provider-secret", response.stderr)
+            self.assertNotIn("/must-not-follow", hits)
+        mode["value"] = "error"
+        response = invoke(message_path)
+        self.assertEqual(response.returncode, 0)
+        self.assertEqual(json.loads(response.stdout), {"status": 500, "data": None})
+        self.assertNotIn("private-provider-secret", response.stdout + response.stderr)
+
+        # Existing owners may be explicitly enrolled by a local administrator,
+        # but the grant is READ-only and never changes session metadata/parent.
+        mode["value"] = "normal"
+        existing_sid = "ses_existing_owner"
+        existing_path = f"/api/session/{existing_sid}"
+        existing = {"id": existing_sid, "projectID": "existing-project", "parentID": "ses_existing_parent",
+                    "location": {"directory": workspace}, "metadata": {"originalOwner": "unchanged"}}
+        extra_sessions[existing_path] = existing
+        admin_token = "synthetic-local-admin-credential-32-characters"
+        admin_file = root / "enrollment-admin-token"
+        admin_file.write_text(admin_token); admin_file.chmod(0o600)
+        self.data["enrollment_admin_token_file"] = str(admin_file)
+        self.write_config()
+        selection = {"session_id": existing_sid, "owner": owner, "workspace": workspace}
+        admin_args = ("--session-id", existing_sid, "--owner", owner, "--workspace", workspace, "--stdin-admin-token")
+        for supplied in ("", "wrong-local-admin-credential-32-characters"):
+            before = len(hits)
+            with patch("sys.stdin", io.StringIO(supplied)):
+                rc, out, err = self.run_bridge("grant-enrollment", *admin_args)
+            self.assertEqual(rc, 2)
+            self.assertEqual(out, "")
+            self.assertNotIn(supplied or "this-never-appears", err)
+            self.assertEqual(hits[before:], [])
+        before = len(hits)
+        self.assertEqual(invoke(existing_path).returncode, 2, "existing session must not be discovered without grant")
+        self.assertEqual(invoke(existing_path, local_admin_selection=selection).returncode, 2)
+        self.assertEqual(hits[before:], [])
+        with patch("sys.stdin", io.StringIO(admin_token)):
+            rc, out, err = self.run_bridge("grant-enrollment", *admin_args)
+        self.assertEqual((rc, err), (0, ""))
+        grant = json.loads(out)["grant_id"]
+        self.assertNotIn(admin_token, out)
+        rc, out, err = self.run_bridge("enrolled-result", "--grant-id", grant, "--owner", owner)
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(json.loads(out)["access"], "enrolled_read_only")
+        self.assertEqual(json.loads(out)["capabilities"], ["read"])
+        self.assertNotIn("private-provider-secret", out)
+        for path in (existing_path, existing_path + "/permission",
+                     existing_path + "/message?limit=20&type=assistant&order=desc"):
+            before = len(hits)
+            self.assertEqual(invoke(path, grant_id=grant).returncode, 0)
+            self.assertEqual(hits[before:], [existing_path, path])
+        for path, method, body in ((existing_path + "/prompt", "POST", {"id": mid, "text": "steal ownership"}),
+                                   (existing_path + "/interrupt?resume=false", "POST", None),
+                                   (existing_path + "/permission/per_pending/reply", "POST", {"decision": "allow"}),
+                                   (existing_path, "DELETE", None),
+                                   (existing_path + "/message?limit=999&type=assistant&order=desc", "GET", None),
+                                   (existing_path + "/permission", "GET", {}),
+                                   (f"/api/session/{sid}", "GET", None)):
+            before = len(hits)
+            self.assertEqual(invoke(path, method, body, grant_id=grant).returncode, 2)
+            self.assertEqual(hits[before:], [])
+        before = len(hits)
+        self.assertEqual(invoke(existing_path, grant_id="grant_" + "0" * 32).returncode, 2)
+        self.assertEqual(invoke(existing_path, grant_id="../../secret").returncode, 2)
+        self.assertEqual(hits[before:], [])
+        for change in ("project", "workspace", "metadata", "parent"):
+            original = json.loads(json.dumps(existing))
+            if change == "project": existing["projectID"] = "other-project"
+            elif change == "workspace": existing["location"]["directory"] = "/other-workspace"
+            elif change == "metadata": existing["metadata"]["originalOwner"] = "other-owner"
+            else: existing["parentID"] = "ses_other_parent"
+            before = len(hits)
+            self.assertEqual(invoke(existing_path + "/permission", grant_id=grant).returncode, 2)
+            self.assertEqual(hits[before:], [existing_path])
+            self.assertEqual(self.run_bridge("enrolled-result", "--grant-id", grant, "--owner", owner)[0], 2)
+            existing.clear(); existing.update(original)
+        extra_sessions.pop(existing_path)
+        self.assertEqual(self.run_bridge("enrolled-result", "--grant-id", grant, "--owner", owner)[0], 2)
+        extra_sessions[existing_path] = existing
+        with patch("sys.stdin", io.StringIO("wrong-admin-token")):
+            self.assertEqual(self.run_bridge("revoke-enrollment", *admin_args, "--grant-id", grant)[0], 2)
+        with patch("sys.stdin", io.StringIO(admin_token)):
+            rc, out, err = self.run_bridge("revoke-enrollment", *admin_args, "--grant-id", grant)
+        self.assertEqual((rc, err), (0, ""))
+        self.assertTrue(json.loads(out)["revoked"])
+        before = len(hits)
+        self.assertEqual(invoke(existing_path, grant_id=grant).returncode, 2)
+        self.assertEqual(self.run_bridge("enrolled-result", "--grant-id", grant, "--owner", owner)[0], 2)
+        self.assertEqual(hits[before:], [])
+        self.assertEqual(existing["metadata"], {"originalOwner": "unchanged"})
+        self.assertEqual(existing["parentID"], "ses_existing_parent")
+        self.assertFalse(any(hit.startswith("POST " + existing_path) for hit in hits))
 
     def test_two_processes_one_prompt_and_restart_recovery(self):
         sessions, messages, posts = {}, {}, []

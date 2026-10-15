@@ -13,6 +13,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import secrets
+
+from .supervision import (SupervisionError, owned_result, enrolled_result,
+                          enrollment_row, grant_enrollment, revoke_enrollment)
 
 
 class BridgeError(Exception):
@@ -101,7 +105,8 @@ class InstalledClient:
     def request(self, method, path, body=None):
         try:
             result = subprocess.run([self.config["node_executable"], self.script, self.config["_private_path"]],
-                input=json.dumps({"method": method, "path": path, "body": body}),
+                input=json.dumps({"method": method, "path": path, "body": body,
+                                  **self.config.get("_supervision_authority", {})}),
                 capture_output=True, text=True, timeout=20)
             require(result.returncode == 0 and len(result.stdout) <= 2_000_000,
                     "guarded local service request unavailable")
@@ -200,6 +205,23 @@ def public(row, session=None):
             "owner": row[6], "evidence": "OpenCode session outcome" if session and session.get("outcome") else "local bridge ledger"}
 
 
+def enrollment_admin_token(config):
+    """Local administrator credential via stdin, never argv or MCP arguments."""
+    try:
+        path = Path(config.get("enrollment_admin_token_file", ""))
+        require(path.is_file() and path.stat().st_uid == os.getuid() and
+                path.stat().st_mode & 0o077 == 0 and path.stat().st_size <= 4096,
+                "private enrollment admin credential unavailable")
+        expected = path.read_text().strip()
+        supplied = sys.stdin.read(4098).strip()
+        require(32 <= len(expected) <= 4096 and len(supplied) <= 4096 and
+                secrets.compare_digest(expected.encode(), supplied.encode()),
+                "enrollment administrator authentication failed")
+        return supplied
+    except (OSError, UnicodeError):
+        raise BridgeError("private enrollment admin credential unavailable") from None
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Scoped local OpenCode task adapter")
     parser.add_argument("--config", default=os.environ.get("AGENT_COMPUTER_BRIDGE_CONFIG", ""))
@@ -207,27 +229,66 @@ def main(argv=None):
     start = commands.add_parser("start")
     start.add_argument("--key", required=True)
     start.add_argument("--owner", required=True)
-    start.add_argument("--text", required=True)
+    start.add_argument("--text")  # Legacy trusted local CLI alias; remote entry uses stdin.
+    start.add_argument("--stdin-text", action="store_true")
     status = commands.add_parser("status")
     status.add_argument("--key", required=True)
     status.add_argument("--owner", required=True)
+    result = commands.add_parser("result", help="Read bounded, redacted output of an owned task")
+    result.add_argument("--key", required=True)
+    result.add_argument("--owner", required=True)
+    enrolled = commands.add_parser("enrolled-result", help="Read an existing session by locally issued grant ID")
+    enrolled.add_argument("--grant-id", required=True)
+    enrolled.add_argument("--owner", required=True)
+    for name in ("grant-enrollment", "revoke-enrollment"):
+        admin = commands.add_parser(name, help="Local admin only; requires private credential on stdin")
+        admin.add_argument("--session-id", required=True)
+        admin.add_argument("--owner", required=True)
+        admin.add_argument("--workspace", required=True)
+        admin.add_argument("--stdin-admin-token", action="store_true", required=True)
+        if name == "revoke-enrollment":
+            admin.add_argument("--grant-id", required=True)
     feedback = commands.add_parser("respond")
     feedback.add_argument("--key", required=True)
     feedback.add_argument("--owner", required=True)
     feedback.add_argument("--feedback-key", required=True)
-    feedback.add_argument("--text", required=True)
+    feedback.add_argument("--text")
+    feedback.add_argument("--stdin-text", action="store_true")
     cancel = commands.add_parser("cancel")
     cancel.add_argument("--key", required=True)
     cancel.add_argument("--owner", required=True)
     args = parser.parse_args(argv)
     try:
+        if args.command in ("start", "respond"):
+            require(bool(args.stdin_text) != (args.text is not None), "supply exactly one text source")
+            if args.stdin_text:
+                args.text = sys.stdin.read(16002)
         require(bool(args.config), "set --config to a private config file")
         config, token, directory, state = load_config(args.config)
         config["_private_path"] = str(Path(args.config).expanduser().resolve())
         db = database(state)
         client = InstalledClient(config) if config.get("transport") == "installed-client" else Client(config, token)
-        key = validate_key(args.key)
         require(args.owner == config["authorized_owner"], "owner not authorized by private configuration")
+        if args.command in ("grant-enrollment", "revoke-enrollment"):
+            token = enrollment_admin_token(config)
+            require(args.workspace == str(directory), "selected workspace not authorized by private configuration")
+            selection = {"session_id": args.session_id, "owner": config["authorized_owner"], "workspace": str(directory)}
+            if args.command == "grant-enrollment":
+                config["_supervision_authority"] = {"local_admin_selection": selection, "local_admin_token": token}
+                print(json.dumps(grant_enrollment(db, client, args.session_id, config["authorized_owner"],
+                                                 directory, local_admin_grant=selection)))
+            else:
+                row = enrollment_row(db, args.grant_id, config["authorized_owner"], directory)
+                require(row[0] == args.session_id, "selected session does not match enrollment")
+                revoke_enrollment(db, args.grant_id)
+                print(json.dumps({"grant_id": args.grant_id, "revoked": True}))
+            return 0
+        if args.command == "enrolled-result":
+            enrollment_row(db, args.grant_id, config["authorized_owner"], directory)
+            config["_supervision_authority"] = {"grant_id": args.grant_id}
+            print(json.dumps(enrolled_result(db, client, args.grant_id, config["authorized_owner"], directory)))
+            return 0
+        key = validate_key(args.key)
         if args.command == "start":
             import hashlib
             require(bool(args.text.strip()) and len(args.text) <= 16000, "task text missing or too long")
@@ -302,7 +363,11 @@ def main(argv=None):
                     bool(re.fullmatch(r"msg_[0-9a-f]{32}", row[2])), "unknown task in this workspace")
             session = owned_session(client, row[1], key, args.owner, directory)
             require(session is not None, "owned session not found")
-            if args.command == "status":
+            if args.command == "result":
+                # Session/workspace come only from the private ledger/config;
+                # --owner must match the configured owner before any service GET.
+                print(json.dumps(owned_result(client, row, config["authorized_owner"], directory)))
+            elif args.command == "status":
                 result = public(row, session)
                 result["prompt_observed"] = prompt_exists(client, row[1], row[2])
                 if row[5] == "submitting" and result["prompt_observed"] and result["phase"] == "submitting":
@@ -376,9 +441,9 @@ def main(argv=None):
                 db.execute("UPDATE tasks SET phase='interrupt_acknowledged' WHERE task_key=?", (key,))
                 print(json.dumps({"key": key, "session": row[1], "phase": "interrupt_acknowledged"}))
         return 0
-    except (BridgeError, KeyError, ValueError, sqlite3.Error) as exc:
+    except (BridgeError, SupervisionError, KeyError, ValueError, sqlite3.Error) as exc:
         # Never print raw provider errors, URLs, tokens, workspace paths or task text.
-        message = str(exc) if isinstance(exc, BridgeError) else "invalid configuration or local state"
+        message = str(exc) if isinstance(exc, (BridgeError, SupervisionError)) else "invalid configuration or local state"
         print(json.dumps({"error": message}), file=sys.stderr)
         return 2
 

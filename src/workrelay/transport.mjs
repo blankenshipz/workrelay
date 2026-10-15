@@ -1,14 +1,54 @@
 // Private in-process credential handoff from the installed @opencode/client.
 // JSON body arrives via stdin; credentials and request text never enter argv.
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 
 const rootRoutes = new Set(['/api/plugin', '/api/integration/openai', '/api/provider/openai', '/api/model']);
 const sessionPath = /^\/api\/session\/(ses_bridge_[0-9a-f]{32})(?:\/(prompt|message\/(msg_[0-9a-f]{32})|inbox(?:\/(msg_[0-9a-f]{32}))?|interrupt\?resume=false))?$/;
+const resultReadPath = /^\/api\/session\/(ses_bridge_[0-9a-f]{32})\/(permission|message\?[^#]+)$/;
 const fields = (value, expected) => value !== null && typeof value === 'object' && !Array.isArray(value) &&
   Object.keys(value).sort().join(',') === [...expected].sort().join(',');
+
+function boundedMessageQuery(tail) {
+  if (!tail.startsWith('message?')) return false;
+  const raw = tail.slice('message?'.length);
+  // V2 cursors are opaque strings, not assumed to be base64 or session IDs.
+  // Reject ambiguous encodings/control characters, duplicate/extra fields and
+  // cursor+order. Every page must retain the assistant filter and bounded limit.
+  if (/%(?![0-9a-f]{2})/i.test(raw)) return false;
+  const query = new URLSearchParams(raw);
+  const keys = [...query.keys()];
+  const expected = query.has('cursor') ? ['cursor', 'limit', 'type'] : ['limit', 'order', 'type'];
+  if (keys.sort().join(',') !== expected.sort().join(',')) return false;
+  const limit = query.get('limit');
+  if (!/^(?:[1-9]|[1-4][0-9]|50)$/.test(limit ?? '') || query.get('type') !== 'assistant') return false;
+  if (!query.has('cursor')) return query.get('order') === 'desc';
+  const cursor = query.get('cursor');
+  return cursor.length > 0 && cursor.length <= 4096 && !/[\x00-\x1f\x7f\ufffd]/.test(cursor);
+}
+
+async function boundedJSON(response) {
+  const reader = response.body?.getReader();
+  if (!reader) return null;
+  const chunks = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > 2_000_000) throw new Error('response too large');
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel();
+  }
+  const body = Buffer.concat(chunks).toString('utf8');
+  return body ? JSON.parse(body) : null;
+}
 
 function ledger(config, sid) {
   const code = `import json,sqlite3,sys
@@ -21,11 +61,66 @@ print(json.dumps({'task':r,'feedback':f}))`;
   return JSON.parse(result);
 }
 
+function enrollment(config, grantID) {
+  if (typeof grantID !== 'string' || !/^grant_[0-9a-f]{32}$/.test(grantID)) return null;
+  const code = `import json,sqlite3,sys
+db=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True,timeout=3)
+r=db.execute('SELECT session_id,owner,workspace,project_id,revoked,owner_snapshot FROM supervision_grants WHERE grant_id=?',(sys.argv[2],)).fetchone()
+print(json.dumps(r))`;
+  return JSON.parse(execFileSync('/usr/bin/python3', ['-c', code, `${config.state_dir}/bridge.sqlite`, grantID],
+    { encoding: 'utf8', timeout: 5000, maxBuffer: 200_000, stdio: ['ignore', 'pipe', 'ignore'] }));
+}
+
+function adminAuthenticated(config, token) {
+  if (typeof token !== 'string' || token.length < 32 || token.length > 4096) return false;
+  const stat = statSync(config.enrollment_admin_token_file);
+  if (!stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o077) || stat.size > 4096) return false;
+  const expected = Buffer.from(readFileSync(config.enrollment_admin_token_file, 'utf8').trim());
+  const supplied = Buffer.from(token);
+  return expected.length >= 32 && expected.length === supplied.length && timingSafeEqual(expected, supplied);
+}
+
+async function allowEnrollment(input, config, endpoint, headers) {
+  if (input.method !== 'GET' || input.body !== null) return false;
+  const match = /^\/api\/session\/(ses[A-Za-z0-9_-]{1,160})(?:\/(permission|message\?[^#]+))?$/.exec(input.path);
+  if (!match || (match[2] && match[2] !== 'permission' && !boundedMessageQuery(match[2]))) return false;
+  const sid = match[1];
+  let row = null;
+  if (input.local_admin_selection !== undefined || input.local_admin_token !== undefined) {
+    if (input.grant_id !== undefined || match[2] || !adminAuthenticated(config, input.local_admin_token)) return false;
+    const selection = input.local_admin_selection;
+    if (!fields(selection, ['session_id', 'owner', 'workspace']) || selection.session_id !== sid ||
+        selection.owner !== config.authorized_owner || selection.workspace !== config.directory) return false;
+  } else {
+    row = enrollment(config, input.grant_id);
+    if (!row || row[0] !== sid || row[1] !== config.authorized_owner || row[2] !== config.directory ||
+        !row[3] || row[4] !== 0 || !row[5]) return false;
+  }
+  const found = await fetch(new URL(`/api/session/${sid}`, endpoint.url), { headers, redirect: 'manual',
+    signal: AbortSignal.timeout(5000) });
+  if (!found.ok) return false;
+  const session = (await boundedJSON(found))?.data;
+  if (session?.id !== sid || session?.location?.directory !== config.directory || !session?.projectID) return false;
+  if (row) {
+    if (session.projectID !== row[3] || !isDeepStrictEqual(JSON.parse(row[5]),
+        { metadata: session.metadata ?? null, parentID: session.parentID ?? null })) return false;
+    // Recheck persisted revocation after the remote ownership probe.
+    if (!isDeepStrictEqual(enrollment(config, input.grant_id), row)) return false;
+  }
+  return true;
+}
+
 async function allow(input, config, endpoint, headers) {
   const path = input.path;
-  if (typeof path !== 'string' || !['GET', 'POST', 'DELETE'].includes(input.method)) return false;
+  if (typeof path !== 'string' || path.length > 50_000 || /[\x00-\x1f\x7f\\#]/.test(path) ||
+      !['GET', 'POST', 'DELETE'].includes(input.method)) return false;
+  if (input.grant_id !== undefined || input.local_admin_selection !== undefined || input.local_admin_token !== undefined)
+    return allowEnrollment(input, config, endpoint, headers);
   if (rootRoutes.has(path)) return input.method === 'GET' && input.body === null;
-  const match = sessionPath.exec(path);
+  const resultRead = resultReadPath.exec(path);
+  if (resultRead && (input.method !== 'GET' || input.body !== null ||
+      (resultRead[2] !== 'permission' && !boundedMessageQuery(resultRead[2])))) return false;
+  const match = resultRead ?? sessionPath.exec(path);
   if (path !== '/api/session' && !match) return false;
   const sid = path === '/api/session' ? input.body?.id : match[1];
   if (!/^ses_bridge_[0-9a-f]{32}$/.test(sid ?? '')) return false;
@@ -50,11 +145,12 @@ async function allow(input, config, endpoint, headers) {
   // Exact missing-session GET is required for safe deterministic creation recovery.
   if (found.status === 404) return input.method === 'GET' && !tail && input.body === null;
   if (!found.ok) return false;
-  const session = (await found.json())?.data;
+  const session = (await boundedJSON(found))?.data;
   if (session?.id !== sid || session?.location?.directory !== config.directory ||
       session?.metadata?.agentComputerBridge !== key ||
       session?.metadata?.agentComputerBridgeOwner !== owner) return false;
   if (!tail) return input.method === 'GET' && input.body === null;
+  if (resultRead) return true; // GET/body/query already checked; ownership revalidated above.
   if (tail === 'inbox') return input.method === 'GET' && input.body === null;
   if (tail.startsWith('message/')) return input.method === 'GET' && input.body === null &&
     (match[3] === mid || feedback.some(([id]) => id === match[3]));
@@ -97,10 +193,12 @@ try {
   if (response.status >= 300 && response.status < 400) throw new Error('redirect denied');
   if (response.status === 404 && input.method === 'GET') {
     process.stdout.write(JSON.stringify({ status: 404, data: null }));
+  } else if (!response.ok) {
+    // Upstream errors can include credentials/transcripts. Status is sufficient.
+    await response.body?.cancel();
+    process.stdout.write(JSON.stringify({ status: response.status, data: null }));
   } else {
-    const body = await response.text();
-    if (body.length > 2_000_000) throw new Error('response too large');
-    process.stdout.write(JSON.stringify({ status: response.status, data: body ? JSON.parse(body) : null }));
+    process.stdout.write(JSON.stringify({ status: response.status, data: await boundedJSON(response) }));
   }
 } catch {
   // Never emit request/response bodies, transport exceptions or auth material.
