@@ -485,11 +485,17 @@ export function createGateway(rawConfig, options = {}) {
     const selfHosted = config.issuer_mode === 'self-hosted';
     const rawNames = selfHosted ? req.rawHeaders.filter((_, index) => index % 2 === 0)
       .map(name => name.toLowerCase()) : [];
+    const proxyProtoCount = rawNames.filter(name => name === 'x-forwarded-proto').length;
+    const requireProxyProto = publicProxy &&
+      config.issuer_public_proxy?.require_parsed_x_forwarded_proto_https === true;
     const exclusiveHeaders = ['host', 'origin', 'content-length', 'transfer-encoding', 'content-type'];
     if (!loopback.has(remote) ||
         (selfHosted ? rawNames.filter(name => name === 'host').length !== 1 ||
           exclusiveHeaders.some(name => rawNames.filter(value => value === name).length > 1) ||
-          rawNames.some(name => name === 'forwarded' || name === 'x-real-ip' || name.startsWith('x-forwarded-')) ||
+          rawNames.some(name => name === 'forwarded' || name === 'x-real-ip' ||
+            name.startsWith('x-forwarded-') && name !== 'x-forwarded-proto') ||
+          (requireProxyProto ? proxyProtoCount !== 1 || req.headers['x-forwarded-proto'] !== 'https' :
+            proxyProtoCount !== 0) ||
           req.headers.host !== (publicProxy ? hostname : localHost) ||
           (req.headers.origin && req.headers.origin !== (publicProxy ? config.public_origin : `http://${localHost}`)) ||
           (publicProxy && (typeof req.url !== 'string' || !req.url.startsWith('/') || req.url.startsWith('//') ||

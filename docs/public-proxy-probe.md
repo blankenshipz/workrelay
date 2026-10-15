@@ -9,7 +9,9 @@ tokens, signing keys or webhook secrets in commands, logs or screenshots.
 1. Confirm the chosen hostname, DNS and valid certificate from a separate
    external client; verify TLS, hostname and certificate chain without `-k` or
    ignored verification. Confirm proxy accepts only that host, strips caller
-   forwarding headers, and sends to the Workrelay loopback port only. Confirm
+   forwarding headers (or replaces a single parsed `X-Forwarded-Proto: https`
+   when the separate private Quick Tunnel contract is enabled), and sends to
+   the Workrelay loopback port only. That header never proves TLS. Confirm
    the OpenCode service remains authenticated and loopback-only. Record actual
    endpoint, process/port owner and route owner without credential contents.
 2. With no bearer, fetch `/.well-known/oauth-protected-resource/mcp` and the

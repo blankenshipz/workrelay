@@ -77,6 +77,9 @@ test('signed OAuth JWT, strict boundary, and real MCP2 client handshake/tools', 
     assert.equal(wrongHost, 400);
     assert.equal((await request(await token(), { Origin: 'https://evil.example' })).status, 400);
     assert.equal((await request(await token(), { 'X-Forwarded-Host': 'evil.example' })).status, 400);
+    assert.equal((await request(await token(), { 'X-Forwarded-Proto': 'https' })).status, 200,
+      'external issuer retains its existing forwarded-proto handling');
+    assert.equal((await request(await token(), { 'X-Forwarded-Proto': 'http' })).status, 400);
     const oversizedToken = await token();
     const oversized = await new Promise((resolve, reject) => {
       const req = httpRequest(url, { method: 'POST', headers: {
