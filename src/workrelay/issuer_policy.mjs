@@ -189,7 +189,7 @@ export function createUnexposedIssuerPolicy({ origin, principal, jwks, cookieKey
   const resource = `${issuer.origin}/mcp`;
   if (typeof preapproveChatGPT !== 'boolean' || preapproveChatGPT && !cimd)
     throw Error('preapproval requires exact ChatGPT CIMD policy');
-  return new Provider(issuer.origin, {
+  const provider = new Provider(issuer.origin, {
     ...(preapproveChatGPT ? { loadExistingGrant: ctx => {
       // Supported provider hook, called only after loadAccount. Never invent an
       // authenticated session or expand the single locally approved capability.
@@ -238,4 +238,16 @@ export function createUnexposedIssuerPolicy({ origin, principal, jwks, cookieKey
         } },
     },
   });
+  if (preapproveChatGPT) provider.use(async (ctx, next) => {
+    await next();
+    // Provider.use wraps the maintained router. Change only its successful
+    // discovery response, reflecting the exact grant enforced above; internal
+    // OIDC support is not additional locally preapproved authority.
+    if (ctx.oidc?.route === 'discovery' && ctx.status === 200 &&
+        ['GET', 'HEAD'].includes(ctx.method) && ctx.body && typeof ctx.body === 'object') {
+      ctx.body = { ...ctx.body, scopes_supported: ['workrelay:tasks'] };
+      ctx.remove('Content-Length'); // Koa serializes and sizes the new JSON body.
+    }
+  });
+  return provider;
 }
