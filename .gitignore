@@ -8,3 +8,4 @@ config.json
 *.log
 node_modules/
 tests/.workrelay-issuer-mcp-*/
+tests/.workrelay-head-*/

@@ -11,6 +11,63 @@ import argon2 from 'argon2';
 import { createGateway, readPrivateConfig } from '../src/workrelay/mcp.mjs';
 import { CHATGPT_CIMD_ID, CHATGPT_CIMD_REDIRECT } from '../src/workrelay/issuer_policy.mjs';
 
+test('real public-proxy gateway discovery HEAD preserves metadata and method boundaries', async t => {
+  const directory = await fs.mkdtemp(join(dirname(fileURLToPath(import.meta.url)), '.workrelay-head-'));
+  await fs.chmod(directory, 0o700);
+  let gateway;
+  const stop = async () => {
+    if (gateway?.listening) await new Promise(resolve => { gateway.close(resolve); gateway.closeAllConnections(); });
+  };
+  t.after(async () => { await stop(); await fs.rm(directory, { recursive: true, force: true }); });
+  const origin = 'https://workrelay.example.test';
+  const key = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ format: 'jwk' });
+  const write = (name, value) => fs.writeFile(join(directory, name), JSON.stringify(value), { mode: 0o600 });
+  await write('human.json', { accountId: 'person1', verifier: await argon2.hash(randomBytes(32).toString('hex')) });
+  await write('issuer.json', { version: 1, accountId: 'person1', origin,
+    jwks: { keys: [{ ...key, kid: 'fixture', alg: 'RS256', use: 'sig' }] },
+    cookieKeys: [randomBytes(32).toString('hex')], clientId: CHATGPT_CIMD_ID,
+    redirectUris: [CHATGPT_CIMD_REDIRECT], clientRegistration: 'chatgpt-cimd' });
+  await write('revocations.json', { revoked_principals: [], revoked_tokens: [] });
+  for (const preapprove of [false, true]) {
+    const reserve = createServer();
+    await new Promise(resolve => reserve.listen(0, '127.0.0.1', resolve));
+    const port = reserve.address().port;
+    await new Promise(resolve => reserve.close(resolve));
+    const config = { public_origin: origin, issuer_mode: 'self-hosted', issuer_exposure: 'public-proxy',
+      issuer_state_dir: directory, audience: origin + '/mcp', principal: 'person1', owner: 'person1',
+      clientId: CHATGPT_CIMD_ID, redirectUris: [CHATGPT_CIMD_REDIRECT], clientRegistration: 'chatgpt-cimd',
+      issuer_preapprove_chatgpt: preapprove, bridge_config: '/unused-fixture', port,
+      revocation_file: join(directory, 'revocations.json'), issuer_public_proxy: { origin,
+        acknowledge_tls_terminator_and_loopback_exclusivity: true, require_parsed_x_forwarded_proto_https: true } };
+    gateway = createGateway(config);
+    await new Promise(resolve => gateway.listen(port, '127.0.0.1', resolve));
+    const request = (path, method = 'GET', headers = {}) => new Promise((resolve, reject) => {
+      const req = httpRequest({ host: '127.0.0.1', port, path, method,
+        headers: { host: 'workrelay.example.test', 'x-forwarded-proto': 'https', ...headers } }, res => {
+        let body = ''; res.on('data', chunk => { body += chunk; });
+        res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body }));
+      });
+      req.on('error', reject); req.end();
+    });
+    for (const path of ['/.well-known/oauth-authorization-server', '/.well-known/openid-configuration']) {
+      const get = await request(path), head = await request(path, 'HEAD');
+      assert.equal(get.status, 200); assert.equal(head.status, 200); assert.equal(head.body, '');
+      assert.deepEqual(JSON.parse(get.body).scopes_supported, preapprove ? ['workrelay:tasks'] : ['openid', 'offline_access']);
+      assert.equal(Number(get.headers['content-length']), Buffer.byteLength(get.body));
+      for (const name of ['content-length', 'content-type', 'cache-control', 'etag', 'vary'])
+        assert.equal(head.headers[name], get.headers[name], name);
+      for (const method of ['POST', 'PUT', 'DELETE', 'PATCH']) assert.equal((await request(path, method)).status, 405);
+      for (const headers of [{ host: 'wrong.example.test' }, { origin: 'https://wrong.example.test' },
+        { 'x-forwarded-proto': 'http' }, { forwarded: 'proto=https' }])
+        assert.equal((await request(path, 'HEAD', headers)).status, 400);
+    }
+    assert.equal((await request('/jwks', 'HEAD')).status, 405);
+    assert.equal((await request('/token', 'HEAD')).status, 405);
+    assert.notEqual((await request('/mcp', 'HEAD')).status, 200);
+    await stop();
+  }
+});
+
 test('production local-only loopback gateway requires provisioned state and rejects proxy claims', async t => {
   // Private issuer/config reads reject writable ancestors such as macOS tmpdir.
   const directory = await fs.mkdtemp(join(dirname(fileURLToPath(import.meta.url)), '.workrelay-issuer-mcp-'));

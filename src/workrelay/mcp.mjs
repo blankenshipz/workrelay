@@ -607,8 +607,8 @@ export function createGateway(rawConfig, options = {}) {
         /^\/interaction\/[A-Za-z0-9._~-]{1,128}$/.test(path) ?
         (path.startsWith('/interaction/') ? ['GET', 'POST'] : ['GET']) :
         path === '/token' || path === '/token/revocation' ? ['POST', 'OPTIONS'] :
-        ['/jwks', '/.well-known/oauth-authorization-server', '/.well-known/openid-configuration'].includes(path) ?
-        ['GET', 'OPTIONS'] : [];
+        ['/.well-known/oauth-authorization-server', '/.well-known/openid-configuration'].includes(path) ?
+        ['GET', 'HEAD', 'OPTIONS'] : path === '/jwks' ? ['GET', 'OPTIONS'] : [];
       if (!methods.includes(req.method)) return rejectIssuer(methods.length ? 405 : 404, 'not_found');
       if (req.headers['transfer-encoding']) return rejectIssuer(411, 'length_required');
       const isPost = req.method === 'POST';
