@@ -1,6 +1,38 @@
 # Workrelay
 
-Connect remote agents to an existing local OpenCode service. Workrelay has an **experimental authenticated MCP2 HTTPS gateway** and a separate local CLI adapter. The gateway is model-free: a remote MCP client can call Workrelay tools directly; Workrelay forwards scoped actions to local OpenCode, where configured agents use the existing included ChatGPT OAuth entitlement and safeguards. It is not an OpenAI Dot API, Meta Muse integration, or hosted relay service. Real Dot/mobile connectivity and event delivery remain unverified; see [the MCP boundary and setup](docs/mcp-local.md).
+**Bring a remote agent to the OpenCode you already run—without turning OpenCode into a public service.** Workrelay is an experimental, model-free bridge: its local adapter and authenticated MCP gateway pass narrowly scoped work to an existing local OpenCode service, where that service's configured agents, provider access, and safeguards remain in control.
+
+Workrelay is open source and early-stage. It is not a hosted relay, OpenAI Dot API, or Meta Muse integration. Dot/mobile connectivity and end-to-end remote event delivery have **not** been verified. The goal is to make safe, inspectable handoffs between agents and local development environments useful across more clients and execution setups, without pretending those integrations already exist.
+
+## How it works
+
+The usual remote task journey is:
+
+```text
+Remote MCP client
+      │ authenticated HTTPS (experimental gateway)
+      ▼
+Workrelay on your computer ── scoped task ──► existing local OpenCode
+      ▲                                          │
+      └──── status / result / events ◄───────────┘
+                    │
+                    └─ human handles any real permission decision in OpenCode/OpenChamber
+```
+
+Connect to the configured MCP endpoint, inspect `workrelay_profile`, start a small authorized task with `workrelay_start`, and follow its status/result. You can send conversational follow-up with `workrelay_respond`; that is not permission approval. Handle actual permission requests in the OpenCode/OpenChamber UI. Stop using the connection or cancel the owned root with `workrelay_cancel`; reconnect and check the same task with its stable key. The separate local CLI adapter offers start/status/respond/cancel for local workflows. OpenCode remains private and its existing permissions and provider safeguards stay in force.
+
+### Events are two related, distinct mechanisms
+
+- **OpenCode's internal event stream** is the local service's own session/runtime event source. Workrelay consumes local service state to track the task; this stream is not a remote subscription or webhook.
+- **MCP Events** are the gateway's client-facing protocol (`events/list`, `events/subscribe`, `events/unsubscribe`) for task lifecycle notifications such as `task.decision` and `task.completed`. Workrelay also implements signed HTTPS webhook delivery for configured callbacks. Both mechanisms have local protocol/controlled-transport test coverage; polling remains available.
+
+Those tests do not verify a user-operated public tunnel, independently operated issuer, external callback receiver, or real Dot/mobile round trip. Treat remote connectivity and delivery through your own deployed network path as unverified until tested in that environment. See [the MCP boundary, setup, and verification limits](docs/mcp-local.md).
+
+## Where the project is going—and how to help
+
+Workrelay is model/provider-neutral at the bridge boundary: it routes work to the OpenCode installation you configure; it does not itself supply a model. Today, this repository's documented guarded task setup is tied to the existing included ChatGPT OAuth/Codex entitlement and does not switch providers or buy credits. Broader provider and execution ecosystems—including Anthropic/Claude and other cloud-hosted or local models—are a direction for future compatible deployments, **not a claim of current verified support**. Any provider's authentication, cost, quota, and safety rules remain the operator's responsibility and must be supported by the configured OpenCode environment.
+
+We welcome contributors who want to improve the bridge, event interoperability, setup clarity, and safe client/supervisor integrations. Start with the implementation and docs in this repository, run the documented local checks, and open a focused pull request explaining the user journey and what you actually tested. Please distinguish local or synthetic evidence from a real external-client round trip; do not include credentials or private deployment details in issues or patches. We do not promise support for a particular supervisor or provider before its integration exists and is verified.
 
 ## Safety and setup
 
