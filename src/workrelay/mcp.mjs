@@ -13,7 +13,7 @@ import { z } from 'zod';
 import { createLocalJWKSet, createRemoteJWKSet, jwtVerify } from 'jose';
 import { createEventsService } from './events.mjs';
 import { createIssuerAdapter } from './oidc_adapter.mjs';
-import { createUnexposedIssuerPolicy } from './issuer_policy.mjs';
+import { createUnexposedIssuerPolicy, createPreapprovalDiagnostic } from './issuer_policy.mjs';
 import { createLocalInteractions, createOriginDiagnostic } from './issuer_interactions.mjs';
 const loopback = new Set(['127.0.0.1', '::1']);
 const key = z.string().regex(/^[A-Za-z0-9_-]{1,80}$/);
@@ -286,6 +286,8 @@ export function createGateway(rawConfig, options = {}) {
       redirectUris: settings.redirectUris, clientRegistration: settings.clientRegistration ?? 'static',
       fetchClientDocument: options.fetchClientDocument,
       preapproveChatGPT: config.issuer_preapprove_chatgpt ?? false,
+      onPreapprovalDenied: config.issuer_origin_diagnostic?.enabled === true ?
+        createPreapprovalDiagnostic(config.issuer_state_dir) : undefined,
       adapter: createIssuerAdapter(config.issuer_state_dir),
       findAccount: async (_ctx, id) => id === config.principal ? {
         accountId: id, claims: async () => ({ sub: id }),

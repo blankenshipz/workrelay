@@ -1,6 +1,49 @@
 // Unmounted policy prototype for the maintained oidc-provider. Never route
 // requests here until private provisioning, login, consent and CSRF are ready.
 import Provider, { errors } from 'oidc-provider';
+import { openSync, closeSync, fstatSync, lstatSync, readFileSync, writeFileSync,
+  linkSync, unlinkSync, fsyncSync, constants } from 'node:fs';
+import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
+import { privateDirectory } from './issuer_interactions.mjs';
+
+const preapprovalReasons = new Set(['account', 'session', 'client', 'redirect',
+  'resource_absent', 'resource_array', 'resource_other', 'scope_absent', 'scope_other', 'response_type']);
+
+// Same exclusive private arm/used/receipt protocol as the interaction recorder.
+// A separate target prevents a login/consent recorder from consuming this arm.
+export function createPreapprovalDiagnostic(directory) {
+  return reason => {
+    let fd, temporary;
+    try {
+      if (!preapprovalReasons.has(reason)) return;
+      privateDirectory(directory);
+      const arm = join(directory, 'origin-post.arm'), used = join(directory, 'origin-post.used');
+      const receipt = join(directory, 'origin-post.receipt.json');
+      fd = openSync(arm, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      const info = fstatSync(fd), pathInfo = lstatSync(arm);
+      if (!info.isFile() || info.uid !== process.getuid() || info.mode & 0o077 || info.nlink !== 1 ||
+          info.size > 160 || info.dev !== pathInfo.dev || info.ino !== pathInfo.ino) return;
+      const { target, attemptId, expiresAt } = JSON.parse(readFileSync(fd, 'utf8'));
+      closeSync(fd); fd = undefined;
+      if (target !== 'preapproval' || !/^[a-f0-9]{32}$/.test(attemptId ?? '') ||
+          !Number.isSafeInteger(expiresAt) || expiresAt <= Date.now() || expiresAt > Date.now() + 120000) return;
+      try { lstatSync(receipt); return; } catch (error) { if (error.code !== 'ENOENT') return; }
+      linkSync(arm, used);
+      unlinkSync(arm);
+      temporary = join(directory, `origin-post.${randomBytes(16).toString('hex')}.tmp`);
+      fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+      writeFileSync(fd, JSON.stringify({ attemptId, stage: 'preapproval', rejectionClass: reason }));
+      fsyncSync(fd); closeSync(fd); fd = undefined;
+      linkSync(temporary, receipt);
+      fd = openSync(directory, constants.O_RDONLY | constants.O_NOFOLLOW); fsyncSync(fd);
+    } catch { /* Recording cannot affect authorization or disclose an error. */ }
+    finally {
+      if (fd !== undefined) try { closeSync(fd); } catch { /* ignored */ }
+      if (temporary) try { unlinkSync(temporary); } catch { /* ignored */ }
+    }
+  };
+}
 
 export const CHATGPT_CIMD_ID = 'https://chatgpt.com/oauth/client.json';
 export const CHATGPT_CIMD_REDIRECT = 'https://chatgpt.com/connector_platform_oauth_redirect';
@@ -81,13 +124,19 @@ const exactHttps = (value, allowOrigin = false) => {
   return uri;
 };
 
-export async function loadPreapprovedChatGPTGrant(ctx, { principal, resource }) {
+export async function loadPreapprovedChatGPTGrant(ctx, { principal, resource, onDenied }) {
   const { account, session, client, params, provider } = ctx.oidc;
-  if (account?.accountId !== principal || session?.accountId !== principal ||
-      client?.clientId !== CHATGPT_CIMD_ID || params.client_id !== CHATGPT_CIMD_ID ||
-      params.redirect_uri !== CHATGPT_CIMD_REDIRECT || params.resource !== resource ||
-      params.scope !== 'workrelay:tasks' || params.response_type !== 'code')
+  const reason = account?.accountId !== principal ? 'account' : session?.accountId !== principal ? 'session' :
+    client?.clientId !== CHATGPT_CIMD_ID || params.client_id !== CHATGPT_CIMD_ID ? 'client' :
+    params.redirect_uri !== CHATGPT_CIMD_REDIRECT ? 'redirect' :
+    params.resource !== resource ? (params.resource === undefined ? 'resource_absent' :
+      Array.isArray(params.resource) ? 'resource_array' : 'resource_other') :
+    params.scope !== 'workrelay:tasks' ? (params.scope ? 'scope_other' : 'scope_absent') :
+    params.response_type !== 'code' ? 'response_type' : null;
+  if (reason) {
+    try { onDenied?.(reason); } catch { /* never change the denial */ }
     throw new errors.AccessDenied('request outside locally preapproved grant');
+  }
   const grantId = ctx.oidc.result?.consent?.grantId || session.grantIdFor(client.clientId);
   if (grantId) {
     const existing = await provider.Grant.find(grantId);
@@ -102,7 +151,8 @@ export async function loadPreapprovedChatGPTGrant(ctx, { principal, resource }) 
 }
 
 export function createUnexposedIssuerPolicy({ origin, principal, jwks, cookieKeys, clientId,
-  redirectUris, adapter, findAccount, clientRegistration = 'static', fetchClientDocument, preapproveChatGPT = false }) {
+  redirectUris, adapter, findAccount, clientRegistration = 'static', fetchClientDocument, preapproveChatGPT = false,
+  onPreapprovalDenied }) {
   const issuer = exactHttps(origin, true);
   if (issuer.pathname !== '/' || issuer.search || !principal || typeof principal !== 'string' ||
       !Array.isArray(jwks?.keys) || !jwks.keys.length ||
@@ -122,7 +172,7 @@ export function createUnexposedIssuerPolicy({ origin, principal, jwks, cookieKey
     ...(preapproveChatGPT ? { loadExistingGrant: ctx => {
       // Supported provider hook, called only after loadAccount. Never invent an
       // authenticated session or expand the single locally approved capability.
-      return loadPreapprovedChatGPTGrant(ctx, { principal, resource });
+      return loadPreapprovedChatGPTGrant(ctx, { principal, resource, onDenied: onPreapprovalDenied });
     } } : {}),
     clientAuthMethods: ['none'],
     ...(cimd ? { fetch: (url, options) => restrictedClientDocument(url, options, fetchClientDocument) } : {}),

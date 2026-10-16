@@ -10,7 +10,39 @@ import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import argon2 from 'argon2';
 import { createIssuerAdapter } from '../src/workrelay/oidc_adapter.mjs';
-import { createUnexposedIssuerPolicy, loadPreapprovedChatGPTGrant, CHATGPT_CIMD_ID, CHATGPT_CIMD_REDIRECT } from '../src/workrelay/issuer_policy.mjs';
+import { createUnexposedIssuerPolicy, loadPreapprovedChatGPTGrant, createPreapprovalDiagnostic, CHATGPT_CIMD_ID, CHATGPT_CIMD_REDIRECT } from '../src/workrelay/issuer_policy.mjs';
+
+test('preapproval denial recorder is bounded, exclusive, categorical and target-specific', async t => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'workrelay-preauth-diagnostic-'));
+  await fs.chmod(dir, 0o700);
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const arm = join(dir, 'origin-post.arm'), used = join(dir, 'origin-post.used');
+  const receipt = join(dir, 'origin-post.receipt.json');
+  const record = createPreapprovalDiagnostic(dir);
+  const attemptId = randomBytes(16).toString('hex');
+  const prepare = (target, expiresAt = Date.now() + 60000) => fs.writeFile(arm,
+    JSON.stringify({ target, attemptId, expiresAt }), { mode: 0o600 });
+  await prepare('consent'); record('scope_other');
+  assert.equal(await fs.access(used).then(() => true, () => false), false);
+  await prepare('preapproval', Date.now() - 1); record('scope_other');
+  assert.equal(await fs.access(used).then(() => true, () => false), false);
+  await prepare('preapproval'); await fs.chmod(arm, 0o644); record('scope_other');
+  assert.equal(await fs.access(used).then(() => true, () => false), false);
+  await fs.chmod(arm, 0o600); record('PRIVATE_MARKER');
+  assert.equal(await fs.access(used).then(() => true, () => false), false);
+  await assert.rejects(loadPreapprovedChatGPTGrant({ oidc: {
+    account: { accountId: 'synthetic' }, session: { accountId: 'synthetic' },
+    client: { clientId: CHATGPT_CIMD_ID }, params: { client_id: CHATGPT_CIMD_ID,
+      redirect_uri: CHATGPT_CIMD_REDIRECT, resource: 'https://issuer.example.test/mcp',
+      scope: 'openid PRIVATE_MARKER', response_type: 'code' },
+  } }, { principal: 'synthetic', resource: 'https://issuer.example.test/mcp', onDenied: record }),
+  error => error.error === 'access_denied');
+  assert.deepEqual(JSON.parse(await fs.readFile(receipt, 'utf8')),
+    { attemptId, stage: 'preapproval', rejectionClass: 'scope_other' });
+  assert.equal((await fs.stat(receipt)).mode & 0o777, 0o600);
+  await prepare('preapproval'); record('account');
+  assert.equal(JSON.parse(await fs.readFile(receipt, 'utf8')).rejectionClass, 'scope_other');
+});
 
 test('preapproval hook rejects account and capability escalation and cannot resurrect referenced revoked grants', async () => {
   let created = 0;
@@ -221,6 +253,7 @@ for (const registration of ['static', 'chatgpt-cimd', 'chatgpt-preapproved']) te
   const clientId = cimd ? CHATGPT_CIMD_ID : 'approved-client';
   const redirect = cimd ? CHATGPT_CIMD_REDIRECT : 'https://client.example.test/callback';
   let documentFetches = 0;
+  let accountLookups = 0;
   const provider = createUnexposedIssuerPolicy({ origin, principal: 'person1',
     jwks: { keys: [{ ...privateKey, kid: 'test', alg: 'RS256', use: 'sig' }] },
     cookieKeys: [randomBytes(32).toString('base64url')], clientId,
@@ -240,7 +273,8 @@ for (const registration of ['static', 'chatgpt-cimd', 'chatgpt-preapproved']) te
         { headers: { 'content-type': 'application/json' } });
     } } : {}),
     redirectUris: [redirect], adapter: createIssuerAdapter(directory),
-    findAccount: async (_ctx, id) => id === 'person1' ? { accountId: id, claims: async () => ({ sub: id }) } : undefined });
+    findAccount: async (_ctx, id) => { accountLookups++;
+      return id === 'person1' ? { accountId: id, claims: async () => ({ sub: id }) } : undefined; } });
   let handler = createLocalInteractions({ provider, directory, origin, clientId, resource: origin + '/mcp' });
   const server = createServer({ key: await fs.readFile(join(directory, 'tls.key')),
     cert: await fs.readFile(join(directory, 'tls.crt')) }, async (req, res) => {
@@ -284,6 +318,7 @@ for (const registration of ['static', 'chatgpt-cimd', 'chatgpt-preapproved']) te
     `&scope=workrelay%3Atasks&resource=${encodeURIComponent(origin + '/mcp')}&code_challenge=${'a'.repeat(43)}` +
     '&code_challenge_method=S256&state=test';
   let next = await request(auth);
+  assert.equal(accountLookups, 0, 'fresh no-cookie request has no authenticated account lookup');
   assert.equal(next.response.status, 303, next.text);
   let url = new URL(next.response.headers.get('location'), base);
   assert.equal(url.pathname.startsWith('/interaction/'), true);
