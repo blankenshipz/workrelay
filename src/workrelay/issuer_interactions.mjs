@@ -59,21 +59,23 @@ export function createOriginDiagnostic({ directory, origin, hostname, beforePubl
   const arm = join(directory, 'origin-post.arm');
   const used = join(directory, 'origin-post.used');
   const receipt = join(directory, 'origin-post.receipt.json');
-  return function capture(req, res) {
+  return function capture(req, res, prompt) {
     if (req.method !== 'POST' || !/^\/interaction\/[A-Za-z0-9._~-]{1,128}$/.test(req.url ?? '')) return null;
     try {
       privateDirectory(directory);
       const fd = openSync(arm, constants.O_RDONLY | constants.O_NOFOLLOW);
-      let expiry, attemptId;
+      let expiry, attemptId, target;
       try {
         const file = fstatSync(fd), link = lstatSync(arm);
         if (!file.isFile() || file.uid !== process.getuid() || file.mode & 0o077 || file.nlink !== 1 ||
             file.size > 128 || file.dev !== link.dev || file.ino !== link.ino) return null;
         const armBytes = Buffer.alloc(file.size);
         if (readSync(fd, armBytes, 0, file.size, 0) !== file.size) return null;
-        ({ expiresAt: expiry, attemptId } = JSON.parse(armBytes.toString('utf8')));
+        ({ expiresAt: expiry, attemptId, target } = JSON.parse(armBytes.toString('utf8')));
       } finally { closeSync(fd); }
       const now = Date.now();
+      if (target !== undefined && target !== 'consent') return null;
+      if (target === 'consent' && prompt !== 'consent') return null;
       if (!Number.isSafeInteger(expiry) || expiry <= now || expiry > now + 120000 ||
           typeof attemptId !== 'string' || !/^[a-f0-9]{32}$/.test(attemptId)) return null;
       try { lstatSync(receipt); return null; }
@@ -95,7 +97,7 @@ export function createOriginDiagnostic({ directory, origin, hostname, beforePubl
         ['same-origin', 'same-site', 'cross-site', 'none'].includes(fetchSite) ? fetchSite : 'other';
       const hostMatch = req.rawHeaders.filter((_, index) => index % 2 === 0)
         .filter(name => name.toLowerCase() === 'host').length === 1 && req.headers.host === hostname;
-      let stage = 'outer', rejectionClass = 'none';
+      let stage = 'outer', rejectionClass = 'none', consentRejection = 'none';
       res.once('finish', () => {
         let temporary, fd;
         try {
@@ -103,7 +105,8 @@ export function createOriginDiagnostic({ directory, origin, hostname, beforePubl
           temporary = join(directory, `origin-post.${randomBytes(16).toString('hex')}.tmp`);
           fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
           writeFileSync(fd, JSON.stringify({ attemptId, origin: originCategory, refererOriginMatch,
-            secFetchSite, hostMatch, status: res.statusCode, stage, rejectionClass }));
+            secFetchSite, hostMatch, status: res.statusCode, stage, rejectionClass,
+            ...(target === 'consent' ? { consentRejection } : {}) }));
           fsyncSync(fd);
           closeSync(fd); fd = undefined;
           beforePublish?.();
@@ -116,7 +119,10 @@ export function createOriginDiagnostic({ directory, origin, hostname, beforePubl
           if (temporary) try { unlinkSync(temporary); } catch { /* ignored */ }
         }
       });
-      return { reachedInteraction() { stage = 'interaction'; }, rejectedAtGateway(reason) {
+      return { rejectedConsent(reason) {
+        if (['provider_context', 'origin', 'form', 'csrf_session_binding', 'account', 'scope', 'grant', 'caught_failure'].includes(reason))
+          consentRejection = reason;
+      }, reachedInteraction() { stage = 'interaction'; }, rejectedAtGateway(reason) {
         if (['remote', 'forwarding', 'host', 'origin', 'framing', 'other'].includes(reason))
           rejectionClass = reason;
       } };
@@ -172,7 +178,7 @@ export async function provisionLocalHuman({ directory, accountId }) {
   return accountId;
 }
 
-export function createLocalInteractions({ provider, directory, origin, clientId, resource }) {
+export function createLocalInteractions({ provider, directory, origin, clientId, resource, captureConsent }) {
   if (!provider?.interactionDetails || !provider?.interactionFinished ||
       new URL(origin).origin !== origin || !origin.startsWith('https://') ||
       resource !== `${origin}/mcp` || !clientId) throw Error('invalid interaction configuration');
@@ -290,14 +296,22 @@ export function createLocalInteractions({ provider, directory, origin, clientId,
     if (!path) return false;
     const uid = path[1];
     if (req.method !== 'GET' && req.method !== 'POST') { send(res, 405); return true; }
+    let diagnostic;
+    const deny = reason => { diagnostic?.rejectedConsent(reason); send(res, 403); return true; };
     try {
       assertState();
       const admitted = admit(req);
       if (admitted !== 200) { send(res, admitted); return true; }
       // The provider binds this interaction to its own session cookies.
       const details = await provider.interactionDetails(req, res);
+      // A consent arm is claimed only after the provider identifies consent.
+      // Login, unknown interactions and failures before this point leave it armed.
+      if (req.method === 'POST' && details.prompt?.name === 'consent') {
+        diagnostic = captureConsent?.(req, res);
+        diagnostic?.reachedInteraction();
+      }
       if (details.uid !== uid || details.params?.client_id !== clientId ||
-          !['login', 'consent'].includes(details.prompt?.name)) { send(res, 403); return true; }
+          !['login', 'consent'].includes(details.prompt?.name)) return deny('provider_context');
       const name = details.prompt.name;
       if (req.method === 'GET') {
         const nonce = randomBytes(32).toString('base64url');
@@ -324,13 +338,14 @@ export function createLocalInteractions({ provider, directory, origin, clientId,
         send(res, 200, `<!doctype html><html lang="en"><meta charset="utf-8"><title>Workrelay ${name}</title><h1>Workrelay ${name}</h1><p>Client: ${client}</p><p>Access: ${escaped(resource)} (workrelay:tasks)</p>${disclosure}<form method="post" action="${action}"><input type="hidden" name="csrf" value="${escaped(nonce)}">${form}</form></html>`);
         return true;
       }
-      if (req.headers.origin !== origin) { send(res, 403); return true; }
-      const fields = await body(req);
+      if (req.headers.origin !== origin) return deny('origin');
+      let fields;
+      try { fields = await body(req); } catch { return deny('form'); }
       const cookieHeaders = (req.headers.cookie ?? '').split(';').map(s => s.trim());
       const cookies = cookieHeaders.filter(s => s.startsWith(`${COOKIE}=`));
       const cookie = cookies.length === 1 ? cookies[0].slice(COOKIE.length + 1) : '';
       if (!/^[A-Za-z0-9_-]{43}$/.test(cookie) || !/^[A-Za-z0-9_-]{43}$/.test(fields.get('csrf') ?? '') ||
-          !consume(uid, details, cookie, fields.get('csrf'))) { send(res, 403); return true; }
+          !consume(uid, details, cookie, fields.get('csrf'))) return deny('csrf_session_binding');
       res.setHeader('set-cookie', `${COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`);
       if (name === 'login') {
         if (fields.has('decision') || !fields.has('password')) { send(res, 403); return true; }
@@ -343,24 +358,25 @@ export function createLocalInteractions({ provider, directory, origin, clientId,
         await provider.interactionFinished(req, res, { login: { accountId: human.accountId, remember: false, amr: ['pwd'] } }, { mergeWithLastSubmission: false });
         return true;
       }
-      if (fields.has('password') || !['approve', 'deny'].includes(fields.get('decision')) || !details.session?.accountId) { send(res, 403); return true; }
+      if (fields.has('password') || !['approve', 'deny'].includes(fields.get('decision'))) return deny('form');
+      if (!details.session?.accountId) return deny('account');
       const human = readHuman();
-      if (details.session.accountId !== human.accountId) { send(res, 403); return true; }
+      if (details.session.accountId !== human.accountId) return deny('account');
       if (fields.get('decision') === 'deny') {
         await provider.interactionFinished(req, res, { error: 'access_denied' }, { mergeWithLastSubmission: false }); return true;
       }
       const missing = details.prompt.details;
       if (missing.missingOIDCScope?.length || missing.missingOIDCClaims?.length || missing.rar?.length ||
           Object.keys(missing.missingResourceScopes ?? {}).some(key => key !== resource) ||
-          (missing.missingResourceScopes?.[resource] ?? []).some(scope => scope !== 'workrelay:tasks')) { send(res, 403); return true; }
+          (missing.missingResourceScopes?.[resource] ?? []).some(scope => scope !== 'workrelay:tasks')) return deny('scope');
       const grant = details.grantId ? await provider.Grant.find(details.grantId) :
         new provider.Grant({ accountId: human.accountId, clientId });
-      if (!grant || grant.accountId !== human.accountId || grant.clientId !== clientId) { send(res, 403); return true; }
+      if (!grant || grant.accountId !== human.accountId || grant.clientId !== clientId) return deny('grant');
       if (missing.missingResourceScopes?.[resource]?.length) grant.addResourceScope(resource, 'workrelay:tasks');
       const grantId = await grant.save();
       await provider.interactionFinished(req, res, { consent: details.grantId ? {} : { grantId } }, { mergeWithLastSubmission: true });
       return true;
-    } catch { if (!res.headersSent) send(res, 403); else res.destroy(); return true; }
+    } catch { diagnostic?.rejectedConsent('caught_failure'); if (!res.headersSent) send(res, 403); else res.destroy(); return true; }
   };
 }
 

@@ -7,9 +7,34 @@ import { promises as fs } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
+import { Readable } from 'node:stream';
 import argon2 from 'argon2';
 import { createIssuerAdapter } from '../src/workrelay/oidc_adapter.mjs';
-import { createUnexposedIssuerPolicy } from '../src/workrelay/issuer_policy.mjs';
+import { createUnexposedIssuerPolicy, loadPreapprovedChatGPTGrant, CHATGPT_CIMD_ID, CHATGPT_CIMD_REDIRECT } from '../src/workrelay/issuer_policy.mjs';
+
+test('preapproval hook rejects account and capability escalation and cannot resurrect referenced revoked grants', async () => {
+  let created = 0;
+  const principal = 'synthetic-account', resource = 'https://issuer.example.test/mcp';
+  const context = () => ({ oidc: { account: { accountId: principal },
+    session: { accountId: principal, grantIdFor: () => undefined }, client: { clientId: CHATGPT_CIMD_ID },
+    params: { client_id: CHATGPT_CIMD_ID, redirect_uri: CHATGPT_CIMD_REDIRECT, resource,
+      scope: 'workrelay:tasks', response_type: 'code' },
+    provider: { Grant: class { constructor() { created++; } static async find() { return undefined; } } } } });
+  for (const mutate of [
+    c => { c.account.accountId = 'wrong'; }, c => { c.session.accountId = 'wrong'; },
+    c => { c.account = undefined; }, c => { c.client.clientId = 'wrong'; },
+    c => { c.params.client_id = 'wrong'; }, c => { c.params.resource += '/wrong'; },
+    c => { c.params.redirect_uri = 'https://wrong.example.test'; },
+    c => { c.params.scope += ' openid'; }, c => { c.params.scope = ''; },
+    c => { c.params.resource = [resource, 'https://wrong.example.test']; },
+    c => { c.session.grantIdFor = () => 'synthetic-revoked'; },
+  ]) {
+    const ctx = context(); mutate(ctx.oidc);
+    await assert.rejects(loadPreapprovedChatGPTGrant(ctx, { principal, resource }),
+      error => error.error === 'access_denied');
+  }
+  assert.equal(created, 0, 'denied requests never create a grant');
+});
 import { createLocalInteractions, createOriginDiagnostic, provisionLocalHuman } from '../src/workrelay/issuer_interactions.mjs';
 
 test('one-shot origin diagnostic persists categories only and does not decide HTTP authorization', async t => {
@@ -113,7 +138,72 @@ test('diagnostic claim is exclusive; a failed publication or stale receipt canno
   assert.notEqual(later, successful);
 });
 
-test('provisioning refuses non-TTY; actual HTTPS provider interaction requires CSRF, password and consent', async t => {
+test('consent-only one-shot records actual rejection branches without values; login cannot consume arm', async t => {
+  const directory = await fs.mkdtemp(join(tmpdir(), 'workrelay-consent-diagnostic-'));
+  await fs.chmod(directory, 0o700);
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  await fs.writeFile(join(directory, 'human.json'), JSON.stringify({ accountId: 'synthetic-account',
+    verifier: '$argon2id$synthetic-unused' }), { mode: 0o600 });
+  const origin = 'https://issuer.example.test', clientId = 'synthetic-client', resource = origin + '/mcp';
+  let details, grantFailure = false, throwFailure = false;
+  const provider = { interactionDetails: async () => details,
+    Grant: class { constructor({ accountId, clientId }) { this.accountId = grantFailure ? 'wrong' : accountId; this.clientId = clientId; }
+      addResourceScope() {} async save() { if (throwFailure) throw Error('PRIVATE_MARKER'); return 'synthetic-grant'; } },
+    interactionFinished: async (_req, res) => { res.writeHead(303); res.end(); } };
+  const capture = createOriginDiagnostic({ directory, origin, hostname: 'issuer.example.test' });
+  const handler = createLocalInteractions({ provider, directory, origin, clientId, resource,
+    captureConsent: (req, res) => capture(req, res, 'consent') });
+  async function call(method, fields = '', headers = {}) {
+    const req = Readable.from([fields]);
+    Object.assign(req, { method, url: '/interaction/synthetic', socket: { remoteAddress: '127.0.0.1' },
+      headers: { host: 'issuer.example.test', origin, 'content-type': 'application/x-www-form-urlencoded', ...headers } });
+    req.rawHeaders = Object.entries(req.headers).flat();
+    const res = new EventEmitter();
+    Object.assign(res, { headers: {}, text: '', statusCode: 200,
+      setHeader(name, value) { this.headers[name] = value; },
+      writeHead(status, values = {}) { this.statusCode = status; Object.assign(this.headers, values); },
+      end(value = '') { this.text += value; this.emit('finish'); } });
+    // Same outer invocation as gateway: consent-target arm must not claim here.
+    assert.equal(capture(req, res), null);
+    await handler(req, res);
+    return res;
+  }
+  for (const category of ['provider_context', 'origin', 'form', 'csrf_session_binding', 'account', 'scope', 'grant', 'caught_failure', 'none']) {
+    details = { uid: 'synthetic', params: { client_id: clientId }, prompt: { name: 'consent', details: {} },
+      session: { uid: 'synthetic-session', accountId: category === 'account' ? 'wrong' : 'synthetic-account' } };
+    grantFailure = category === 'grant'; throwFailure = category === 'caught_failure';
+    const page = await call('GET');
+    const cookie = page.headers['set-cookie'].split(';')[0];
+    const token = page.text.match(/name="csrf" value="([^"]+)"/)[1];
+    const attemptId = randomBytes(16).toString('hex');
+    await fs.writeFile(join(directory, 'origin-post.arm'), JSON.stringify({ attemptId,
+      expiresAt: Date.now() + 60000, target: 'consent' }), { mode: 0o600, flag: 'wx' });
+    // A login POST fails Origin but must leave this consent arm available.
+    details.prompt.name = 'login';
+    assert.equal((await call('POST', '', { origin: 'null' })).statusCode, 403);
+    assert.equal(await fs.access(join(directory, 'origin-post.used')).then(() => true, () => false), false);
+    details.prompt.name = 'consent';
+    if (category === 'provider_context') details.params.client_id = 'wrong';
+    if (category === 'scope') details.prompt.details = { missingOIDCScope: ['synthetic-forbidden'] };
+    const body = new URLSearchParams({ csrf: category === 'csrf_session_binding' ? 'wrong' : token,
+      decision: category === 'form' ? 'invalid' : 'approve' });
+    const result = await call('POST', body.toString(), { cookie, origin: category === 'origin' ? 'null' : origin });
+    assert.equal(result.statusCode, category === 'none' ? 303 : 403);
+    const receipt = JSON.parse(await fs.readFile(join(directory, 'origin-post.receipt.json'), 'utf8'));
+    assert.equal(receipt.attemptId, attemptId);
+    assert.equal(receipt.consentRejection, category);
+    assert.deepEqual(Object.keys(receipt).sort(), ['attemptId','origin','refererOriginMatch','secFetchSite',
+      'hostMatch','status','stage','rejectionClass','consentRejection'].sort());
+    assert.equal(receipt.stage, 'interaction');
+    assert.equal(JSON.stringify(receipt).includes('synthetic'), false);
+    assert.equal(JSON.stringify(receipt).includes('PRIVATE_MARKER'), false);
+    assert.equal(capture({ method: 'POST', url: '/interaction/synthetic' }, new EventEmitter(), 'consent'), null);
+    await fs.unlink(join(directory, 'origin-post.used'));
+    await fs.unlink(join(directory, 'origin-post.receipt.json'));
+  }
+});
+
+for (const registration of ['static', 'chatgpt-cimd', 'chatgpt-preapproved']) test(`${registration}: provisioning refuses non-TTY; actual HTTPS provider interaction requires CSRF, password and consent`, async t => {
   const directory = await fs.mkdtemp(join(tmpdir(), 'workrelay-interaction-'));
   await fs.chmod(directory, 0o700);
   t.after(() => fs.rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));
@@ -126,11 +216,29 @@ test('provisioning refuses non-TTY; actual HTTPS provider interaction requires C
   execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-noenc', '-subj', '/CN=localhost',
     '-keyout', join(directory, 'tls.key'), '-out', join(directory, 'tls.crt'), '-days', '1'], { stdio: 'ignore' });
   const origin = 'https://issuer.example.test';
-  const clientId = 'approved-client';
-  const redirect = 'https://client.example.test/callback';
+  const preapproveChatGPT = registration === 'chatgpt-preapproved';
+  const cimd = registration !== 'static';
+  const clientId = cimd ? CHATGPT_CIMD_ID : 'approved-client';
+  const redirect = cimd ? CHATGPT_CIMD_REDIRECT : 'https://client.example.test/callback';
+  let documentFetches = 0;
   const provider = createUnexposedIssuerPolicy({ origin, principal: 'person1',
     jwks: { keys: [{ ...privateKey, kid: 'test', alg: 'RS256', use: 'sig' }] },
     cookieKeys: [randomBytes(32).toString('base64url')], clientId,
+    clientRegistration: cimd ? 'chatgpt-cimd' : 'static', preapproveChatGPT,
+    ...(cimd ? { fetchClientDocument: async (id, options) => {
+      assert.equal(id, CHATGPT_CIMD_ID);
+      assert.equal(options.redirect, 'manual');
+      assert.ok(options.dispatcher, 'maintained provider supplies restricted dispatcher');
+      documentFetches++;
+      // Official public metadata shape observed 2026-10-16. Only this network
+      // fetch is isolated; policy validation and provider client resolution run.
+      return new Response(JSON.stringify({ client_id: CHATGPT_CIMD_ID,
+        redirect_uris: [CHATGPT_CIMD_REDIRECT], token_endpoint_auth_method: 'private_key_jwt',
+        token_endpoint_auth_methods_supported: ['none', 'private_key_jwt'],
+        grant_types: ['authorization_code', 'refresh_token'], response_types: ['code'],
+        jwks_uri: 'https://chatgpt.com/oauth/jwks.json' }),
+        { headers: { 'content-type': 'application/json' } });
+    } } : {}),
     redirectUris: [redirect], adapter: createIssuerAdapter(directory),
     findAccount: async (_ctx, id) => id === 'person1' ? { accountId: id, claims: async () => ({ sub: id }) } : undefined });
   let handler = createLocalInteractions({ provider, directory, origin, clientId, resource: origin + '/mcp' });
@@ -143,9 +251,14 @@ test('provisioning refuses non-TTY; actual HTTPS provider interaction requires C
   const base = `https://127.0.0.1:${server.address().port}`;
   const jar = new Map();
   async function request(path, opts = {}) {
+    const pathname = new URL(path, base).pathname;
+    const cookies = [...jar.values()].filter(cookie =>
+      pathname === cookie.path || pathname.startsWith(cookie.path.endsWith('/') ? cookie.path : cookie.path + '/'))
+      .sort((a, b) => b.path.length - a.path.length)
+      .map(cookie => `${cookie.name}=${cookie.value}`).join('; ');
     const response = await new Promise((resolve, reject) => {
       const call = httpsRequest(base + path, { method: opts.method ?? 'GET', rejectUnauthorized: false,
-        headers: { cookie: [...jar].map(([name, value]) => `${name}=${value}`).join('; '), ...opts.headers } }, result => {
+        headers: { cookie: cookies, ...opts.headers } }, result => {
         let text = '';
         result.on('data', chunk => { text += chunk; });
         result.on('end', () => resolve({ status: result.statusCode, headers: {
@@ -155,8 +268,15 @@ test('provisioning refuses non-TTY; actual HTTPS provider interaction requires C
       call.end(opts.body?.toString());
     });
     for (const set of response.headers.getSetCookie()) {
-      const [key, value] = set.split(';', 1)[0].split('=');
-      if (value) jar.set(key, value); else jar.delete(key);
+      const [pair, ...attributes] = set.split(';');
+      const split = pair.indexOf('='), name = pair.slice(0, split), value = pair.slice(split + 1);
+      const attrs = new Map(attributes.map(item => {
+        const [key, ...parts] = item.trim().split('='); return [key.toLowerCase(), parts.join('=')];
+      }));
+      const cookiePath = attrs.get('path') || pathname.slice(0, pathname.lastIndexOf('/') + 1);
+      const key = name + ':' + cookiePath;
+      if (!value || attrs.get('max-age') === '0') jar.delete(key);
+      else jar.set(key, { name, value, path: cookiePath });
     }
     return { response, text: response.text };
   }
@@ -187,6 +307,31 @@ test('provisioning refuses non-TTY; actual HTTPS provider interaction requires C
   assert.doesNotMatch(next.text, new RegExp(fixturePassword));
   const post = async (csrf, fields) => request(url.pathname, { method: 'POST', headers: {
     origin, 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, ...fields }) });
+  // Serialize successful controls from the emitted HTML, including only the
+  // selected submit button. Never include the unclicked Deny button.
+  const emittedForm = (html, password) => {
+    const attr = tag => new Map([...tag.matchAll(/([\w-]+)="([^"]*)"/g)].map(match => [match[1], match[2]]));
+    const formTag = html.match(/<form\b[^>]*>/)?.[0];
+    assert.ok(formTag, 'emitted form exists');
+    const form = attr(formTag);
+    assert.equal(form.get('method'), 'post');
+    const action = new URL(form.get('action'), origin);
+    assert.equal(action.origin, origin);
+    assert.equal(action.pathname, url.pathname, 'emitted action preserves interaction UID');
+    const fields = new URLSearchParams();
+    for (const tag of html.match(/<input\b[^>]*>/g) ?? []) {
+      const input = attr(tag);
+      if (input.get('type') === 'hidden') fields.append(input.get('name'), input.get('value'));
+      if (input.get('type') === 'password') fields.append(input.get('name'), password);
+    }
+    const button = attr((html.match(/<button\b[^>]*>/g) ?? [])[0] ?? '');
+    assert.equal(button.get('type'), 'submit');
+    if (button.has('name')) fields.append(button.get('name'), button.get('value'));
+    return { path: action.pathname, fields };
+  };
+  const submitForm = form => request(form.path, { method: 'POST', headers: {
+    origin, referer: origin + form.path, 'sec-fetch-site': 'same-origin',
+    'content-type': 'application/x-www-form-urlencoded' }, body: form.fields });
   assert.equal((await post('wrong', { password: fixturePassword })).response.status, 403);
   assert.equal((await post(first, { password: 'incorrect' })).response.status, 403);
   assert.equal((await post(first, { password: fixturePassword })).response.status, 403, 'nonce cannot be replayed');
@@ -206,12 +351,33 @@ test('provisioning refuses non-TTY; actual HTTPS provider interaction requires C
   const db = new DatabaseSync(join(directory, 'interactions.sqlite'));
   db.prepare('DELETE FROM attempts WHERE account=?').run('person1'); db.close();
   next = await request(url.pathname);
-  next = await post(hidden(next.text), { password: fixturePassword });
+  next = await submitForm(emittedForm(next.text, fixturePassword));
   assert.equal(next.response.status, 303);
   // Resume provider authorization after login, which must prompt for consent.
   url = new URL(next.response.headers.get('location'), base);
   next = await request(url.pathname + url.search);
   assert.equal(next.response.status, 303);
+  if (preapproveChatGPT) {
+    const callback = new URL(next.response.headers.get('location'));
+    assert.equal(callback.origin + callback.pathname, redirect, 'preapproved login goes directly to exact callback');
+    assert.equal(callback.searchParams.has('code'), true);
+    assert.equal(callback.searchParams.get('state'), 'test');
+    assert.ok(documentFetches > 0);
+    for (const invalid of [
+      auth.replace('workrelay%3Atasks', 'openid'),
+      auth.replace(encodeURIComponent(origin + '/mcp'), encodeURIComponent('https://wrong.example.test/mcp')),
+      auth.replace(encodeURIComponent(redirect), encodeURIComponent('https://wrong.example.test/callback')),
+      auth.replace(clientId, 'https://wrong.example.test/client.json'),
+      auth.replace(/&code_challenge=[^&]+&code_challenge_method=S256/, ''),
+    ]) {
+      const rejected = await request(invalid);
+      const location = rejected.response.headers.get('location');
+      assert.equal(location ? new URL(location, base).searchParams.has('code') : false, false,
+        'out-of-policy authorization never issues a code');
+      assert.ok([303, 400, 403].includes(rejected.response.status));
+    }
+    return;
+  }
   url = new URL(next.response.headers.get('location'), base);
   next = await request(url.pathname);
   assert.equal(next.response.status, 200);
@@ -223,12 +389,20 @@ test('provisioning refuses non-TTY; actual HTTPS provider interaction requires C
   const consentNonce = hidden(next.text);
   assert.equal((await post(consentNonce, { decision: 'unexpected' })).response.status, 403);
   next = await request(url.pathname);
-  next = await post(hidden(next.text), { decision: 'approve' });
+  const approveForm = emittedForm(next.text);
+  const hostileForm = { ...approveForm, fields: new URLSearchParams(approveForm.fields) };
+  hostileForm.fields.set('csrf', 'synthetic-wrong-csrf');
+  assert.equal((await submitForm(hostileForm)).response.status, 403, 'emitted consent with hostile CSRF denied');
+  next = await submitForm(approveForm);
   assert.equal(next.response.status, 303);
+  assert.equal((await submitForm(approveForm)).response.status, 403, 'consent form replay denied');
   url = new URL(next.response.headers.get('location'), base);
   next = await request(url.pathname + url.search);
   assert.equal(next.response.status, 303);
-  assert.match(next.response.headers.get('location'), /^https:\/\/client\.example\.test\/callback\?code=/);
+  const callback = new URL(next.response.headers.get('location'));
+  assert.equal(callback.origin + callback.pathname, redirect, 'exact allowlisted callback');
+  assert.equal(callback.searchParams.has('code'), true, 'callback contains code, never printed');
+  if (cimd) assert.ok(documentFetches > 0, 'CIMD dynamic resolution exercised, not static client fallback');
 });
 
 test('separate processes reserve at most five concurrent verifications in one private database', async t => {

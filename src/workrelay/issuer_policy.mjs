@@ -81,8 +81,28 @@ const exactHttps = (value, allowOrigin = false) => {
   return uri;
 };
 
+export async function loadPreapprovedChatGPTGrant(ctx, { principal, resource }) {
+  const { account, session, client, params, provider } = ctx.oidc;
+  if (account?.accountId !== principal || session?.accountId !== principal ||
+      client?.clientId !== CHATGPT_CIMD_ID || params.client_id !== CHATGPT_CIMD_ID ||
+      params.redirect_uri !== CHATGPT_CIMD_REDIRECT || params.resource !== resource ||
+      params.scope !== 'workrelay:tasks' || params.response_type !== 'code')
+    throw new errors.AccessDenied('request outside locally preapproved grant');
+  const grantId = ctx.oidc.result?.consent?.grantId || session.grantIdFor(client.clientId);
+  if (grantId) {
+    const existing = await provider.Grant.find(grantId);
+    if (!existing || existing.accountId !== principal || existing.clientId !== client.clientId)
+      throw new errors.AccessDenied('existing grant unavailable');
+    return existing; // Never recreate a revoked session-bound grant.
+  }
+  const grant = new provider.Grant({ accountId: principal, clientId: CHATGPT_CIMD_ID });
+  grant.addResourceScope(resource, 'workrelay:tasks');
+  await grant.save();
+  return grant;
+}
+
 export function createUnexposedIssuerPolicy({ origin, principal, jwks, cookieKeys, clientId,
-  redirectUris, adapter, findAccount, clientRegistration = 'static', fetchClientDocument }) {
+  redirectUris, adapter, findAccount, clientRegistration = 'static', fetchClientDocument, preapproveChatGPT = false }) {
   const issuer = exactHttps(origin, true);
   if (issuer.pathname !== '/' || issuer.search || !principal || typeof principal !== 'string' ||
       !Array.isArray(jwks?.keys) || !jwks.keys.length ||
@@ -96,7 +116,14 @@ export function createUnexposedIssuerPolicy({ origin, principal, jwks, cookieKey
       cimd && (clientId !== CHATGPT_CIMD_ID || allowed.length !== 1 ||
         allowed[0] !== CHATGPT_CIMD_REDIRECT)) throw Error('invalid issuer policy');
   const resource = `${issuer.origin}/mcp`;
+  if (typeof preapproveChatGPT !== 'boolean' || preapproveChatGPT && !cimd)
+    throw Error('preapproval requires exact ChatGPT CIMD policy');
   return new Provider(issuer.origin, {
+    ...(preapproveChatGPT ? { loadExistingGrant: ctx => {
+      // Supported provider hook, called only after loadAccount. Never invent an
+      // authenticated session or expand the single locally approved capability.
+      return loadPreapprovedChatGPTGrant(ctx, { principal, resource });
+    } } : {}),
     clientAuthMethods: ['none'],
     ...(cimd ? { fetch: (url, options) => restrictedClientDocument(url, options, fetchClientDocument) } : {}),
     adapter, jwks, cookies: { keys: cookieKeys, long: { httpOnly: true, secure: true, sameSite: 'lax' },

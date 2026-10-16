@@ -675,7 +675,7 @@ db.execute('PRAGMA wal_checkpoint(TRUNCATE)');db.close()`, join(directory, 'issu
   /wrong\.example\.test/);
   jar.clear();
   let step = await request(cimdAuth());
-  let sawLogin = false, sawConsent = false, cimdCode;
+  let sawLogin = false, sawConsent = false, cimdCode, consentAttempt;
   for (let i = 0; i < 12; i++) {
     assert.equal(step.response.status, 303, 'CIMD authorization step redirect status');
     const nextUrl = safeUrl(step.response.headers.get('location'), base, 'CIMD authorization');
@@ -688,7 +688,19 @@ db.execute('PRAGMA wal_checkpoint(TRUNCATE)');db.close()`, join(directory, 'issu
     if (step.response.status === 200 && nextUrl.pathname.startsWith('/interaction/')) {
       const login = step.text.includes('name="password"');
       if (login) sawLogin = true; else sawConsent = true;
+      if (!login) {
+        consentAttempt = randomBytes(16).toString('hex');
+        await fs.writeFile(diagnosticArm, JSON.stringify({ attemptId: consentAttempt,
+          expiresAt: Date.now() + 60000, target: 'consent' }), { mode: 0o600, flag: 'wx' });
+      }
       step = await post(nextUrl.pathname, hidden(step.text), login ? { password } : { decision: 'approve' });
+      if (!login) {
+        const captured = await diagnosticResult();
+        assert.equal(captured.attemptId, consentAttempt);
+        assert.equal(captured.consentRejection, 'none');
+        assert.equal(captured.stage, 'interaction');
+        assert.equal(captured.status, 303);
+      }
     }
   }
   assert.ok(cimdCode && sawLogin && sawConsent, 'fresh synthetic human login and consent issue code');

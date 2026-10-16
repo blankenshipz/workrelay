@@ -114,6 +114,10 @@ export function validateConfig(config, { testIssuer = false } = {}) {
       (!publicProxy || config.issuer_origin_diagnostic?.enabled !== true ||
         config.issuer_origin_diagnostic.arm_file !== join(config.issuer_state_dir, 'origin-post.arm')))
     throw Error('origin diagnostic requires exact private public-proxy opt-in');
+  if (config.issuer_preapprove_chatgpt !== undefined &&
+      (typeof config.issuer_preapprove_chatgpt !== 'boolean' ||
+        config.issuer_preapprove_chatgpt && (!selfHosted || config.clientRegistration !== 'chatgpt-cimd')))
+    throw Error('preapproval requires explicit self-hosted ChatGPT CIMD config');
   if (!config.audience || typeof config.audience !== 'string' || !config.principal ||
       typeof config.principal !== 'string' || !key.safeParse(config.owner).success ||
       !config.bridge_config || typeof config.bridge_config !== 'string')
@@ -281,6 +285,7 @@ export function createGateway(rawConfig, options = {}) {
       jwks: settings.jwks, cookieKeys: settings.cookieKeys, clientId: settings.clientId,
       redirectUris: settings.redirectUris, clientRegistration: settings.clientRegistration ?? 'static',
       fetchClientDocument: options.fetchClientDocument,
+      preapproveChatGPT: config.issuer_preapprove_chatgpt ?? false,
       adapter: createIssuerAdapter(config.issuer_state_dir),
       findAccount: async (_ctx, id) => id === config.principal ? {
         accountId: id, claims: async () => ({ sub: id }),
@@ -292,7 +297,8 @@ export function createGateway(rawConfig, options = {}) {
     issuerProvider.proxy = true; // trusted X-Forwarded-Proto is checked before these routes.
     issuerInteraction = createLocalInteractions({ provider: issuerProvider,
       directory: config.issuer_state_dir, origin: config.public_origin,
-      clientId: settings.clientId, resource: `${config.public_origin}/mcp` });
+      clientId: settings.clientId, resource: `${config.public_origin}/mcp`,
+      captureConsent: (req, res) => captureOrigin?.(req, res, 'consent') });
   }
   // Local-admin-only file. Any token hash revocation conservatively disables
   // this sole principal and its subscriptions until an explicit admin re-enable.
