@@ -1,7 +1,8 @@
 // Unmounted local human interaction handler. The caller must mount this BEFORE
 // provider.callback(), enforce its public-origin/proxy boundary, and serve HTTPS.
 import { randomBytes, createHash, timingSafeEqual } from 'node:crypto';
-import { openSync, closeSync, readFileSync, readSync, writeFileSync, lstatSync, fstatSync, realpathSync, constants } from 'node:fs';
+import { openSync, closeSync, readFileSync, readSync, writeFileSync, lstatSync, fstatSync, realpathSync,
+  linkSync, unlinkSync, fsyncSync, constants } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join, resolve, dirname, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -47,6 +48,80 @@ function sidecars(path) {
   for (const name of [path, `${path}-journal`, `${path}-wal`, `${path}-shm`]) {
     try { privateFile(name); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   }
+}
+
+// Explicit private one-shot diagnostic, never an authorization signal. The
+// arm file is operator-created mode 0600 and expires within two minutes. A
+// hard link with O_EXCL-like semantics admits at most one request across
+// processes; failure to record must never change the HTTP decision.
+export function createOriginDiagnostic({ directory, origin, hostname, beforePublish }) {
+  privateDirectory(directory);
+  const arm = join(directory, 'origin-post.arm');
+  const used = join(directory, 'origin-post.used');
+  const receipt = join(directory, 'origin-post.receipt.json');
+  return function capture(req, res) {
+    if (req.method !== 'POST' || !/^\/interaction\/[A-Za-z0-9._~-]{1,128}$/.test(req.url ?? '')) return null;
+    try {
+      privateDirectory(directory);
+      const fd = openSync(arm, constants.O_RDONLY | constants.O_NOFOLLOW);
+      let expiry, attemptId;
+      try {
+        const file = fstatSync(fd), link = lstatSync(arm);
+        if (!file.isFile() || file.uid !== process.getuid() || file.mode & 0o077 || file.nlink !== 1 ||
+            file.size > 128 || file.dev !== link.dev || file.ino !== link.ino) return null;
+        const armBytes = Buffer.alloc(file.size);
+        if (readSync(fd, armBytes, 0, file.size, 0) !== file.size) return null;
+        ({ expiresAt: expiry, attemptId } = JSON.parse(armBytes.toString('utf8')));
+      } finally { closeSync(fd); }
+      const now = Date.now();
+      if (!Number.isSafeInteger(expiry) || expiry <= now || expiry > now + 120000 ||
+          typeof attemptId !== 'string' || !/^[a-f0-9]{32}$/.test(attemptId)) return null;
+      try { lstatSync(receipt); return null; }
+      catch (error) { if (error.code !== 'ENOENT') return null; }
+      linkSync(arm, used); // exclusive: a second process cannot consume it
+      unlinkSync(arm);
+      const rawOriginCount = req.rawHeaders.filter((_, index) => index % 2 === 0)
+        .filter(name => name.toLowerCase() === 'origin').length;
+      const value = req.headers.origin;
+      const originCategory = rawOriginCount === 0 ? 'absent' : rawOriginCount !== 1 ? 'other' :
+        value === 'null' ? 'null' : value === origin ? 'equal' : 'other';
+      let refererOriginMatch = false;
+      try {
+        const parsed = new URL(req.headers.referer);
+        refererOriginMatch = parsed.origin === origin && !parsed.username && !parsed.password;
+      } catch { /* absent or malformed is only a false diagnostic category */ }
+      const fetchSite = req.headers['sec-fetch-site'];
+      const secFetchSite = fetchSite === undefined ? 'absent' :
+        ['same-origin', 'same-site', 'cross-site', 'none'].includes(fetchSite) ? fetchSite : 'other';
+      const hostMatch = req.rawHeaders.filter((_, index) => index % 2 === 0)
+        .filter(name => name.toLowerCase() === 'host').length === 1 && req.headers.host === hostname;
+      let stage = 'outer', rejectionClass = 'none';
+      res.once('finish', () => {
+        let temporary, fd;
+        try {
+          privateDirectory(directory);
+          temporary = join(directory, `origin-post.${randomBytes(16).toString('hex')}.tmp`);
+          fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+          writeFileSync(fd, JSON.stringify({ attemptId, origin: originCategory, refererOriginMatch,
+            secFetchSite, hostMatch, status: res.statusCode, stage, rejectionClass }));
+          fsyncSync(fd);
+          closeSync(fd); fd = undefined;
+          beforePublish?.();
+          linkSync(temporary, receipt); // old receipt is never replaced
+          const dirFd = openSync(directory, constants.O_RDONLY | constants.O_NOFOLLOW);
+          try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+        } catch { /* never change an authentication response for diagnostic I/O */ }
+        finally {
+          if (fd !== undefined) try { closeSync(fd); } catch { /* ignored */ }
+          if (temporary) try { unlinkSync(temporary); } catch { /* ignored */ }
+        }
+      });
+      return { reachedInteraction() { stage = 'interaction'; }, rejectedAtGateway(reason) {
+        if (['remote', 'forwarding', 'host', 'origin', 'framing', 'other'].includes(reason))
+          rejectionClass = reason;
+      } };
+    } catch { return null; }
+  };
 }
 function send(res, status, body = '') {
   res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',

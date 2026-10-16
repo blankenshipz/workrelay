@@ -6,10 +6,112 @@ import { execFileSync, spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { EventEmitter } from 'node:events';
 import argon2 from 'argon2';
 import { createIssuerAdapter } from '../src/workrelay/oidc_adapter.mjs';
 import { createUnexposedIssuerPolicy } from '../src/workrelay/issuer_policy.mjs';
-import { createLocalInteractions, provisionLocalHuman } from '../src/workrelay/issuer_interactions.mjs';
+import { createLocalInteractions, createOriginDiagnostic, provisionLocalHuman } from '../src/workrelay/issuer_interactions.mjs';
+
+test('one-shot origin diagnostic persists categories only and does not decide HTTP authorization', async t => {
+  const directory = await fs.mkdtemp(join(tmpdir(), 'workrelay-origin-diag-'));
+  await fs.chmod(directory, 0o700);
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const origin = 'https://issuer.example.test', hostname = 'issuer.example.test';
+  const capture = createOriginDiagnostic({ directory, origin, hostname });
+  const arm = join(directory, 'origin-post.arm'), receipt = join(directory, 'origin-post.receipt.json');
+  const used = join(directory, 'origin-post.used');
+  const run = async ({ originValue, status, stage, referer, fetchSite, host = hostname }) => {
+    const attemptId = randomBytes(16).toString('hex');
+    await fs.writeFile(arm, JSON.stringify({ expiresAt: Date.now() + 60000, attemptId }), { mode: 0o600, flag: 'wx' });
+    const req = { method: 'POST', url: '/interaction/test',
+      rawHeaders: ['Host', host, ...(originValue === undefined ? [] : ['Origin', originValue])],
+      headers: { host, ...(originValue === undefined ? {} : { origin: originValue }),
+        referer, 'sec-fetch-site': fetchSite, authorization: 'Bearer SYNTHETIC_PRIVATE_MARKER',
+        cookie: 'SYNTHETIC_PRIVATE_MARKER' } };
+    const res = new EventEmitter(); res.statusCode = status;
+    const observed = capture(req, res);
+    assert.ok(observed);
+    if (stage === 'interaction') observed.reachedInteraction();
+    res.emit('finish');
+    const data = JSON.parse(await fs.readFile(receipt, 'utf8'));
+    assert.equal((await fs.stat(receipt)).mode & 0o777, 0o600);
+    assert.deepEqual(Object.keys(data).sort(),
+      ['attemptId', 'hostMatch', 'origin', 'refererOriginMatch', 'secFetchSite', 'stage', 'status', 'rejectionClass'].sort());
+    assert.equal(data.attemptId, attemptId);
+    assert.equal(JSON.stringify(data).includes('SYNTHETIC_PRIVATE_MARKER'), false);
+    assert.equal(JSON.stringify(data).includes('other.example.test'), false);
+    assert.equal(JSON.stringify(data).includes('/interaction/test'), false);
+    assert.equal(capture(req, res), null, 'one POST consumes the arm');
+    await fs.unlink(used); await fs.unlink(receipt);
+    const { attemptId: _attemptId, ...categories } = data;
+    return categories;
+  };
+  assert.deepEqual(await run({ originValue: undefined, status: 400, stage: 'outer' }),
+    { origin: 'absent', refererOriginMatch: false, secFetchSite: 'absent', hostMatch: true,
+      status: 400, stage: 'outer', rejectionClass: 'none' });
+  assert.equal((await run({ originValue: 'null', status: 400, stage: 'outer', fetchSite: 'cross-site' })).origin, 'null');
+  const accepted = await run({ originValue: origin, status: 403, stage: 'interaction',
+    referer: origin + '/interaction/test', fetchSite: 'same-origin' });
+  assert.equal(accepted.origin, 'equal');
+  assert.equal(accepted.refererOriginMatch, true);
+  assert.equal(accepted.secFetchSite, 'same-origin');
+  assert.equal((await run({ originValue: 'https://other.example.test', status: 400,
+    stage: 'outer', host: 'other.example.test', fetchSite: 'attacker-secret' })).origin, 'other');
+  await fs.writeFile(arm, JSON.stringify({ expiresAt: Date.now() + 60000,
+    attemptId: randomBytes(16).toString('hex') }), { mode: 0o600 });
+  await fs.chmod(arm, 0o644);
+  assert.equal(capture({ method: 'POST', url: '/interaction/test', rawHeaders: [], headers: {} },
+    new EventEmitter()), null, 'insecure arm fails closed');
+  assert.equal(await fs.access(used).then(() => true, () => false), false);
+  await fs.unlink(arm);
+  await fs.writeFile(arm, JSON.stringify({ expiresAt: Date.now() - 1,
+    attemptId: randomBytes(16).toString('hex') }), { mode: 0o600 });
+  assert.equal(capture({ method: 'POST', url: '/interaction/test', rawHeaders: [], headers: {} },
+    new EventEmitter()), null, 'expired arm does not capture');
+});
+
+test('diagnostic claim is exclusive; a failed publication or stale receipt cannot masquerade as a fresh attempt', async t => {
+  const directory = await fs.mkdtemp(join(tmpdir(), 'workrelay-origin-atomic-'));
+  await fs.chmod(directory, 0o700);
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const arm = join(directory, 'origin-post.arm'), used = join(directory, 'origin-post.used');
+  const receipt = join(directory, 'origin-post.receipt.json');
+  const request = { method: 'POST', url: '/interaction/synthetic', rawHeaders: ['Host', 'issuer.example.test'],
+    headers: { host: 'issuer.example.test', cookie: 'PRIVATE_MARKER' } };
+  const response = () => Object.assign(new EventEmitter(), { statusCode: 400 });
+  const armAttempt = async () => {
+    const id = randomBytes(16).toString('hex');
+    await fs.writeFile(arm, JSON.stringify({ attemptId: id, expiresAt: Date.now() + 60000 }),
+      { mode: 0o600, flag: 'wx' });
+    return id;
+  };
+  let interrupted = false;
+  const capture = createOriginDiagnostic({ directory, origin: 'https://issuer.example.test',
+    hostname: 'issuer.example.test', beforePublish: () => {
+      if (!interrupted) { interrupted = true; throw Error('synthetic publication interruption'); }
+    } });
+  const initial = await armAttempt();
+  const first = response(), second = response();
+  assert.ok(capture(request, first));
+  assert.equal(capture(request, second), null, 'only the first simultaneous POST claims this arm');
+  first.emit('finish');
+  assert.equal(await fs.access(receipt).then(() => true, () => false), false,
+    'interrupted temp is not published as partial JSON');
+  assert.deepEqual((await fs.readdir(directory)).sort(), ['origin-post.used']);
+  const retryId = await armAttempt();
+  assert.notEqual(retryId, initial);
+  assert.equal(capture(request, response()), null, 'used marker denies re-arm even without a receipt');
+  await fs.unlink(arm); await fs.unlink(used); // simulated deliberate offline cleanup
+  const successful = await armAttempt();
+  const final = response(); assert.ok(capture(request, final)); final.emit('finish');
+  assert.equal(JSON.parse(await fs.readFile(receipt, 'utf8')).attemptId, successful);
+  assert.equal((await fs.stat(receipt)).mode & 0o777, 0o600);
+  await fs.unlink(used); // stale receipt still denies a re-arm after incomplete cleanup
+  const later = await armAttempt();
+  assert.equal(capture(request, response()), null, 'stale receipt denies new attempt');
+  assert.equal(JSON.parse(await fs.readFile(receipt, 'utf8')).attemptId, successful);
+  assert.notEqual(later, successful);
+});
 
 test('provisioning refuses non-TTY; actual HTTPS provider interaction requires CSRF, password and consent', async t => {
   const directory = await fs.mkdtemp(join(tmpdir(), 'workrelay-interaction-'));

@@ -461,6 +461,7 @@ db.execute('PRAGMA wal_checkpoint(TRUNCATE)');db.close()`, join(directory, 'issu
   // HTTP, never proof of a public TLS terminator or actual ChatGPT client.
   const publicConfig = { ...config, issuer_exposure: 'public-proxy',
     issuer_public_proxy: { origin, acknowledge_tls_terminator_and_loopback_exclusivity: true },
+    issuer_origin_diagnostic: { enabled: true, arm_file: join(directory, 'origin-post.arm') },
     revocation_file: join(directory, 'revocation.json') };
   assert.throws(() => createGateway({ ...publicConfig, issuer_public_proxy: undefined }), /public-proxy issuer requires/);
   assert.throws(() => createGateway({ ...publicConfig, revocation_file: undefined }), /public-proxy issuer requires/);
@@ -477,6 +478,37 @@ db.execute('PRAGMA wal_checkpoint(TRUNCATE)');db.close()`, join(directory, 'issu
     { cwd: process.cwd(), stdio: ['ignore', 'ignore', 'pipe'] });
   const publicDiagnostics = observeChild(publicCli);
   await waitForGateway(publicCli, publicDiagnostics, 'ordinary public-proxy CLI');
+  const diagnosticArm = join(directory, 'origin-post.arm');
+  const diagnosticUsed = join(directory, 'origin-post.used');
+  const diagnosticReceipt = join(directory, 'origin-post.receipt.json');
+  const armDiagnostic = async () => {
+    const attemptId = randomBytes(16).toString('hex');
+    await fs.writeFile(diagnosticArm,
+      JSON.stringify({ expiresAt: Date.now() + 60000, attemptId }), { mode: 0o600, flag: 'wx' });
+    return attemptId;
+  };
+  const diagnosticResult = async () => {
+    for (let attempt = 0; attempt < 20; attempt++) {
+      try { return safeJson(await fs.readFile(diagnosticReceipt, 'utf8'), 'categorical origin receipt'); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    assert.fail('one-shot diagnostic receipt missing');
+  };
+  const nullAttempt = await armDiagnostic();
+  assert.equal((await request('/interaction/synthetic', { method: 'POST', headers: {
+    origin: 'null', 'content-type': 'application/x-www-form-urlencoded',
+  }, body: 'csrf=synthetic' })).response.status, 400);
+  assert.deepEqual(await diagnosticResult(), { attemptId: nullAttempt, origin: 'null', refererOriginMatch: false,
+    secFetchSite: 'absent', hostMatch: true, status: 400, stage: 'outer', rejectionClass: 'origin' });
+  await fs.unlink(diagnosticUsed); await fs.unlink(diagnosticReceipt);
+  const canonicalAttempt = await armDiagnostic();
+  assert.equal((await request('/interaction/synthetic', { method: 'POST', headers: {
+    origin, 'content-type': 'application/x-www-form-urlencoded',
+  }, body: 'csrf=synthetic' })).response.status, 403);
+  assert.deepEqual(await diagnosticResult(), { attemptId: canonicalAttempt, origin: 'equal', refererOriginMatch: false,
+    secFetchSite: 'absent', hostMatch: true, status: 403, stage: 'interaction', rejectionClass: 'none' });
+  await fs.unlink(diagnosticUsed); await fs.unlink(diagnosticReceipt);
   assert.equal((await request('/jwks', { headers: { host: `127.0.0.1:${port}` } })).response.status, 400);
   assert.equal((await request('/jwks', { headers: { 'x-forwarded-proto': 'https' } })).response.status, 400);
   assert.equal((await request('/jwks', { headers: { 'x-forwarded-for': '198.51.100.17' } })).response.status, 400,
@@ -494,6 +526,24 @@ db.execute('PRAGMA wal_checkpoint(TRUNCATE)');db.close()`, join(directory, 'issu
     });
     socket.once('error', reject);
   });
+  const checkGatewayClass = async (headers, expected, expectedOrigin = 'absent') => {
+    const id = await armDiagnostic();
+    const result = await rawStatus(`POST /interaction/synthetic HTTP/${headers ? '1.1' : '1.0'}\r\n${headers}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
+    assert.equal(result, 400);
+    const receipt = await diagnosticResult();
+    assert.equal(receipt.attemptId, id);
+    assert.equal(receipt.rejectionClass, expected);
+    assert.equal(receipt.origin, expectedOrigin);
+    assert.equal(receipt.stage, 'outer');
+    await fs.unlink(diagnosticUsed); await fs.unlink(diagnosticReceipt);
+  };
+  await checkGatewayClass('', 'host');
+  await checkGatewayClass('Host: workrelay.example.test\r\nHost: workrelay.example.test\r\n', 'host');
+  await checkGatewayClass('Host: workrelay.example.test\r\nOrigin: https://wrong.example.test\r\nOrigin: https://workrelay.example.test\r\n', 'origin', 'other');
+  await checkGatewayClass('Host: workrelay.example.test\r\nContent-Type: text/plain\r\nContent-Type: text/plain\r\n', 'framing');
+  await checkGatewayClass('Host: workrelay.example.test\r\nX-Forwarded-For: 198.51.100.17\r\n', 'forwarding');
+  await checkGatewayClass('Host: workrelay.example.test\r\nOrigin: https://wrong.example.test\r\n', 'origin', 'other');
+  await checkGatewayClass('Host: workrelay.example.test\r\nOrigin: https://wrong.example.test\r\nX-Forwarded-For: 198.51.100.17\r\n', 'forwarding', 'other');
   assert.equal(await rawStatus('GET /jwks HTTP/1.1\r\nHost: workrelay.example.test\r\nHost: workrelay.example.test\r\n\r\n'), 400);
   assert.equal(await rawStatus('POST /token HTTP/1.1\r\nHost: workrelay.example.test\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n'), 400);
   assert.equal(await rawStatus('GET http://wrong.example.test/jwks HTTP/1.1\r\nHost: workrelay.example.test\r\n\r\n'), 400);

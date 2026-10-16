@@ -14,7 +14,7 @@ import { createLocalJWKSet, createRemoteJWKSet, jwtVerify } from 'jose';
 import { createEventsService } from './events.mjs';
 import { createIssuerAdapter } from './oidc_adapter.mjs';
 import { createUnexposedIssuerPolicy } from './issuer_policy.mjs';
-import { createLocalInteractions } from './issuer_interactions.mjs';
+import { createLocalInteractions, createOriginDiagnostic } from './issuer_interactions.mjs';
 const loopback = new Set(['127.0.0.1', '::1']);
 const key = z.string().regex(/^[A-Za-z0-9_-]{1,80}$/);
 const grantId = z.string().regex(/^grant_[0-9a-f]{32}$/);
@@ -110,6 +110,10 @@ export function validateConfig(config, { testIssuer = false } = {}) {
       !config.revocation_file || typeof config.revocation_file !== 'string' ||
       !config.revocation_file.startsWith('/')))
     throw Error('public-proxy issuer requires explicit origin, operator contract and revocation reference');
+  if (config.issuer_origin_diagnostic !== undefined &&
+      (!publicProxy || config.issuer_origin_diagnostic?.enabled !== true ||
+        config.issuer_origin_diagnostic.arm_file !== join(config.issuer_state_dir, 'origin-post.arm')))
+    throw Error('origin diagnostic requires exact private public-proxy opt-in');
   if (!config.audience || typeof config.audience !== 'string' || !config.principal ||
       typeof config.principal !== 'string' || !key.safeParse(config.owner).success ||
       !config.bridge_config || typeof config.bridge_config !== 'string')
@@ -440,6 +444,8 @@ export function createGateway(rawConfig, options = {}) {
   const metadataUrl = `${config.public_origin}/.well-known/oauth-protected-resource/mcp`;
   const resource = `${config.public_origin}/mcp`;
   const hostname = new URL(config.public_origin).host;
+  const captureOrigin = config.issuer_origin_diagnostic?.enabled === true ?
+    createOriginDiagnostic({ directory: config.issuer_state_dir, origin: config.public_origin, hostname }) : null;
   const localHostFor = address => address === '::1' ? `[::1]:${config.port}` : `127.0.0.1:${config.port}`;
   const metadata = JSON.stringify({ resource, authorization_servers: [config.issuer], scopes_supported: ['workrelay:tasks'],
     bearer_methods_supported: ['header'] });
@@ -479,6 +485,7 @@ export function createGateway(rawConfig, options = {}) {
     }); } finally { pendingAdmissions.set(kind, pendingAdmissions.get(kind) - 1); }
   }
   const server = createServer(async (req, res) => {
+    const originDiagnostic = captureOrigin?.(req, res);
     // Never trust forwarded identity or a caller-supplied owner. The public Host is
     // canonical; the local Host is only available to a real loopback peer.
     const remote = req.socket.remoteAddress;
@@ -522,7 +529,31 @@ export function createGateway(rawConfig, options = {}) {
           (req.headers.origin && req.headers.origin !== config.public_origin) ||
           (req.headers['x-forwarded-host'] && req.headers['x-forwarded-host'] !== hostname) ||
           (req.headers['x-forwarded-proto'] && req.headers['x-forwarded-proto'] !== 'https')) ||
-        req.headers.forwarded || req.headers['x-forwarded-prefix']) return failure(res, 400, 'invalid_origin');
+        req.headers.forwarded || req.headers['x-forwarded-prefix']) {
+      if (originDiagnostic) {
+        const rejectionClass = !loopback.has(remote) ? 'remote' :
+          selfHosted && rawNames.filter(name => name === 'host').length !== 1 ? 'host' :
+          selfHosted && rawNames.filter(name => name === 'origin').length > 1 ? 'origin' :
+          selfHosted && ['content-length', 'transfer-encoding', 'content-type'].some(name =>
+            rawNames.filter(value => value === name).length > 1) ? 'framing' :
+          (selfHosted && (!validProxyFor || rawNames.some(name => name === 'forwarded' || name === 'x-real-ip' ||
+              name.startsWith('x-forwarded-') && name !== 'x-forwarded-proto' &&
+                !(discardProxyFor && name === 'x-forwarded-for')) ||
+            (requireProxyProto ? proxyProtoCount !== 1 || req.headers['x-forwarded-proto'] !== 'https' :
+              proxyProtoCount !== 0)) || req.headers.forwarded || req.headers['x-forwarded-prefix']) ? 'forwarding' :
+          req.headers.host !== (selfHosted ? (publicProxy ? hostname : localHost) : hostname) &&
+            (selfHosted || req.headers.host !== localHost) ? 'host' :
+          req.headers.origin && req.headers.origin !== (selfHosted && !publicProxy ?
+            `http://${localHost}` : config.public_origin) ? 'origin' :
+          publicProxy && (typeof req.url !== 'string' || !req.url.startsWith('/') ||
+            req.url.startsWith('//') || req.url.length > 4096 || req.url.includes('#') ||
+            req.rawHeaders.reduce((size, part) => size + Buffer.byteLength(part), 0) > 8192 ||
+            req.headers['content-encoding'] || req.headers['transfer-encoding'] &&
+              req.headers['content-length']) ? 'framing' : 'other';
+        originDiagnostic.rejectedAtGateway(rejectionClass);
+      }
+      return failure(res, 400, 'invalid_origin');
+    }
     if (discardProxyFor) {
       delete req.headers['x-forwarded-for'];
       req.rawHeaders = req.rawHeaders.reduce((headers, value, index, raw) => {
@@ -595,6 +626,7 @@ export function createGateway(rawConfig, options = {}) {
         checked.headers = { ...checked.headers, host: hostname,
           'x-forwarded-host': hostname, 'x-forwarded-proto': 'https',
           ...(checked.headers.origin ? { origin: config.public_origin } : {}) };
+        originDiagnostic?.reachedInteraction();
         if (await issuerInteraction(checked, res)) return;
         return await issuerHttp(checked, res);
       } catch (error) {
