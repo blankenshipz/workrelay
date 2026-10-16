@@ -57,7 +57,7 @@ function projection(session) {
 
 export function createManagedReader(expected, readBinding, { loadService = path => import(pathToFileURL(path).href),
   fetcher = fetch, canonical = realpathSync, stat = lstatSync, internalAuthorize } = {}) {
-  const read = async (action, input, claims) => {
+  const read = async (action, input, claims, selectedSession) => {
     const binding = readBinding(); // Re-read owner-only capability every request, including revocation.
     checkManagedBinding(binding, claims, expected);
     if (canonical(binding.service_registration) !== binding.service_registration ||
@@ -89,7 +89,7 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       const before = stat(binding.service_registration);
       if (before.dev !== registration.dev || before.ino !== registration.ino || before.mtimeMs !== registration.mtimeMs) deny();
     } else if (action === 'messages') {
-      if (!sid.test(input.session_id ?? '')) deny();
+      if (!sid.test(input.session_id ?? '') || selectedSession !== input.session_id) deny();
       const limit = input.limit ?? 10;
       if (!Number.isInteger(limit) || limit < 1 || limit > 20) deny();
       const query = new URLSearchParams({ limit: String(limit) });
@@ -152,7 +152,11 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       const next = value.cursor?.next ?? null;
       if (next !== null && (typeof next !== 'string' || next.length > 4096 || /[\x00-\x1f\x7f]/.test(next))) deny();
       const items = value.data.map(message => {
-        if (message.sessionID !== input.session_id || !/^msg[A-Za-z0-9_-]{1,160}$/.test(message.id ?? '')) deny();
+        // Public SessionMessage.Base has no sessionID. Authority comes from the
+        // authenticated, pinned session-scoped route after exact-session lookup.
+        // If a backend supplies an explicit binding, it must not conflict.
+        if (!message || (Object.hasOwn(message, 'sessionID') && message.sessionID !== input.session_id) ||
+            !/^msg[A-Za-z0-9_-]{1,160}$/.test(message.id ?? '')) deny();
         const base = { message_id: message.id };
         if (message.type === 'user') return { ...base, role: 'user', ...managedText(message.text) };
         if (message.type === 'assistant' && Array.isArray(message.content)) return { ...base, role: 'assistant',
@@ -164,7 +168,7 @@ export function createManagedReader(expected, readBinding, { loadService = path 
     }
     if (action === 'read') {
       if (value.data?.id !== input.session_id) deny();
-      const context = input.include_messages === true ? await read('messages', input, claims) : { omission: 'Request include_messages:true for visible context.' };
+      const context = input.include_messages === true ? await read('messages', input, claims, value.data.id) : { omission: 'Request include_messages:true for visible context.' };
       if (JSON.stringify(readBinding()) !== JSON.stringify(binding)) deny();
       return { ...projection(value.data), server_id: managedServerID(binding), context };
     }
@@ -177,5 +181,5 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       guidance: items.length ? 'Use returned session IDs and actions; continue with next_cursor.' :
         'No sessions on this page. Continue with next_cursor if present. No enrollment is required for this bound server.' };
   };
-  return read;
+  return (action, input, claims) => read(action, input, claims);
 }

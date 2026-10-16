@@ -31,7 +31,7 @@ test('managed registration read boundary is pinned, revoked, bounded and sanitiz
     subject: 'alice', client_id: client, server: 'http://127.0.0.1:12345', service_registration: '/private/service.json', client_service_module: '/private/service.mjs' };
   const expected = { issuer: b.issuer, audience: b.audience, principal: b.subject, managed_server: { ...b } };
   const claims = { iss: b.issuer, aud: b.audience, sub: b.subject, client_id: client };
-  let binding = { ...b }, endpoint = b.server, moved = false, calls = 0, during, foreign = false, messageRevocation = false, surfaceText;
+  let binding = { ...b }, endpoint = b.server, moved = false, calls = 0, during, foreign = false, messageRevocation = false, surfaceText, wrongSelection = false;
   const reader = createManagedReader(expected, () => ({ ...binding }), {
     canonical: path => moved ? '/replacement' : path,
     stat: () => ({ isFile: () => true, isDirectory: () => true, isSymbolicLink: () => false, uid: process.getuid(), mode: 0o600, dev: 1, ino: 1, mtimeMs: 1 }),
@@ -41,16 +41,18 @@ test('managed registration read boundary is pinned, revoked, bounded and sanitiz
       const session = { id: root, projectID: '/PRIVATE/SECRET_PROJECT?token=SECRET', title: surfaceText ?? 'Useful project password=SECRET', metadata: { password: 'SECRET' }, location: { directory: '/PRIVATE' }, time: { idle: 1 }, outcome: 'succeeded' };
       if (during) during();
       if (url.pathname.endsWith('/message')) {
+        assert.equal(url.pathname, `/api/session/${root}/message`);
         if (messageRevocation) binding.revoked = true;
         assert.equal(url.searchParams.get('limit'), '3');
         assert.equal(url.searchParams.has('order'), !url.searchParams.has('cursor'));
         return new Response(JSON.stringify({ data: [
-          { id: 'msg_user', sessionID: foreign ? 'ses_other' : root, type: 'user', text: surfaceText ?? 'Please repair navigation token=SECRET', files: [{ content: 'SECRET_FILE' }] },
-          { id: 'msg_assistant', sessionID: root, type: 'assistant', content: [{ type: 'text', text: surfaceText ?? 'Implemented navigation; live acceptance pending.', state: { encrypted: 'HIDDEN' } }, { type: 'reasoning', text: 'HIDDEN' }, { type: 'encrypted_reasoning', data: 'HIDDEN' }, { type: 'tool', output: 'SECRET_FILE' }] },
-          { id: 'msg_system', sessionID: root, type: 'system', text: 'HIDDEN' }
+          // Actual public SessionMessage.Base: id/time, no sessionID.
+          { id: 'msg_user', time: { created: 1 }, ...(foreign ? { sessionID: 'ses_other' } : {}), type: 'user', text: surfaceText ?? 'Please repair navigation token=SECRET', files: [{ content: 'SECRET_FILE' }] },
+          { id: 'msg_assistant', time: { created: 2 }, type: 'assistant', content: [{ type: 'text', text: surfaceText ?? 'Implemented navigation; live acceptance pending.', state: { encrypted: 'HIDDEN' } }, { type: 'reasoning', text: 'HIDDEN' }, { type: 'encrypted_reasoning', data: 'HIDDEN' }, { type: 'tool', output: 'SECRET_FILE' }] },
+          { id: 'msg_system', time: { created: 3 }, type: 'system', text: 'HIDDEN' }
         ], cursor: { next: 'older' } }));
       }
-      return new Response(JSON.stringify(url.pathname === '/api/session' ? { data: [session], cursor: { next: 'page2' } } : { data: session }));
+      return new Response(JSON.stringify(url.pathname === '/api/session' ? { data: [session], cursor: { next: 'page2' } } : { data: { ...session, id: wrongSelection ? 'ses_other' : session.id } }));
     },
   });
   const page = await reader('discover', {}, claims);
@@ -92,6 +94,14 @@ test('managed registration read boundary is pinned, revoked, bounded and sanitiz
   foreign = false; messageRevocation = true;
   await assert.rejects(reader('read', { session_id: root, include_messages: true, limit: 3 }, claims));
   messageRevocation = false; binding = { ...b };
+  wrongSelection = true;
+  const beforeWrongSelection = calls;
+  await assert.rejects(reader('read', { session_id: root, include_messages: true, limit: 3 }, claims));
+  assert.equal(calls, beforeWrongSelection + 1, 'mismatched session metadata must prevent message request');
+  wrongSelection = false;
+  const beforeUnscoped = calls;
+  await assert.rejects(reader('messages', { session_id: root, limit: 3 }, claims));
+  assert.equal(calls, beforeUnscoped, 'message fetch requires exact session read, not a standalone action');
   await reader('discover', { cursor: 'page2', limit: 1 }, claims);
   const before = calls;
   for (const bad of [{ ...claims, sub: 'bob' }, { ...claims, client_id: 'other' }, { ...claims, aud: 'other' }, undefined])
@@ -136,7 +146,7 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
     if (req.url === '/api/provider/openai') return res.end(JSON.stringify({ data: { id: 'openai', package: '@opencode/ai/providers/openai' } }));
     if (req.url === '/api/model') return res.end(JSON.stringify({ data: [{ id: 'fixture', providerID: 'openai', package: '@opencode/ai/providers/openai' }] }));
     if (req.url === `/api/session/${root}`) return res.end(JSON.stringify({ data: session }));
-    if (req.url.startsWith(`/api/session/${root}/message?`)) return res.end(JSON.stringify({ data: [{ id: 'msg_visible', sessionID: root, type: 'user', text: 'Review the release documentation.' }], cursor: {} }));
+    if (req.url.startsWith(`/api/session/${root}/message?`)) return res.end(JSON.stringify({ data: [{ id: 'msg_visible', time: { created: 1 }, type: 'user', text: 'Review the release documentation.' }], cursor: {} }));
     if (req.url === `/api/session/${root}/inbox`) return res.end(JSON.stringify({ data: inbox }));
     if (req.url.includes('/message/')) { res.statusCode = 404; return res.end('{}'); }
     reads++;
