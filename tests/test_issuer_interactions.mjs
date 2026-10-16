@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { generateKeyPairSync, randomBytes, createHash } from 'node:crypto';
+import { generateKeyPairSync, randomBytes, createHash, createPublicKey } from 'node:crypto';
 import { createServer, request as httpsRequest } from 'node:https';
+import { createServer as createHttpServer, request as httpRequest } from 'node:http';
 import { execFileSync, spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -9,7 +10,9 @@ import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import argon2 from 'argon2';
+import { importJWK, jwtVerify } from 'jose';
 import { createIssuerAdapter } from '../src/workrelay/oidc_adapter.mjs';
+import { createGateway } from '../src/workrelay/mcp.mjs';
 import { createUnexposedIssuerPolicy, loadPreapprovedChatGPTGrant, createPreapprovalDiagnostic, CHATGPT_CIMD_ID, CHATGPT_CIMD_REDIRECT } from '../src/workrelay/issuer_policy.mjs';
 
 test('preapproval next-denial mode has absolute 30-minute bounds and independent exclusive restart-safe files', async t => {
@@ -119,8 +122,6 @@ test('scope mismatch classification is finite and never persists unknown scope t
   const resource = 'https://issuer.example.test/mcp';
   for (const [scope, expected] of [
     ['openid', 'valid-2-0-1'], ['offline_access', 'valid-4-0-1'],
-    ['workrelay:tasks openid', 'valid-3-0-2'],
-    ['openid workrelay:tasks', 'valid-3-0-2'],
     ['workrelay:tasks offline_access profile email openid', 'valid-31-0-5'],
     ['PRIVATE_UNKNOWN_MARKER', 'valid-0-1-1'],
     ['workrelay:tasks PRIVATE_UNKNOWN_MARKER', 'valid-1-1-2'],
@@ -175,7 +176,7 @@ test('preapproval hook rejects account and capability escalation and cannot resu
     c => { c.account = undefined; }, c => { c.client.clientId = 'wrong'; },
     c => { c.params.client_id = 'wrong'; }, c => { c.params.resource += '/wrong'; },
     c => { c.params.redirect_uri = 'https://wrong.example.test'; },
-    c => { c.params.scope += ' openid'; }, c => { c.params.scope = ''; },
+    c => { c.params.scope += ' profile'; }, c => { c.params.scope = ''; },
     c => { c.params.resource = [resource, 'https://wrong.example.test']; },
     c => { c.session.grantIdFor = () => 'synthetic-revoked'; },
   ]) {
@@ -199,7 +200,7 @@ test('preapproval hook rejects account and capability escalation and cannot resu
     ['resource_array', c => { c.params.resource = [resource, 'https://wrong.example.test']; }],
     ['resource_other', c => { c.params.resource += '/wrong'; }],
     ['scope_absent', c => { delete c.params.scope; }],
-    ['scope_other', c => { c.params.scope = 'openid workrelay:tasks'; }],
+    ['scope_other', c => { c.params.scope = 'openid'; }],
     ['scope_other', c => { c.params.scope = 'workrelay:tasks profile'; }],
     ['response_type', c => { c.params.response_type = 'token'; }],
   ];
@@ -439,6 +440,29 @@ for (const registration of ['static', 'chatgpt-cimd', 'chatgpt-preapproved']) te
     findAccount: async (_ctx, id) => { accountLookups++;
       return id === 'person1' ? { accountId: id, claims: async () => ({ sub: id }) } : undefined; } });
   let originalDiscovery;
+  if (preapproveChatGPT) {
+    const grant = new provider.Grant({ accountId: 'person1', clientId });
+    grant.addResourceScope(origin + '/mcp', 'workrelay:tasks');
+    const id = await grant.save();
+    const context = () => ({ oidc: { account: { accountId: 'person1' },
+      session: { accountId: 'person1', grantIdFor: () => id }, client: { clientId },
+      params: { client_id: clientId, redirect_uri: redirect, resource: origin + '/mcp',
+        scope: 'workrelay:tasks openid', response_type: 'code' }, provider } });
+    assert.equal((await provider.Grant.find(id)).getOIDCScope(), '');
+    await loadPreapprovedChatGPTGrant(context(), { principal: 'person1', resource: origin + '/mcp' });
+    const upgraded = await provider.Grant.find(id);
+    assert.equal(upgraded.jti, id);
+    assert.equal(upgraded.accountId, 'person1'); assert.equal(upgraded.clientId, clientId);
+    assert.equal(upgraded.getOIDCScope(), 'openid');
+    assert.equal(upgraded.getResourceScope(origin + '/mcp'), 'workrelay:tasks');
+    assert.equal(upgraded.getResourceScope('https://wrong.example.test/mcp'), '');
+    const wrong = context(); wrong.oidc.account.accountId = 'other';
+    await assert.rejects(loadPreapprovedChatGPTGrant(wrong, { principal: 'person1', resource: origin + '/mcp' }));
+    await upgraded.destroy();
+    await assert.rejects(loadPreapprovedChatGPTGrant(context(), { principal: 'person1', resource: origin + '/mcp' }),
+      error => error.error === 'access_denied');
+    assert.equal(await provider.Grant.find(id), undefined, 'revoked grant not recreated');
+  }
   provider.use(async (ctx, next) => {
     await next();
     if (ctx.oidc?.route === 'discovery' && ctx.status === 200) originalDiscovery = JSON.parse(JSON.stringify(ctx.body));
@@ -491,9 +515,9 @@ for (const registration of ['static', 'chatgpt-cimd', 'chatgpt-preapproved']) te
     assert.match(discovery.response.headers.get('content-type'), /application\/json/);
     assert.equal(Number(discovery.response.headers.get('content-length')), Buffer.byteLength(discovery.text));
     const metadata = JSON.parse(discovery.text);
-    assert.deepEqual(metadata, preapproveChatGPT ? { ...originalDiscovery, scopes_supported: ['workrelay:tasks'] } : originalDiscovery,
+    assert.deepEqual(metadata, preapproveChatGPT ? { ...originalDiscovery, scopes_supported: ['workrelay:tasks', 'openid'] } : originalDiscovery,
       'only scopes_supported changes from provider-generated metadata');
-    assert.deepEqual(metadata.scopes_supported, preapproveChatGPT ? ['workrelay:tasks'] : ['openid', 'offline_access']);
+    assert.deepEqual(metadata.scopes_supported, preapproveChatGPT ? ['workrelay:tasks', 'openid'] : ['openid', 'offline_access']);
     if (advertised) assert.deepEqual(metadata, advertised, 'both discovery aliases agree');
     advertised = metadata;
     const head = await request(path, { method: 'HEAD' });
@@ -504,7 +528,9 @@ for (const registration of ['static', 'chatgpt-cimd', 'chatgpt-preapproved']) te
   const requestedScope = preapproveChatGPT ? advertised.scopes_supported.join(' ') : 'workrelay:tasks';
   const auth = `/auth?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent(redirect)}` +
     `&scope=${encodeURIComponent(requestedScope)}&resource=${encodeURIComponent(origin + '/mcp')}&code_challenge=${challenge}` +
-    '&code_challenge_method=S256&state=test';
+    '&code_challenge_method=S256&state=test' + (preapproveChatGPT ? '&nonce=synthetic-nonce' : '');
+  const withScope = scope => auth.replace(/&scope=[^&]+/, '&scope=' + encodeURIComponent(scope))
+    .replace(scope.split(' ').includes('openid') ? /$^/ : /&nonce=synthetic-nonce/, '');
   let next = await request(auth);
   assert.equal(accountLookups, 0, 'fresh no-cookie request has no authenticated account lookup');
   assert.equal(next.response.status, 303, next.text);
@@ -592,14 +618,55 @@ for (const registration of ['static', 'chatgpt-cimd', 'chatgpt-preapproved']) te
       code: callback.searchParams.get('code'), code_verifier: verifier, resource: origin + '/mcp' }) });
     assert.equal(initialExchange.response.status, 200, 'discovery-selected scope reaches PKCE token exchange');
     const initialToken = JSON.parse(initialExchange.text);
-    assert.equal(initialToken.id_token, undefined, 'no OIDC identity token added');
+    const verificationKey = await importJWK(createPublicKey({ key: privateKey, format: 'jwk' }).export({ format: 'jwk' }), 'RS256');
+    const verifyIdentity = async token => {
+      const { payload } = await jwtVerify(token, verificationKey, { issuer: origin, audience: clientId, algorithms: ['RS256'] });
+      assert.equal(payload.sub, 'person1');
+      assert.equal(payload.exp - payload.iat, 300);
+      assert.equal(payload.nonce, 'synthetic-nonce');
+      assert.ok(Object.keys(payload).every(key => ['sub', 'iss', 'aud', 'iat', 'exp', 'nonce', 'sid', 'auth_time'].includes(key)));
+      await assert.rejects(jwtVerify(token, verificationKey, { issuer: origin, audience: origin + '/mcp' }));
+    };
+    await verifyIdentity(initialToken.id_token);
+    // Full gateway verification of an actual provider-issued ID token. The
+    // private fixture shares only issuer/key identity, not a mocked verifier.
+    await fs.writeFile(join(directory, 'issuer.json'), JSON.stringify({ version: 1, accountId: 'person1', origin,
+      jwks: { keys: [{ ...privateKey, kid: 'test', alg: 'RS256', use: 'sig' }] },
+      cookieKeys: [randomBytes(32).toString('hex')], clientId, redirectUris: [redirect], clientRegistration: 'chatgpt-cimd' }), { mode: 0o600 });
+    const reserve = createHttpServer();
+    await new Promise(resolve => reserve.listen(0, '127.0.0.1', resolve));
+    const gatewayPort = reserve.address().port;
+    await new Promise(resolve => reserve.close(resolve));
+    const gateway = createGateway({ public_origin: origin, issuer_mode: 'self-hosted', issuer_exposure: 'local-only',
+      issuer_state_dir: directory, audience: origin + '/mcp', principal: 'person1', owner: 'person1',
+      clientId, redirectUris: [redirect], clientRegistration: 'chatgpt-cimd', issuer_preapprove_chatgpt: true,
+      bridge_config: '/unused-fixture', port: gatewayPort });
+    try {
+      await new Promise(resolve => gateway.listen(gatewayPort, '127.0.0.1', resolve));
+      const gatewayStatus = token => new Promise((resolve, reject) => {
+        const req = httpRequest({ host: '127.0.0.1', port: gatewayPort, path: '/mcp', method: 'POST',
+          headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' } }, res => {
+          res.resume(); res.on('end', () => resolve(res.statusCode));
+        }); req.on('error', reject); req.end('not-json');
+      });
+      assert.equal(await gatewayStatus(initialToken.id_token), 401, 'issued ID token rejected before MCP body handling');
+      assert.equal(await gatewayStatus(initialToken.access_token), 400, 'issued access token reaches body validation');
+    } finally { await new Promise(resolve => { gateway.close(resolve); gateway.closeAllConnections(); }); }
+    const refreshed = await request('/token', { method: 'POST', headers: {
+      'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'refresh_token',
+      client_id: clientId, refresh_token: initialToken.refresh_token, resource: origin + '/mcp' }) });
+    assert.equal(refreshed.response.status, 200);
+    const refreshedTokens = JSON.parse(refreshed.text);
+    await verifyIdentity(refreshedTokens.id_token);
+    const refreshedAccess = await jwtVerify(refreshedTokens.access_token, verificationKey, { issuer: origin, audience: origin + '/mcp' });
+    assert.equal(refreshedAccess.payload.scope, 'workrelay:tasks');
     const initialClaims = JSON.parse(Buffer.from(initialToken.access_token.split('.')[1], 'base64url').toString());
     assert.equal(initialClaims.aud, origin + '/mcp');
     assert.equal(initialClaims.scope, 'workrelay:tasks');
     assert.equal(initialClaims.sub, 'person1');
     // Real provider normalization, after authentication and with its existing
     // session/grant. Duplicate scope tokens normalize to the same capability.
-    const repeatedScope = await request(auth.replace('workrelay%3Atasks', 'workrelay%3Atasks%20workrelay%3Atasks'));
+    const repeatedScope = await request(withScope('workrelay:tasks workrelay:tasks openid'));
     assert.equal(new URL(repeatedScope.response.headers.get('location')).searchParams.has('code'), true);
     // Repeated resource parameters are retained as an array by the provider,
     // even when they name only the same server. Equivalent targets may not
@@ -628,20 +695,24 @@ for (const registration of ['static', 'chatgpt-cimd', 'chatgpt-preapproved']) te
     assert.equal(claims.aud, origin + '/mcp');
     assert.equal(claims.scope, 'workrelay:tasks');
     assert.equal(claims.sub, 'person1');
-    for (const [scope, expected] of [['workrelay:tasks openid', 'valid-3-0-2'],
+    for (const [scope, expected] of [['workrelay:tasks profile', 'valid-9-0-2'],
       ['workrelay:tasks offline_access', 'valid-5-0-2'],
       ['workrelay:tasks PRIVATE_UNKNOWN_MARKER', 'valid-1-1-2']]) {
       deniedScopeClasses.length = 0;
-      const rejected = await request(auth.replace('workrelay%3Atasks', encodeURIComponent(scope)) + '&prompt=consent');
-      assert.equal(new URL(rejected.response.headers.get('location'), base).searchParams.has('code'), false);
+      deniedCategories.length = 0;
+      const rejected = await request(withScope(scope) + '&prompt=consent');
+      const failure = new URL(rejected.response.headers.get('location'), base);
+      assert.equal(failure.searchParams.has('code'), false);
+      assert.equal(failure.searchParams.get('error'), 'access_denied');
+      assert.deepEqual(deniedCategories, ['scope_other']);
       assert.deepEqual(deniedScopeClasses, [expected], 'maintained provider rejection supplies only fixed classification');
     }
     for (const invalid of [
-      auth.replace('workrelay%3Atasks', 'openid'),
-      auth.replace('workrelay%3Atasks', 'offline_access') + '&prompt=consent',
-      auth.replace('workrelay%3Atasks', 'workrelay%3Atasks%20offline_access') + '&prompt=consent',
-      auth.replace('workrelay%3Atasks', 'workrelay%3Atasks%20openid'),
-      auth.replace('workrelay%3Atasks', 'workrelay%3Atasks%20arbitrary'),
+      withScope('openid'),
+      withScope('offline_access') + '&prompt=consent',
+      withScope('workrelay:tasks offline_access') + '&prompt=consent',
+      withScope('workrelay:tasks email'),
+      withScope('workrelay:tasks arbitrary'),
       auth.replace(encodeURIComponent(origin + '/mcp'), encodeURIComponent('https://wrong.example.test/mcp')),
       auth.replace(encodeURIComponent(redirect), encodeURIComponent('https://wrong.example.test/callback')),
       auth.replace(clientId, 'https://wrong.example.test/client.json'),
@@ -653,6 +724,21 @@ for (const registration of ['static', 'chatgpt-cimd', 'chatgpt-preapproved']) te
         'out-of-policy authorization never issues a code');
       assert.ok([303, 400, 403].includes(rejected.response.status));
     }
+    const taskOnly = await request(withScope('workrelay:tasks').replace('&nonce=synthetic-nonce', ''));
+    const taskExchange = await request('/token', { method: 'POST', headers: {
+      'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'authorization_code',
+      client_id: clientId, redirect_uri: redirect, code: new URL(taskOnly.response.headers.get('location')).searchParams.get('code'),
+      code_verifier: verifier, resource: origin + '/mcp' }) });
+    assert.equal(taskExchange.response.status, 200);
+    assert.equal(JSON.parse(taskExchange.text).id_token, undefined, 'tasks-only request gains no identity token');
+    const revoked = await request('/token/revocation', { method: 'POST', headers: {
+      'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ client_id: clientId,
+      token: refreshedTokens.refresh_token, token_type_hint: 'refresh_token' }) });
+    assert.equal(revoked.response.status, 200);
+    const afterRevoke = await request('/token', { method: 'POST', headers: {
+      'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'refresh_token',
+      client_id: clientId, refresh_token: refreshedTokens.refresh_token, resource: origin + '/mcp' }) });
+    assert.equal(afterRevoke.response.status, 400, 'revoked refresh cannot reissue identity or task token');
     return;
   }
   url = new URL(next.response.headers.get('location'), base);

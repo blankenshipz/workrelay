@@ -166,12 +166,15 @@ function exactResource(value, resource) {
 
 export async function loadPreapprovedChatGPTGrant(ctx, { principal, resource, onDenied }) {
   const { account, session, client, params, provider } = ctx.oidc;
+  const scopes = typeof params.scope === 'string' ? params.scope.split(' ') : [];
+  const allowedScope = scopes.includes('workrelay:tasks') && scopes.length <= 2 &&
+    new Set(scopes).size === scopes.length && scopes.every(scope => scope === 'workrelay:tasks' || scope === 'openid');
   const reason = account?.accountId !== principal ? 'account' : session?.accountId !== principal ? 'session' :
     client?.clientId !== CHATGPT_CIMD_ID || params.client_id !== CHATGPT_CIMD_ID ? 'client' :
     params.redirect_uri !== CHATGPT_CIMD_REDIRECT ? 'redirect' :
     !exactResource(params.resource, resource) ? (params.resource === undefined ? 'resource_absent' :
       Array.isArray(params.resource) ? 'resource_array' : 'resource_other') :
-    params.scope !== 'workrelay:tasks' ? (params.scope ? 'scope_other' : 'scope_absent') :
+    !allowedScope ? (params.scope ? 'scope_other' : 'scope_absent') :
     params.response_type !== 'code' ? 'response_type' : null;
   if (reason) {
     try { onDenied?.(reason, reason === 'scope_other' ? scopeClass(params.scope) : undefined); } catch { /* never change the denial */ }
@@ -182,10 +185,15 @@ export async function loadPreapprovedChatGPTGrant(ctx, { principal, resource, on
     const existing = await provider.Grant.find(grantId);
     if (!existing || existing.accountId !== principal || existing.clientId !== client.clientId)
       throw new errors.AccessDenied('existing grant unavailable');
+    if (scopes.includes('openid') && !existing.getOIDCScope().split(' ').includes('openid')) {
+      existing.addOIDCScope('openid');
+      await existing.save();
+    }
     return existing; // Never recreate a revoked session-bound grant.
   }
   const grant = new provider.Grant({ accountId: principal, clientId: CHATGPT_CIMD_ID });
   grant.addResourceScope(resource, 'workrelay:tasks');
+  if (scopes.includes('openid')) grant.addOIDCScope('openid');
   await grant.save();
   return grant;
 }
@@ -209,6 +217,7 @@ export function createUnexposedIssuerPolicy({ origin, principal, jwks, cookieKey
   if (typeof preapproveChatGPT !== 'boolean' || preapproveChatGPT && !cimd)
     throw Error('preapproval requires exact ChatGPT CIMD policy');
   const provider = new Provider(issuer.origin, {
+    ...(preapproveChatGPT ? { ttl: { IdToken: 300 } } : {}),
     ...(preapproveChatGPT ? { loadExistingGrant: ctx => {
       // Supported provider hook, called only after loadAccount. Never invent an
       // authenticated session or expand the single locally approved capability.
@@ -264,7 +273,7 @@ export function createUnexposedIssuerPolicy({ origin, principal, jwks, cookieKey
     // OIDC support is not additional locally preapproved authority.
     if (ctx.oidc?.route === 'discovery' && ctx.status === 200 &&
         ['GET', 'HEAD'].includes(ctx.method) && ctx.body && typeof ctx.body === 'object') {
-      ctx.body = { ...ctx.body, scopes_supported: ['workrelay:tasks'] };
+      ctx.body = { ...ctx.body, scopes_supported: ['workrelay:tasks', 'openid'] };
       ctx.remove('Content-Length'); // Koa serializes and sizes the new JSON body.
     }
   });

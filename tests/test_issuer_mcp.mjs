@@ -52,7 +52,7 @@ test('real public-proxy gateway discovery HEAD preserves metadata and method bou
     for (const path of ['/.well-known/oauth-authorization-server', '/.well-known/openid-configuration']) {
       const get = await request(path), head = await request(path, 'HEAD');
       assert.equal(get.status, 200); assert.equal(head.status, 200); assert.equal(head.body, '');
-      assert.deepEqual(JSON.parse(get.body).scopes_supported, preapprove ? ['workrelay:tasks'] : ['openid', 'offline_access']);
+      assert.deepEqual(JSON.parse(get.body).scopes_supported, preapprove ? ['workrelay:tasks', 'openid'] : ['openid', 'offline_access']);
       assert.equal(Number(get.headers['content-length']), Buffer.byteLength(get.body));
       for (const name of ['content-length', 'content-type', 'cache-control', 'etag', 'vary'])
         assert.equal(head.headers[name], get.headers[name], name);
