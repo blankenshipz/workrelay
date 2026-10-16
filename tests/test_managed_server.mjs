@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createManagedReader } from '../src/workrelay/managed_server.mjs';
+import { createManagedReader, managedText } from '../src/workrelay/managed_server.mjs';
 import { createGateway } from '../src/workrelay/mcp.mjs';
 import { createServer } from 'node:http';
 import { generateKeyPairSync, createHash } from 'node:crypto';
@@ -15,20 +15,41 @@ const root = 'ses_ec3ddf9ebffe9cDFhA0VKjmkRn';
 const listen = s => new Promise(resolve => s.listen(0, '127.0.0.1', resolve));
 const close = s => new Promise(resolve => { s.close(resolve); s.closeAllConnections(); });
 
+test('visible text preserves meaning, redacts established credentials before truncation', () => {
+  const source = 'Fix navigation.\nCookie: session=hidden; second=hidden\nAuthorization: Bearer hidden\npassword="hidden words" token=hidden\nhttps://user:pass@example.test/path\n-----BEGIN PRIVATE KEY-----\nhidden\n-----END PRIVATE KEY-----\nsk-examplekey\nContinue safely.';
+  const result = managedText(source);
+  assert.match(result.text, /Fix navigation/); assert.match(result.text, /Continue safely/);
+  assert.doesNotMatch(result.text, /hidden|user:pass|examplekey/);
+  assert.equal(result.source, 'untrusted_session_text'); assert.equal(result.redacted, true);
+  const long = managedText('Useful '.repeat(1000));
+  assert.equal(long.text.length, 4000); assert.equal(long.omission, 'text_truncated');
+  assert.equal(managedText(undefined).omission, 'text_unavailable');
+});
+
 test('managed registration read boundary is pinned, revoked, bounded and sanitized', async () => {
   const b = { enabled: true, revoked: false, issuer: 'https://issuer.test', audience: 'https://issuer.test/mcp',
     subject: 'alice', client_id: client, server: 'http://127.0.0.1:12345', service_registration: '/private/service.json', client_service_module: '/private/service.mjs' };
   const expected = { issuer: b.issuer, audience: b.audience, principal: b.subject, managed_server: { ...b } };
   const claims = { iss: b.issuer, aud: b.audience, sub: b.subject, client_id: client };
-  let binding = { ...b }, endpoint = b.server, moved = false, calls = 0, during;
+  let binding = { ...b }, endpoint = b.server, moved = false, calls = 0, during, foreign = false, messageRevocation = false, surfaceText;
   const reader = createManagedReader(expected, () => ({ ...binding }), {
     canonical: path => moved ? '/replacement' : path,
     stat: () => ({ isFile: () => true, isDirectory: () => true, isSymbolicLink: () => false, uid: process.getuid(), mode: 0o600, dev: 1, ino: 1, mtimeMs: 1 }),
     loadService: async () => ({ discover: async args => { assert.equal(args.file, b.service_registration); return { url: endpoint, auth: {} }; }, headers: () => ({}) }),
     fetcher: async (url, options) => {
       calls++; assert.equal(options.method, 'GET'); assert.equal(options.redirect, 'manual');
-      const session = { id: root, projectID: '/PRIVATE/SECRET_PROJECT?token=SECRET', title: 'SECRET_TITLE', metadata: { password: 'SECRET' }, location: { directory: '/PRIVATE' }, time: { idle: 1 } };
+      const session = { id: root, projectID: '/PRIVATE/SECRET_PROJECT?token=SECRET', title: surfaceText ?? 'Useful project password=SECRET', metadata: { password: 'SECRET' }, location: { directory: '/PRIVATE' }, time: { idle: 1 }, outcome: 'succeeded' };
       if (during) during();
+      if (url.pathname.endsWith('/message')) {
+        if (messageRevocation) binding.revoked = true;
+        assert.equal(url.searchParams.get('limit'), '3');
+        assert.equal(url.searchParams.has('order'), !url.searchParams.has('cursor'));
+        return new Response(JSON.stringify({ data: [
+          { id: 'msg_user', sessionID: foreign ? 'ses_other' : root, type: 'user', text: surfaceText ?? 'Please repair navigation token=SECRET', files: [{ content: 'SECRET_FILE' }] },
+          { id: 'msg_assistant', sessionID: root, type: 'assistant', content: [{ type: 'text', text: surfaceText ?? 'Implemented navigation; live acceptance pending.', state: { encrypted: 'HIDDEN' } }, { type: 'reasoning', text: 'HIDDEN' }, { type: 'encrypted_reasoning', data: 'HIDDEN' }, { type: 'tool', output: 'SECRET_FILE' }] },
+          { id: 'msg_system', sessionID: root, type: 'system', text: 'HIDDEN' }
+        ], cursor: { next: 'older' } }));
+      }
       return new Response(JSON.stringify(url.pathname === '/api/session' ? { data: [session], cursor: { next: 'page2' } } : { data: session }));
     },
   });
@@ -38,6 +59,39 @@ test('managed registration read boundary is pinned, revoked, bounded and sanitiz
   assert.equal(page.projects[0].id, page.items[0].project_id);
   assert.equal(JSON.stringify(page).includes('SECRET'), false); assert.equal(JSON.stringify(page).includes('PRIVATE'), false);
   assert.equal((await reader('read', { session_id: root }, claims)).session_id, root);
+  assert.equal(page.items[0].label, 'Useful project password=[REDACTED]');
+  assert.equal(page.items[0].runtime_status, 'succeeded');
+  assert.equal(page.items[0].task_outcome.status, 'unknown');
+  const context = (await reader('read', { session_id: root, include_messages: true, limit: 3 }, claims)).context;
+  assert.equal(context.next_cursor, 'older');
+  assert.equal(context.items[0].text, 'Please repair navigation token=[REDACTED]');
+  assert.equal(context.items[1].text, 'Implemented navigation; live acceptance pending.');
+  assert.equal(context.items[2].omission, 'Non-user/assistant message excluded.');
+  assert.doesNotMatch(JSON.stringify(context), /SECRET|HIDDEN/);
+  // Synthetic established formats, independently exercised through every public text surface.
+  for (const credential of ['Basic dGVzdDpmaXh0dXJl', 'AKIA' + 'A'.repeat(16),
+    ...['ghp_', 'gho_', 'ghu_', 'ghs_', 'ghr_', 'github_pat_'].map(prefix => prefix + 'SyntheticFixture123')]) {
+    surfaceText = `Repair navigation ${credential} then verify results.`;
+    const discovered = await reader('discover', {}, claims);
+    const read = await reader('read', { session_id: root, include_messages: true, limit: 3 }, claims);
+    for (const text of [discovered.items[0].label, discovered.items[0].title.text, read.label, read.title.text,
+      read.context.items[0].text, read.context.items[1].text]) {
+      assert.equal(text, 'Repair navigation [REDACTED] then verify results.');
+    }
+    assert.doesNotMatch(JSON.stringify(read), /HIDDEN|SECRET_FILE/);
+    assert.equal(read.context.next_cursor, 'older');
+    assert.equal(read.runtime_status, 'succeeded');
+    assert.equal(read.task_outcome.status, 'unknown');
+  }
+  surfaceText = undefined;
+  await reader('read', { session_id: root, include_messages: true, limit: 3, cursor: 'older' }, claims);
+  await assert.rejects(reader('read', { session_id: root, include_messages: true, limit: 21 }, claims));
+  await assert.rejects(reader('read', { session_id: root, include_messages: true, cursor: '\n' }, claims));
+  foreign = true;
+  await assert.rejects(reader('read', { session_id: root, include_messages: true, limit: 3 }, claims));
+  foreign = false; messageRevocation = true;
+  await assert.rejects(reader('read', { session_id: root, include_messages: true, limit: 3 }, claims));
+  messageRevocation = false; binding = { ...b };
   await reader('discover', { cursor: 'page2', limit: 1 }, claims);
   const before = calls;
   for (const bad of [{ ...claims, sub: 'bob' }, { ...claims, client_id: 'other' }, { ...claims, aud: 'other' }, undefined])
@@ -82,6 +136,7 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
     if (req.url === '/api/provider/openai') return res.end(JSON.stringify({ data: { id: 'openai', package: '@opencode/ai/providers/openai' } }));
     if (req.url === '/api/model') return res.end(JSON.stringify({ data: [{ id: 'fixture', providerID: 'openai', package: '@opencode/ai/providers/openai' }] }));
     if (req.url === `/api/session/${root}`) return res.end(JSON.stringify({ data: session }));
+    if (req.url.startsWith(`/api/session/${root}/message?`)) return res.end(JSON.stringify({ data: [{ id: 'msg_visible', sessionID: root, type: 'user', text: 'Review the release documentation.' }], cursor: {} }));
     if (req.url === `/api/session/${root}/inbox`) return res.end(JSON.stringify({ data: inbox }));
     if (req.url.includes('/message/')) { res.statusCode = 404; return res.end('{}'); }
     reads++;
@@ -129,6 +184,13 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
   };
   assert.equal((await call(client)).result.structuredContent.items[0].session_id, root);
   assert.equal(reads, 1);
+  const readArgs = { session_id: root, include_messages: true, limit: 1 };
+  const visible = (await call(client, 'workrelay_server_read', readArgs)).result;
+  assert.notEqual(visible.isError, true);
+  assert.equal(visible.structuredContent.context.items[0].text, 'Review the release documentation.');
+  assert.equal(visible.structuredContent.task_outcome.status, 'unknown');
+  assert.equal(posts.length, 0, 'context read must never mutate');
+  assert.equal((await call('other', 'workrelay_server_read', readArgs)).result.isError, true);
   assert.equal((await call('other')).result.isError, true); assert.equal(reads, 1);
   await fs.writeFile(capability, JSON.stringify({ ...binding, revoked: true }));
   assert.equal((await call(client)).result.isError, true); assert.equal(reads, 1);
