@@ -80,6 +80,7 @@ function boundedBody(req, limit = MAX_REQUEST_BYTES) {
   });
 }
 const schema = {
+  discover: z.object({ offset: z.number().int().min(0).max(1000000).optional(), limit: z.number().int().min(1).max(50).optional() }).strict(),
   profile: z.object({}).strict(),
   start: z.object({ key, text }).strict(),
   status: z.object({ key }).strict(),
@@ -205,7 +206,8 @@ function bridge(config, command, input) {
   return new Promise((done, reject) => {
     const args = ['-m', 'workrelay.cli', '--config', config.bridge_config,
       command === 'enrolled_result' ? 'enrolled-result' : command,
-      ...(command === 'enrolled_result' ? ['--grant-id', input.grant_id] : ['--key', input.key]), '--owner', config.owner];
+      ...(command === 'discover' ? ['--offset', String(input.offset ?? 0), '--limit', String(input.limit ?? 20)] :
+        command === 'enrolled_result' ? ['--grant-id', input.grant_id] : ['--key', input.key]), '--owner', config.owner];
     if (command === 'respond') args.push('--feedback-key', input.feedback_key);
     if (command === 'respond' || command === 'start') args.push('--stdin-text');
     const child = spawn(config.python ?? '/usr/bin/python3', args, {
@@ -231,12 +233,14 @@ function bridge(config, command, input) {
 
 function mcp(config, invoke, events) {
   const server = new McpServer({ name: 'workrelay', version: '0.1.0' },
-    events ? { capabilities: { events: {} } } : {});
+    { ...(events ? { capabilities: { events: {} } } : {}),
+      instructions: 'Start with workrelay_discover({}) when asked to show available work. It needs no task key or grant ID. Follow returned actions and next_offset. Runs and enrolled sessions are not agent definitions. Never infer access to unlisted sessions.' });
   for (const name of Object.keys(schema)) {
-    const readOnly = ['profile', 'status', 'result', 'enrolled_result'].includes(name);
+    const readOnly = ['discover', 'profile', 'status', 'result', 'enrolled_result'].includes(name);
     server.registerTool(`workrelay_${name}`, {
       title: `Workrelay ${name}`,
-      description: name === 'cancel' ? 'Interrupt only the owned root session; descendants are not canceled.' :
+       description: name === 'discover' ? 'First call: show permitted projects, your owned runs and explicitly enrolled read-only sessions. No IDs required. Returns usable action arguments, bounded pages and empty-state guidance; never lists global sessions or agent definitions.' :
+         name === 'cancel' ? 'Interrupt only the owned root session; descendants are not canceled.' :
         name === 'result' ? 'Read the owned task lifecycle and evidence, not a verified final answer or transcript.' :
         name === 'enrolled_result' ? 'Read only a locally granted existing session by opaque grant ID; cannot respond, adopt or cancel it.' :
         `Operate on the single configured Workrelay workspace: ${name}.`,
@@ -244,7 +248,7 @@ function mcp(config, invoke, events) {
       annotations: { readOnlyHint: readOnly, destructiveHint: name === 'cancel', idempotentHint: name !== 'respond', openWorldHint: false },
     }, async input => {
       try {
-        const output = name === 'profile' ? { owner: config.owner, capabilities: ['start', 'status', 'result', 'enrolled_result', 'respond', 'cancel'],
+        const output = name === 'profile' ? { owner: config.owner, next_action: { tool: 'workrelay_discover', arguments: {} }, capabilities: ['discover', 'start', 'status', 'result', 'enrolled_result', 'respond', 'cancel'],
           limitation: 'Result is bounded/redacted read-only evidence; descendants remain active on cancel.' } :
           await invoke(config, name, input);
         return { content: [{ type: 'text', text: JSON.stringify(output) }], structuredContent: output,

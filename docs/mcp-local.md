@@ -4,6 +4,12 @@ Workrelay's MCP2 gateway lets a remote MCP client invoke model-free tools over H
 
 ## One-time setup and prerequisites
 
+### Everyday first call: discover permitted work
+
+Ask “Show me work I can access.” The client should call `workrelay_discover({})` before asking for internal IDs. It lists the single configured permitted workspace, owned Workrelay runs, and explicitly enrolled read-only sessions. Returned actions include the exact `key` or `grant_id` arguments to use next. Pass `next_offset` as `offset` to continue; `limit` defaults to 20, maximum 50. Pages can be empty when stale authority is excluded. Listings are revalidated against current session ownership/project and local enrollment, not a global session search. Concurrent changes can shift offset pages; restart discovery if necessary.
+
+Empty-state guidance explains how to start a new task (choose a new idempotency key and provide text) or request explicit local enrollment of a selected existing session. Discovery neither enrolls/adopts sessions nor starts inference. It reads the ledger without creating it; missing or unavailable sessions are not authority to control them. Agent definitions are templates, not running work, and are not enumerated. The current configuration authorizes one workspace, not every local project. These discovery behaviors have local tests; actual remote-client usability still requires verification after installation.
+
 The current source uses `@modelcontextprotocol/server` 2.3.1 and `@modelcontextprotocol/node` 2.1.1, Streamable HTTP, and Node >=22. Install dependencies with `npm ci`; run `node src/workrelay/mcp.mjs /absolute/path/to/private-mcp.json`. The process listens on loopback only. Keep the existing authenticated OpenCode service on loopback too; **never forward, publish, or disable authentication on OpenCode**. The gateway calls the existing private CLI configuration and does not replace the local OAuth/quota safeguards.
 
 Create a private JSON config owned by the service user with mode `0600` (parent directory private as well). It contains references and non-secret identifiers only; do not put bearer tokens, passwords, private keys, or secret values in it, the repository, prompts, or logs:

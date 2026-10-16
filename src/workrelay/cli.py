@@ -16,7 +16,7 @@ import uuid
 import secrets
 
 from .supervision import (SupervisionError, owned_result, enrolled_result,
-                          enrollment_row, grant_enrollment, revoke_enrollment)
+                          enrollment_row, grant_enrollment, revoke_enrollment, _enrolled)
 
 
 class BridgeError(Exception):
@@ -205,6 +205,69 @@ def public(row, session=None):
             "owner": row[6], "evidence": "OpenCode session outcome" if session and session.get("outcome") else "local bridge ledger"}
 
 
+def discover(config, client, directory, state, offset=0, limit=20):
+    """Read only the scoped ledger, then revalidate each exact session. No global list."""
+    require(type(offset) is int and 0 <= offset <= 1000000 and type(limit) is int and 1 <= limit <= 50,
+            "invalid discovery page")
+    output = {"projects": [{"id": "configured-workspace", "label": directory.name,
+                            "actions": [{"tool": "workrelay_start", "requires": ["key", "text"]}]}],
+              "items": [], "next_offset": None,
+              "guidance": "These are runs and explicitly enrolled sessions, not agent definitions. "
+              "Use returned action arguments. To start new work, choose a new idempotency key and provide the task text. "
+              "Other existing sessions require explicit local read-only enrollment; discovery cannot enroll them."}
+    path = state / "bridge.sqlite"
+    if not path.exists():
+        output["empty_reason"] = "No Workrelay ledger yet; start a task or ask the local operator to enroll a selected session."
+        return output
+    require(not path.is_symlink() and path.stat().st_uid == os.getuid() and path.stat().st_mode & 0o077 == 0,
+            "private ledger unavailable")
+    db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+    try:
+        db.execute("PRAGMA query_only=ON")
+        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        parts, params = [], []
+        for table, column, kind, extra in [("tasks", "task_key", "run", ""),
+                                          ("supervision_grants", "grant_id", "enrolled_session", " AND revoked=0")]:
+            if table in tables:
+                parts.append(f"SELECT '{kind}' AS kind,{column} AS id FROM {table} WHERE owner=? AND workspace=?{extra}")
+                params.extend([config["authorized_owner"], str(directory)])
+        rows = db.execute(" UNION ALL ".join(parts) + " ORDER BY kind,id LIMIT ? OFFSET ?",
+                          params + [limit + 1, offset]).fetchall() if parts else []
+        if len(rows) > limit:
+            output["next_offset"] = offset + limit
+        for kind, identity in rows[:limit]:
+            try:
+                if kind == "run":
+                    validate_key(identity)
+                    row = task_row(db, identity)
+                    require(bool(re.fullmatch(r"ses_bridge_[0-9a-f]{32}", row[1])), "invalid session identity")
+                    session = owned_session(client, row[1], identity, config["authorized_owner"], directory)
+                    require(session is not None, "session unavailable")
+                    item = {"type": kind, "key": identity, "label": f"Task {identity}",
+                            "status": public(row, session)["phase"], "actions": [
+                                {"tool": f"workrelay_{action}", "arguments": {"key": identity}}
+                                for action in ("status", "result", "cancel")]}
+                    item["actions"].append({"tool": "workrelay_respond", "arguments": {"key": identity},
+                                            "requires": ["feedback_key", "text"]})
+                else:
+                    config["_supervision_authority"] = {"grant_id": identity}
+                    session = _enrolled(db, client, identity, config["authorized_owner"], directory)
+                    item = {"type": kind, "grant_id": identity, "label": "Enrolled read-only session",
+                            "status": session.get("outcome") if session.get("outcome") in
+                            ("succeeded", "failed", "interrupted") else "unknown",
+                            "actions": [{"tool": "workrelay_enrolled_result", "arguments": {"grant_id": identity}}]}
+                output["items"].append({**item, "project_id": "configured-workspace"})
+            except (BridgeError, SupervisionError):
+                pass  # Stale or changed authority is not a discoverable item.
+            finally:
+                config.pop("_supervision_authority", None)
+        if not output["items"]:
+            output["empty_reason"] = "No accessible items on this page. Follow next_offset if present; otherwise start a task or request local enrollment."
+        return output
+    finally:
+        db.close()
+
+
 def enrollment_admin_token(config):
     """Local administrator credential via stdin, never argv or MCP arguments."""
     try:
@@ -226,6 +289,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Scoped local OpenCode task adapter")
     parser.add_argument("--config", default=os.environ.get("AGENT_COMPUTER_BRIDGE_CONFIG", ""))
     commands = parser.add_subparsers(dest="command", required=True)
+    discovery = commands.add_parser("discover", help="List permitted work without internal IDs")
+    discovery.add_argument("--owner", required=True)
+    discovery.add_argument("--offset", type=int, default=0)
+    discovery.add_argument("--limit", type=int, default=20)
     start = commands.add_parser("start")
     start.add_argument("--key", required=True)
     start.add_argument("--owner", required=True)
@@ -266,9 +333,12 @@ def main(argv=None):
         require(bool(args.config), "set --config to a private config file")
         config, token, directory, state = load_config(args.config)
         config["_private_path"] = str(Path(args.config).expanduser().resolve())
-        db = database(state)
         client = InstalledClient(config) if config.get("transport") == "installed-client" else Client(config, token)
         require(args.owner == config["authorized_owner"], "owner not authorized by private configuration")
+        if args.command == "discover":
+            print(json.dumps(discover(config, client, directory, state, args.offset, args.limit)))
+            return 0
+        db = database(state)
         if args.command in ("grant-enrollment", "revoke-enrollment"):
             token = enrollment_admin_token(config)
             require(args.workspace == str(directory), "selected workspace not authorized by private configuration")

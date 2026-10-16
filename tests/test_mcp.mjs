@@ -112,7 +112,16 @@ test('signed OAuth JWT, strict boundary, and real MCP2 client handshake/tools', 
     await client.connect(transport);
     const tools = await client.listTools();
     assert.deepEqual(tools.tools.map(tool => tool.name).sort(),
-      ['workrelay_cancel', 'workrelay_enrolled_result', 'workrelay_profile', 'workrelay_respond', 'workrelay_result', 'workrelay_start', 'workrelay_status']);
+      ['workrelay_cancel', 'workrelay_discover', 'workrelay_enrolled_result', 'workrelay_profile', 'workrelay_respond', 'workrelay_result', 'workrelay_start', 'workrelay_status']);
+    const discovery = tools.tools.find(tool => tool.name === 'workrelay_discover');
+    assert.equal(discovery.annotations.readOnlyHint, true);
+    assert.deepEqual(discovery.inputSchema.required ?? [], []);
+    assert.match(discovery.description, /No IDs required/);
+    assert.equal((await client.callTool({ name: 'workrelay_discover', arguments: {} })).structuredContent.command, 'discover');
+    for (const args of [{ owner: 'other' }, { limit: 51 }, { offset: -1 }])
+      assert.equal((await client.callTool({ name: 'workrelay_discover', arguments: args })).isError, true);
+    assert.equal((await request(await token({ sub: 'other' }), {}, '/mcp', 'tools/call',
+      { name: 'workrelay_discover', arguments: {} })).status, 403);
     assert.equal(tools.tools.find(tool => tool.name === 'workrelay_enrolled_result').annotations.readOnlyHint, true);
     const result = await client.callTool({ name: 'workrelay_status', arguments: { key: 'task1' } });
     assert.equal(result.structuredContent.key, 'task1');
@@ -130,10 +139,10 @@ test('signed OAuth JWT, strict boundary, and real MCP2 client handshake/tools', 
     assert.equal(forgedGrant.isError, true);
     const extraOwner = await client.callTool({ name: 'workrelay_enrolled_result', arguments: { grant_id: grant, owner: 'other' } });
     assert.equal(extraOwner.isError, true);
-    assert.equal(invoked, 4);
+    assert.equal(invoked, 5);
     const rejected = await client.callTool({ name: 'workrelay_start', arguments: { key: 'task2', text: 'hi', owner: 'other' } });
     assert.equal(rejected.isError, true);
-    assert.equal(invoked, 4);
+    assert.equal(invoked, 5);
     await client.close();
   } finally { await close(gateway); await close(issuerServer); }
 });
