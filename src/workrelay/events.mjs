@@ -7,7 +7,7 @@ import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import https from 'node:https';
 
-const NAMES = ['task.decision', 'task.completed', 'session.completed', 'session.failed', 'session.needs_input'];
+const NAMES = ['task.decision', 'task.completed', 'session.completed', 'session.failed', 'session.needs_input', 'session.progress'];
 const sessionName = name => name?.startsWith('session.');
 const sessionId = value => typeof value === 'string' && /^ses[A-Za-z0-9_-]{1,160}$/.test(value);
 const MAX_QUEUE = 2048;
@@ -200,7 +200,7 @@ const definitions = NAMES.map(name => ({ name, description: name === 'task.decis
 for (const definition of definitions.filter(d => sessionName(d.name))) {
   definition.description = `Observed managed-server ${definition.name}; safe current-state reconciliation, not transcript or historical replay.`;
   definition.inputSchema = { type: 'object', properties: { server_id: { type: 'string', pattern: '^srv_[a-f0-9]{64}$' }, session_id: { type: 'string', pattern: '^ses[A-Za-z0-9_-]{1,160}$' } }, required: ['server_id'], additionalProperties: false };
-  definition.payloadSchema = { type: 'object', properties: { server_id: { type: 'string' }, session_id: { type: 'string' }, state: { enum: ['succeeded', 'failed', 'interrupted', 'needs_input'] }, summary: { type: 'string', maxLength: 2000 } }, required: ['server_id', 'session_id', 'state', 'summary'], additionalProperties: false };
+  definition.payloadSchema = { type: 'object', properties: { server_id: { type: 'string' }, session_id: { type: 'string' }, state: { enum: ['succeeded', 'failed', 'interrupted', 'needs_input', 'running', 'retrying', 'idle'] }, summary: { type: 'string', maxLength: 2000 } }, required: ['server_id', 'session_id', 'state', 'summary'], additionalProperties: false };
 }
 
 /** MCP core API (all methods async):
@@ -278,8 +278,39 @@ export function createEventsService({ statePath, principal, authorize, observeMa
       throw error;
     }
   }
+  function managedFilter(filter) {
+    requireValue(filter && /^srv_[a-f0-9]{64}$/.test(filter.server_id) && Object.keys(filter).every(k => ['server_id', 'session_id'].includes(k)) && (filter.session_id === undefined || sessionId(filter.session_id)), 'invalid_managed_filter');
+  }
+  const matchesFilter = (sub, filter) => sub.principal === principal && sub.filter?.server_id === filter.server_id && (!filter.session_id || sub.filter.session_id === filter.session_id);
+  function publicSubscription(state, sub) {
+    const pending = state.queue.filter(item => item.subscriptionId === sub.id);
+    return { id: sub.id, name: sub.name, filter: { ...sub.filter }, status: sub.expires <= now() ? 'expired' : 'active', refresh_before: new Date(sub.expires).toISOString(),
+      queued: pending.length, delivery_state: pending.some(item => item.claim) ? 'in_flight' : pending.some(item => item.attempts > 0) ? 'retrying' : pending.length ? 'queued' : 'idle',
+      next_attempt_at: pending.length ? new Date(Math.min(...pending.map(item => item.due))).toISOString() : null,
+      delivered: sub.delivery?.delivered ?? 0, dropped: sub.delivery?.dropped ?? 0, last_attempt_at: sub.delivery?.last_attempt_at ?? null,
+      last_ack_at: sub.delivery?.last_ack_at ?? null, last_http_status: sub.delivery?.last_http_status ?? null };
+  }
   return {
+    principal,
     async list() { return { events: structuredClone(definitions.filter(d => !sessionName(d.name) || typeof observeManaged === 'function')) }; },
+    async subscriptions({ filter, limit = 20, cursor = null }) {
+      managedFilter(filter); requireValue(Number.isInteger(limit) && limit >= 1 && limit <= 50 && (cursor === null || /^sub_[a-f0-9]{64}$/.test(cursor)), 'invalid_page');
+      return locked(async state => {
+        const candidates = Object.values(state.subscriptions).filter(sub => matchesFilter(sub, filter) && (!cursor || sub.id > cursor)).sort((a, b) => a.id.localeCompare(b.id));
+        const visible = [];
+        for (const sub of candidates) if (await allowed(principal, sub.task, sub.name, sub.filter)) { visible.push(publicSubscription(state, sub)); if (visible.length > limit) break; }
+        return { subscriptions: visible.slice(0, limit), next_cursor: visible.length > limit ? visible[limit - 1].id : null };
+      });
+    },
+    async subscriptionStatus({ id, filter }) {
+      managedFilter(filter); requireValue(/^sub_[a-f0-9]{64}$/.test(id), 'invalid_subscription_id');
+      return locked(async state => { const sub = state.subscriptions[id]; return { subscription: sub && matchesFilter(sub, filter) && await allowed(principal, sub.task, sub.name, sub.filter) ? publicSubscription(state, sub) : null }; });
+    },
+    async unsubscribeById({ id, filter }) {
+      managedFilter(filter); requireValue(/^sub_[a-f0-9]{64}$/.test(id), 'invalid_subscription_id');
+      await stop(sub => sub.id === id && matchesFilter(sub, filter));
+      return { subscription_id: id, status: 'stopped_or_absent' };
+    },
     async subscribe(p) {
       const { task, filter, url, id } = params(p, true);
       requireValue(p.ttlMs == null || (Number.isSafeInteger(p.ttlMs) && p.ttlMs > 0), 'invalid_ttl');
@@ -288,7 +319,7 @@ export function createEventsService({ statePath, principal, authorize, observeMa
         for (const sub of Object.values(state.subscriptions)) if (sub.expires <= now()) drop(state, sub.id);
         requireValue(Object.keys(state.subscriptions).length < 256 || state.subscriptions[id], 'subscription_limit');
         const old = state.subscriptions[id];
-        const sub = { id, principal, task, name: p.name, ...(filter ? { filter, observations: old?.observations ?? {}, scanCursor: old?.scanCursor ?? null } : {}), url, secret: p.delivery.secret, expires: now() + Math.min(p.ttlMs ?? ttlMs, maxTtlMs), verifiedUntil: old?.verifiedUntil || 0 };
+        const sub = { id, principal, task, name: p.name, ...(filter ? { filter, observations: old?.observations ?? {}, scanCursor: old?.scanCursor ?? null } : {}), ...(old?.delivery ? { delivery: old.delivery } : {}), url, secret: p.delivery.secret, expires: now() + Math.min(p.ttlMs ?? ttlMs, maxTtlMs), verifiedUntil: old?.verifiedUntil || 0 };
         if (old && old.secret !== sub.secret) { sub.previousSecret = old.secret; sub.rotationUntil = now() + rotationMs; }
         else if (old?.rotationUntil > now()) { sub.previousSecret = old.previousSecret; sub.rotationUntil = old.rotationUntil; }
         if (!old || old.secret !== sub.secret || old.verifiedUntil <= now()) {
@@ -320,17 +351,17 @@ export function createEventsService({ statePath, principal, authorize, observeMa
           requireValue(page?.server_id === sub.filter.server_id && Array.isArray(page.items) && page.items.length <= 10 && (page.next_cursor === null || typeof page.next_cursor === 'string' && page.next_cursor.length <= 4096 && page.next_cursor !== sub.scanCursor), 'invalid_observation');
           if (!await allowed(principal, sub.task, sub.name, sub.filter)) { drop(state, sub.id); continue; }
           for (const item of page.items) {
-            requireValue(sessionId(item.session_id) && (!sub.filter.session_id || item.session_id === sub.filter.session_id) && ['succeeded', 'failed', 'interrupted', 'needs_input', 'unknown'].includes(item.state) && Array.isArray(item.decisions) && item.decisions.length <= 1000 && item.decisions.every(id => /^per[A-Za-z0-9_-]{1,160}$/.test(id)), 'invalid_observation');
-            const fingerprint = createHash('sha256').update(JSON.stringify([item.state, [...item.decisions].sort()])).digest('hex');
+            requireValue(sessionId(item.session_id) && (!sub.filter.session_id || item.session_id === sub.filter.session_id) && ['succeeded', 'failed', 'interrupted', 'needs_input', 'unknown', 'running', 'retrying', 'idle'].includes(item.state) && Array.isArray(item.decisions) && item.decisions.length <= 1000 && item.decisions.every(id => /^per[A-Za-z0-9_-]{1,160}$/.test(id)), 'invalid_observation');
+            const fingerprint = createHash('sha256').update(JSON.stringify([item.state, item.state === 'needs_input' ? [...item.decisions].sort() : []])).digest('hex');
             const previous = sub.observations[item.session_id];
             if (previous?.fingerprint === fingerprint) continue;
             requireValue(previous || Object.values(state.subscriptions).reduce((sum, subscription) => sum + Object.keys(subscription.observations ?? {}).length, 0) < 8192, 'observation_limit');
             const generation = (previous?.generation ?? 0) + 1;
             sub.observations[item.session_id] = { fingerprint, generation };
-            const name = item.state === 'needs_input' ? 'session.needs_input' : item.state === 'failed' ? 'session.failed' : ['succeeded', 'interrupted'].includes(item.state) ? 'session.completed' : null;
+            const name = item.state === 'needs_input' ? 'session.needs_input' : item.state === 'failed' ? 'session.failed' : ['succeeded', 'interrupted'].includes(item.state) ? 'session.completed' : ['running', 'retrying', 'idle'].includes(item.state) ? 'session.progress' : null;
             if (name !== sub.name) continue;
             const eventId = 'evt_' + createHash('sha256').update(JSON.stringify([principal, sub.id, item.session_id, fingerprint, generation])).digest('hex');
-            state.queue.push({ subscriptionId: sub.id, event: { eventId, name, timestamp: new Date(now()).toISOString(), data: { ...sub.filter, session_id: item.session_id, state: item.state, summary: `Managed session observed ${item.state}; inspect workrelay_server_read. Native approvals remain required.` }, cursor: null }, attempts: 0, due: now() });
+            state.queue.push({ subscriptionId: sub.id, event: { eventId, name, timestamp: new Date(now()).toISOString(), data: { ...sub.filter, session_id: item.session_id, state: item.state, summary: `Managed session observed ${item.state}; inspect workrelay_server_read. Runtime idle is not task completion. Native approvals remain required.` }, cursor: null }, attempts: 0, due: now() });
           }
           sub.scanCursor = page.next_cursor;
         }
@@ -370,14 +401,17 @@ export function createEventsService({ statePath, principal, authorize, observeMa
           if (sub.rotationUntil <= now()) { delete sub.previousSecret; delete sub.rotationUntil; }
           sent++;
           item.attempts++;
+          sub.delivery ??= { delivered: 0, dropped: 0 };
+          sub.delivery.last_attempt_at = new Date(now()).toISOString();
           item.claim = { pid: process.pid, start: owner, token: randomBytes(16).toString('hex') };
           await persist(); // claim and attempt count MUST reach disk before any outbound data
           if (!await allowed(sub.principal, sub.task, sub.name, sub.filter)) { drop(state, sub.id); counts.dropped++; await persist(); continue; }
           let response; try { response = await signed(sub, JSON.stringify(item.event), item.event.eventId); } catch { response = { status: 0 }; }
           delete item.claim;
-          if (response.status >= 200 && response.status < 300) { remove(item); counts.delivered++; }
+          sub.delivery.last_http_status = Number.isInteger(response.status) && response.status >= 100 && response.status <= 599 ? response.status : null;
+          if (response.status >= 200 && response.status < 300) { remove(item); counts.delivered++; sub.delivery.delivered++; sub.delivery.last_ack_at = new Date(now()).toISOString(); }
           else if (response.status === 410) { drop(state, sub.id); counts.dropped++; }
-          else if (response.status === 413 || (response.status >= 400 && response.status < 500 && ![408, 429].includes(response.status)) || item.attempts >= maxAttempts) { remove(item); counts.dropped++; }
+          else if (response.status === 413 || (response.status >= 400 && response.status < 500 && ![408, 429].includes(response.status)) || item.attempts >= maxAttempts) { remove(item); counts.dropped++; sub.delivery.dropped++; }
           else { item.due = now() + Math.min(1000 * 2 ** (item.attempts - 1), 300000); counts.retried++; }
           await persist(); // commit ACK/retry before claiming the next event
         }

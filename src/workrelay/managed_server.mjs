@@ -88,6 +88,8 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       if (JSON.stringify(readBinding()) !== JSON.stringify(binding)) deny();
       const before = stat(binding.service_registration);
       if (before.dev !== registration.dev || before.ino !== registration.ino || before.mtimeMs !== registration.mtimeMs) deny();
+    } else if (action === 'projects' || action === 'agents' || action === 'resolve_project') {
+      path = action === 'agents' ? '/api/agent' : '/api/project';
     } else if (action === 'messages') {
       if (!sid.test(input.session_id ?? '') || selectedSession !== input.session_id) deny();
       const limit = input.limit ?? 10;
@@ -105,6 +107,10 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       const limit = input.limit ?? 20;
       if (!Number.isInteger(limit) || limit < 1 || limit > 50) deny();
       const query = new URLSearchParams({ limit: String(limit) });
+      if (input.search !== undefined) {
+        if (action !== 'discover' || typeof input.search !== 'string' || !input.search.length || input.search.length > 200 || /[\x00-\x1f\x7f]/.test(input.search)) deny();
+        query.set('search', input.search);
+      }
       if (input.cursor !== undefined) {
         if (typeof input.cursor !== 'string' || !input.cursor.length || input.cursor.length > 4096 || /[\x00-\x1f\x7f]/.test(input.cursor)) deny();
         query.set('cursor', input.cursor);
@@ -137,7 +143,7 @@ export function createManagedReader(expected, readBinding, { loadService = path 
         try { while (true) { const part = await stream.read(); if (part.done) break; bytes += part.value.length; if (bytes > 262144) deny(); parts.push(part.value); } } finally { await stream.cancel(); }
         const pending = JSON.parse(Buffer.concat(parts).toString('utf8')).data;
         if (!Array.isArray(pending) || pending.length > 1000 || pending.some(p => p.sessionID !== session.id || !/^per[A-Za-z0-9_-]{1,160}$/.test(p.id))) deny();
-        items.push({ session_id: session.id, state: ['succeeded', 'failed', 'interrupted'].includes(session.outcome) ? session.outcome : pending.length ? 'needs_input' : 'unknown', decisions: pending.map(p => p.id).sort() });
+        items.push({ session_id: session.id, state: ['succeeded', 'failed', 'interrupted'].includes(session.outcome) ? session.outcome : pending.length ? 'needs_input' : session.time?.idle ? 'idle' : 'unknown', decisions: pending.map(p => p.id).sort() });
       }
       if (JSON.stringify(readBinding()) !== JSON.stringify(binding) || canonical(binding.service_registration) !== binding.service_registration) deny();
       const after = stat(binding.service_registration);
@@ -147,6 +153,40 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       return { server_id: managedServerID(binding), items, next_cursor: next };
     }
     if (action === 'internal') return value;
+    if (action === 'resolve_project') {
+      if (!/^project_[a-f0-9]{64}$/.test(input.project_id ?? '') || !Array.isArray(value) || value.length > 10000) deny();
+      const match = value.find(project => typeof project?.id === 'string' && project.id.length <= 160 &&
+        'project_' + createHash('sha256').update(project.id).digest('hex') === input.project_id);
+      if (!match) deny();
+      return { project_id: match.id }; // Internal CLI handoff only, never a registered read tool.
+    }
+    if (action === 'projects' || action === 'agents') {
+      // Native project.list is an array; agent.list is a location-scoped envelope.
+      // Do not expose location paths, agent prompts, provider requests or permissions.
+      const records = action === 'projects' ? value : value.data;
+      const limit = input.limit ?? 20;
+      if (!Array.isArray(records) || records.length > 10000 || !Number.isInteger(limit) || limit < 1 || limit > 50) deny();
+      const items = records.map(record => {
+        if (!record || typeof record.id !== 'string' || !record.id.length || record.id.length > 160) deny();
+        const id = (action === 'projects' ? 'project_' : 'agent_') + createHash('sha256').update(record.id).digest('hex');
+        return action === 'projects' ? { project_id: id, label: managedText(record.name, 200).text || `Project ${id.slice(-8)}` } :
+          { agent_id: id, label: managedText(record.name, 200).text || `Agent ${id.slice(-8)}`, description: managedText(record.description, 1000),
+            mode: ['primary', 'subagent', 'all'].includes(record.mode) ? record.mode : 'unknown', hidden: record.hidden === true,
+            kind: 'agent_definition', execution: false };
+      }).sort((a, b) => (a.project_id ?? a.agent_id).localeCompare(b.project_id ?? b.agent_id));
+      const snapshot = createHash('sha256').update(JSON.stringify([managedServerID(binding), action, items])).digest('hex');
+      let offset = 0;
+      if (input.cursor !== undefined) {
+        if (typeof input.cursor !== 'string' || !/^[a-f0-9]{64}:[0-9]{1,5}$/.test(input.cursor)) deny();
+        const [previous, index] = input.cursor.split(':'); offset = Number(index);
+        if (previous !== snapshot || offset > items.length) deny();
+      }
+      return { server_id: managedServerID(binding), items: items.slice(offset, offset + limit),
+        next_cursor: offset + limit < items.length ? `${snapshot}:${offset + limit}` : null,
+        scope: action === 'agents' ? 'server_default_location_definitions' : 'bound_server_projects',
+        limitation: 'Read-only native inventory. No agent execution, model-route admission or permission grant is implied. Native inventory is bounded to 2MB; changed pages require a fresh first call.',
+        next_action: { tool: 'workrelay_server_discover', arguments: {} } };
+    }
     if (action === 'messages') {
       if (!Array.isArray(value.data) || value.data.length > (input.limit ?? 10)) deny();
       const next = value.cursor?.next ?? null;

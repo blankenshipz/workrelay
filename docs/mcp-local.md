@@ -22,6 +22,28 @@ An owner-only `managed-control.sqlite` ledger reserves the operation, determinis
 
 ### Everyday managed-server use and Events
 
+#### Read-family inventory
+
+Start with `workrelay_server_capabilities({})` to see the tools actually registered in this gateway and their scoped/managed boundaries. `tools/list` remains the authoritative input-schema catalog. Capability discovery verifies the same pinned principal/client/server binding; it does not grant arbitrary shell or bypass native approvals.
+
+- `workrelay_server_projects({limit?,cursor?})` lists known native projects, including projects absent from a session page. IDs are opaque, labels sanitized; paths and workspace commands are not returned.
+- `workrelay_server_agents({limit?,cursor?})` lists **definitions at the server default location**, not running owners or every project's configuration. Agent identifiers are opaque navigation IDs, not execution arguments. Names/descriptions are sanitized; prompts, provider requests and permission rules are excluded. Availability does not prove a financially admitted model route or grant execution permission.
+- Both inventories default to 20 items, maximum 50. Follow `next_cursor`; if the inventory changes, restart from the first page. Native list responses are bounded to 2 MB / 10,000 records rather than streamed without limit.
+- `workrelay_server_discover({search?,limit?,cursor?})` supports native session search (1–200 characters); preserve `search` on subsequent pages. Do not put credentials in search text. Existing session discovery and action arguments remain compatible.
+- `workrelay_server_read({session_id,include_messages:true,limit?,cursor?})` provides bounded visible conversation/results. Runtime success is not verified task completion; no authoritative harness progress/blocker/completion report is invented from native metadata.
+
+The gateway registers ordinary scoped start/status/result/respond/cancel plus these managed controls:
+
+- `workrelay_server_create({operation_id,project_id,title,directory?})`: use the opaque ID returned by projects; directory defaults to the private configured workspace and must remain operator-allowlisted. Creation is idle, returns a stable session ID and does not start inference.
+- `workrelay_server_message`, `workrelay_server_resume`, and `workrelay_server_steer` take `{session_id,operation_id,text}`. Message/resume queue to the existing owner; steer uses native steering. Neither changes agent/model or approves permissions.
+- `workrelay_server_operation_status({session_id,operation_id})` inspects durable operation state without replay. `workrelay_server_interrupt` takes the same arguments and targets that session only; idle may return `idle_noop`, not rollback or removal of queued work.
+
+Reuse identical operation IDs and inputs after uncertainty. All control handoffs use verified caller claims, existing financial admission and native permissions. Creation does not authorize arbitrary directories or models. Ordinary scoped defaults remain unchanged.
+
+With Events enabled, callable tools are `workrelay_event_capabilities({})`, `workrelay_event_subscriptions({session_id?,limit?,cursor?})`, and `workrelay_event_subscription_status` / `workrelay_event_unsubscribe` with `{subscription_id,session_id?}`. They share the native Events store and current revocation boundary; status/list omit callback URLs, signing secrets and event text. Creation remains **native `events/subscribe`**, not a nonexistent subscribe tool. Subscription stop removes pending delivery, not underlying work; `revocation_pending` means retry is required, not success. `session.progress` reports explicit observed transitions; the native adapter only emits source-supported states (including explicit idle), not guessed running/retrying state or verified task completion.
+
+Integrated tools have isolated protocol tests, not yet installed or ChatGPT acceptance. A real callback receiver and actual ChatGPT Events support remain unverified; do not assume the client can provision one. Existing installed session-context evidence does not prove the new tools or real control journey.
+
 Start with `workrelay_server_discover({})`, then `workrelay_server_read({session_id})` using returned IDs. Discovery accepts optional `limit` (1–50, default 20) and `cursor`; use `next_cursor` for later pages. Its returned `server_id` identifies the bound registration/endpoint, not a runtime PID. Message and interrupt schemas are exactly those above: session ID plus operation ID, and text only for messages. Keep native permission decisions in OpenCode/OpenChamber; queued text does not approve them or transfer agent ownership. No reconnect is required for everyday calls; reconnect only after disconnection or a demonstrably stale client tool cache.
 
 Enable `events_enabled`, private `events_state_path` and `revocation_file` once during setup. Managed subscriptions use `events/list`, `events/subscribe` and `events/unsubscribe`, with names `session.completed`, `session.failed`, or `session.needs_input`. Subscribe parameters are `{name, arguments: {server_id, session_id?}, delivery: {mode: "webhook", url, secret}, cursor?: null, ttlMs?: positiveInteger}`. Use the returned server ID; include a session ID for one session, or omit it for the entire explicitly bound server. Unsubscribe uses the same name, arguments and delivery URL/mode; its secret may be omitted. Subscriptions default to one hour and are capped at 24 hours. Stopping a subscription or its expiry stops monitoring, not ordinary service or work.

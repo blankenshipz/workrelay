@@ -38,8 +38,10 @@ test('managed registration read boundary is pinned, revoked, bounded and sanitiz
     loadService: async () => ({ discover: async args => { assert.equal(args.file, b.service_registration); return { url: endpoint, auth: {} }; }, headers: () => ({}) }),
     fetcher: async (url, options) => {
       calls++; assert.equal(options.method, 'GET'); assert.equal(options.redirect, 'manual');
+      if (url.pathname.endsWith('/permission')) return new Response(JSON.stringify({ data: [] }));
+      if (url.searchParams.has('search')) assert.equal(url.searchParams.get('search'), 'release notes');
       const session = { id: root, projectID: '/PRIVATE/SECRET_PROJECT?token=SECRET', title: surfaceText ?? 'Useful project password=SECRET', metadata: { password: 'SECRET' }, location: { directory: '/PRIVATE' }, time: { idle: 1 }, outcome: 'succeeded' };
-      if (during) during();
+      if (during) during(session);
       if (url.pathname.endsWith('/message')) {
         assert.equal(url.pathname, `/api/session/${root}/message`);
         if (messageRevocation) binding.revoked = true;
@@ -56,6 +58,9 @@ test('managed registration read boundary is pinned, revoked, bounded and sanitiz
     },
   });
   const page = await reader('discover', {}, claims);
+  await reader('discover', { search: 'release notes' }, claims);
+  await reader('discover', { search: 'release notes', cursor: 'page2' }, claims);
+  await assert.rejects(reader('discover', { search: '\n' }, claims));
   assert.equal(page.items[0].session_id, root); assert.equal(page.next_cursor, 'page2');
   assert.match(page.items[0].project_id, /^project_[0-9a-f]{64}$/);
   assert.equal(page.projects[0].id, page.items[0].project_id);
@@ -64,6 +69,10 @@ test('managed registration read boundary is pinned, revoked, bounded and sanitiz
   assert.equal(page.items[0].label, 'Useful project password=[REDACTED]');
   assert.equal(page.items[0].runtime_status, 'succeeded');
   assert.equal(page.items[0].task_outcome.status, 'unknown');
+  during = session => { delete session.outcome; };
+  const observed = await reader('events', { server_id: page.server_id, session_id: root }, claims);
+  assert.equal(observed.items[0].state, 'idle', 'progress uses explicit native idle, not inferred running');
+  during = undefined;
   const context = (await reader('read', { session_id: root, include_messages: true, limit: 3 }, claims)).context;
   assert.equal(context.next_cursor, 'older');
   assert.equal(context.items[0].text, 'Please repair navigation token=[REDACTED]');
@@ -141,6 +150,13 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
       return res.end(JSON.stringify({ data: item }));
     }
     assert.equal(req.method, 'GET');
+    if (req.url === '/api/project') return res.end(JSON.stringify([
+      { id: 'project', name: 'Useful project', directory: '/PRIVATE', commands: { start: 'SECRET' } },
+      { id: 'empty-project', name: 'Empty project token=SECRET' }
+    ]));
+    if (req.url === '/api/agent') return res.end(JSON.stringify({ location: { directory: '/PRIVATE' }, data: [
+      { id: 'reviewer', name: 'Review helper', description: 'Review code token=SECRET', mode: 'subagent', hidden: false, system: 'HIDDEN', request: { password: 'SECRET' }, permissions: {} }
+    ] }));
     if (req.url === '/api/plugin') return res.end(JSON.stringify({ data: [{ id: 'subscription.guard', state: { status: 'active' }, source: { type: 'local', path: guardEntry } }] }));
     if (req.url === '/api/integration/openai') return res.end(JSON.stringify({ data: { id: 'openai', connections: [{ type: 'credential', method: 'oauth' }] } }));
     if (req.url === '/api/provider/openai') return res.end(JSON.stringify({ data: { id: 'openai', package: '@opencode/ai/providers/openai' } }));
@@ -182,18 +198,72 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
     managed_server: config.managed_server, managed_supervisor_file: capability };
   await fs.writeFile(config.bridge_config, JSON.stringify(bridge), { mode: 0o600 });
   const gateway = createGateway(config, { testIssuer: true }); await new Promise(resolve => gateway.listen(port, '127.0.0.1', resolve)); t.after(() => close(gateway));
-  const call = async (clientID, name = 'workrelay_server_discover', args = {}, tokenOptions = {}) => {
+  const call = async (clientID, name = 'workrelay_server_discover', args = {}, tokenOptions = {}, target = gateway) => {
     const token = await new SignJWT({ scope: 'workrelay:tasks', client_id: clientID }).setProtectedHeader({ alg: 'RS256', kid: 'test' })
       .setIssuer(origin).setAudience(tokenOptions.audience ?? config.audience).setSubject(tokenOptions.subject ?? 'alice').setIssuedAt().setExpirationTime('5m').sign(keys.privateKey);
     const sdk = new Client({ name: 'managed-test', version: '1' });
     try {
-      await sdk.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${gateway.address().port}/mcp`),
+      await sdk.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${target.address().port}/mcp`),
         { requestInit: { headers: { authorization: `Bearer ${token}` } } }));
-      return { result: await sdk.callTool({ name, arguments: args }) };
+      return { result: await sdk.callTool({ name, arguments: args }), tools: (await sdk.listTools()).tools };
     } finally { await sdk.close(); }
   };
   assert.equal((await call(client)).result.structuredContent.items[0].session_id, root);
   assert.equal(reads, 1);
+  const catalogue = await call(client, 'workrelay_server_capabilities');
+  assert.deepEqual(catalogue.result.structuredContent.tools.map(tool => tool.name).sort(), catalogue.tools.map(tool => tool.name).sort());
+  for (const name of ['workrelay_server_projects', 'workrelay_server_agents', 'workrelay_server_capabilities']) {
+    assert.ok(catalogue.tools.some(tool => tool.name === name && tool.annotations.readOnlyHint));
+    assert.equal((await call('other', name)).result.isError, true);
+  }
+  const projects = (await call(client, 'workrelay_server_projects', { limit: 1 })).result.structuredContent;
+  assert.equal(projects.items.length, 1); assert.ok(projects.next_cursor);
+  const nextProjects = (await call(client, 'workrelay_server_projects', { limit: 1, cursor: projects.next_cursor })).result.structuredContent;
+  assert.equal(nextProjects.items.length, 1); assert.equal(nextProjects.next_cursor, null);
+  assert.notEqual(projects.items[0].project_id, nextProjects.items[0].project_id);
+  const agents = (await call(client, 'workrelay_server_agents')).result.structuredContent;
+  assert.equal(agents.items[0].kind, 'agent_definition'); assert.equal(agents.items[0].execution, false);
+  assert.equal(agents.items[0].label, 'Review helper');
+  for (const output of [projects, nextProjects, agents, catalogue.result.structuredContent]) {
+    assert.doesNotMatch(JSON.stringify(output), /SECRET|PRIVATE|HIDDEN/);
+    assert.ok(catalogue.tools.some(tool => tool.name === output.next_action.tool));
+    assert.notEqual((await call(client, output.next_action.tool, output.next_action.arguments)).result.isError, true);
+  }
+  assert.equal((await call(client, 'workrelay_server_agents', { cursor: projects.next_cursor })).result.isError, true);
+  assert.equal(posts.length, 0);
+  // Isolated router contract tests: the existing gateway below still exercises
+  // the real guarded CLI. This separate gateway captures only router handoff.
+  const handed = [];
+  const revocation = join(dir, 'revocation.json');
+  await fs.writeFile(revocation, JSON.stringify({ revoked_principals: [], revoked_tokens: [] }), { mode: 0o600 });
+  const integratedReserve = createServer(); await listen(integratedReserve);
+  const integratedPort = integratedReserve.address().port; await close(integratedReserve);
+  const integrated = createGateway({ ...config, port: integratedPort, events_enabled: true, events_state_path: join(dir, 'events.sqlite'), revocation_file: revocation }, {
+    testIssuer: true, invoke: async (_config, command, payload) => { handed.push({ command, payload }); return { phase: 'fixture_dispatch', inference_started: false }; }
+  });
+  await new Promise(resolve => integrated.listen(integratedPort, '127.0.0.1', resolve)); t.after(() => close(integrated));
+  const integratedCall = (name, args = {}, who = client) => call(who, name, args, {}, integrated);
+  for (const action of ['create', 'operation_status', 'steer', 'resume']) {
+    const args = action === 'create' ? { operation_id: 'new', project_id: projects.items[0].project_id, title: 'Isolated creation' } :
+      { session_id: root, operation_id: 'inspect', ...(['steer', 'resume'].includes(action) ? { text: 'Bounded continuation' } : {}) };
+    assert.notEqual((await integratedCall(`workrelay_server_${action}`, args)).result.isError, true);
+    assert.equal(handed.at(-1).command, 'managed-control');
+    assert.equal(handed.at(-1).payload.action, action === 'operation_status' ? 'inspect' : action);
+    assert.equal(handed.at(-1).payload.claims.sub, 'alice');
+    assert.equal(handed.at(-1).payload.claims.client_id, client);
+    if (action === 'create') assert.ok(['project', 'empty-project'].includes(handed.at(-1).payload.project_id));
+    const count = handed.length;
+    assert.equal((await integratedCall(`workrelay_server_${action}`, args, 'other')).result.isError, true);
+    assert.equal(handed.length, count);
+  }
+  const full = await integratedCall('workrelay_server_capabilities');
+  assert.deepEqual(full.result.structuredContent.tools.map(tool => tool.name).sort(), full.tools.map(tool => tool.name).sort());
+  for (const name of ['workrelay_event_capabilities', 'workrelay_event_subscriptions', 'workrelay_event_subscription_status', 'workrelay_event_unsubscribe']) {
+    const args = ['workrelay_event_subscription_status', 'workrelay_event_unsubscribe'].includes(name) ? { subscription_id: 'sub_' + 'a'.repeat(64) } : {};
+    assert.notEqual((await integratedCall(name, args)).result.isError, true);
+    assert.equal((await integratedCall(name, args, 'other')).result.isError, true);
+  }
+  reads = 1; // Remaining legacy assertions count session-discovery calls only.
   const readArgs = { session_id: root, include_messages: true, limit: 1 };
   const visible = (await call(client, 'workrelay_server_read', readArgs)).result;
   assert.notEqual(visible.isError, true);

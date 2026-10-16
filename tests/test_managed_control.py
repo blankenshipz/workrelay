@@ -3,12 +3,14 @@ import sqlite3
 import unittest
 import tempfile
 import os
+import hashlib
+import json
 import multiprocessing
 from pathlib import Path
 from unittest.mock import patch
 
 from workrelay.cli import BridgeError
-from workrelay.managed_control import control, reservation_owner_dead
+from workrelay.managed_control import control, reservation_owner_dead, create_session, creation_session_id, inspect_operation, identity
 
 
 class ManagedControlTests(unittest.TestCase):
@@ -34,8 +36,8 @@ class ManagedControlTests(unittest.TestCase):
             return {'data': copy.deepcopy(self.session)}
         if '/prompt' in path:
             self.assertEqual(set(body), {'id', 'text', 'delivery'})
-            self.assertEqual(body['delivery'], 'queue')
-            result = {'id': body['id'], 'sessionID': self.sid, 'delivery': 'queue'}
+            self.assertIn(body['delivery'], ('queue', 'steer'))
+            result = {'id': body['id'], 'sessionID': self.sid, 'delivery': body['delivery']}
             self.inbox.append(result)
             if self.timeout: raise TimeoutError()
             return {'data': result}
@@ -92,7 +94,7 @@ class ManagedControlTests(unittest.TestCase):
 
     @patch('workrelay.managed_control.admission')
     def test_interrupt_only_exact_session_no_inference(self, admit):
-        self.assertEqual(self.run_control(interrupt=True)['phase'], 'interrupt_acknowledged')
+        self.assertEqual(self.run_control(interrupt=True)['phase'], 'idle_noop')
         admit.assert_not_called()
         self.assertEqual(self.posts(), [('POST', '/api/session/ses_existing/interrupt?resume=false', None)])
         self.run_control(interrupt=True)
@@ -209,6 +211,149 @@ class ManagedControlTests(unittest.TestCase):
                     with self.assertRaises(BridgeError): self.run_control(text='hello')
                 self.assertEqual(self.posts(), [])
                 self.binding = 'a' * 64
+
+    @patch('workrelay.managed_control.admission')
+    def test_steer_and_inspect_use_same_native_owner_without_approval_changes(self, admit):
+        original = copy.deepcopy(self.session)
+        result = self.run_control(text='bounded guidance', steer=True)
+        self.assertEqual(result['phase'], 'steering')
+        self.assertEqual(self.posts()[0][2]['delivery'], 'steer')
+        self.assertEqual(self.run_control(text='bounded guidance', steer=True), result)
+        with self.assertRaises(BridgeError): self.run_control(text='bounded guidance')
+        observed = inspect_operation(self.db, self.config, self, self.authorize, self.sid, 'operation')
+        self.assertEqual(observed['phase'], 'queued_observed')
+        self.assertEqual(observed['task_outcome'], 'unverified')
+        self.assertFalse(observed['cancellation_is_rollback'])
+        self.assertEqual(self.session, original)
+        self.binding = 'b' * 64
+        with self.assertRaises(BridgeError):
+            inspect_operation(self.db, self.config, self, self.authorize, self.sid, 'operation')
+
+    def test_exact_full_model_and_raw_input_bound(self):
+        self.session['model'] = {**self.config['model'], 'variant': 'different'}
+        with self.assertRaises(BridgeError): self.run_control(text='hello')
+        with self.assertRaises(BridgeError): self.run_control(text='hello' + ' ' * 16000)
+        self.assertEqual(self.posts(), [])
+
+    @patch('workrelay.managed_control.admission')
+    def test_verified_sidebar_work_addition_change_and_removal_preserves_identity(self, admit):
+        self.run_control(text='hello')
+        original = identity(self.session, self.sid)
+        for work in ({'state': 'open', 'openedAt': 1, 'openedBy': 'auto'},
+                     {'state': 'open', 'suggestDoneAt': 2, 'doneAt': None},
+                     {'state': 'done', 'openedBy': 'user', 'doneAt': 3}):
+            self.session['metadata']['openchamber'] = {'work': work}
+            self.assertEqual(identity(self.session, self.sid), original)
+            self.assertEqual(inspect_operation(self.db, self.config, self, self.authorize, self.sid, 'operation')['phase'], 'queued_observed')
+        del self.session['metadata']['openchamber']
+        self.assertEqual(identity(self.session, self.sid), original)
+        self.assertEqual(len(self.posts()), 1)
+
+    @patch('workrelay.managed_control.admission')
+    def test_protected_identity_and_unknown_ui_fields_remain_fail_closed(self, admit):
+        self.run_control(text='hello')
+        original = copy.deepcopy(self.session)
+        changes = [('agent', 'other'), ('model', {**self.config['model'], 'variant': 'other'}),
+                   ('projectID', 'other'), ('location', {'directory': '/other'}),
+                   ('parentID', 'ses_other'), ('permissions', {'allow': True}),
+                   ('metadata', {'taskIntent': 'changed'}),
+                   ('metadata', {**original['metadata'], 'owner': 'other'}),
+                   ('metadata', {**original['metadata'], 'workrelayBinding': 'other'}),
+                   ('metadata', {**original['metadata'], 'openchamber': {'goal': {'id': 'other'}}}),
+                   ('metadata', {**original['metadata'], 'openchamber': {'work': {'state': 'open', 'owner': 'other'}}}),
+                   ('metadata', {**original['metadata'], 'openchamber': {'work': {'state': 'open', 'openedAt': 'untrusted'}}})]
+        for key, value in changes:
+            self.session = copy.deepcopy(original); self.session[key] = value
+            with self.subTest(field=key, value_type=type(value).__name__):
+                with self.assertRaises(BridgeError):
+                    inspect_operation(self.db, self.config, self, self.authorize, self.sid, 'operation')
+        self.assertEqual(len(self.posts()), 1)
+
+    @patch('workrelay.managed_control.admission')
+    def test_legacy_ui_hash_not_rewritten_or_erased(self, admit):
+        self.session['metadata']['openchamber'] = {'work': {'state': 'open', 'openedAt': 1}}
+        self.run_control(text='hello')
+        selected = {key: self.session.get(key) for key in
+                    ('id', 'parentID', 'projectID', 'agent', 'model', 'metadata', 'permissions', 'location')}
+        old_hash = hashlib.sha256(json.dumps(selected, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        self.db.execute('UPDATE managed_operations SET identity=?', (old_hash,))
+        before = self.db.execute('SELECT * FROM managed_operations').fetchall()
+        with self.assertRaises(BridgeError):
+            inspect_operation(self.db, self.config, self, self.authorize, self.sid, 'operation')
+        self.assertEqual(self.db.execute('SELECT * FROM managed_operations').fetchall(), before)
+
+
+class CreationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.directory = str(Path(self.tmp.name).resolve())
+        self.config = {'directory': self.directory, 'model': {'providerID': 'openai', 'id': 'included', 'variant': 'full'}, 'agent': 'quick-builder'}
+        self.db = sqlite3.connect(':memory:', isolation_level=None); self.addCleanup(self.db.close)
+        self.binding = 'a' * 64; self.sessions = {}; self.calls = []; self.timeout = False
+
+    def authorize(self):
+        if self.binding is None: raise BridgeError('revoked')
+        return self.binding
+
+    def request(self, method, path, body=None):
+        self.calls.append((method, path, copy.deepcopy(body)))
+        if path == '/api/project': return [{'id': 'project', 'canonical': self.directory}]
+        if method == 'GET':
+            session = self.sessions.get(path.split('/')[-1])
+            return {'data': copy.deepcopy(session)} if session else None
+        self.assertEqual((method, path), ('POST', '/api/session'))
+        self.assertNotIn('permissions', body); self.assertNotIn('parentID', body)
+        self.sessions[body['id']] = {**copy.deepcopy(body), 'projectID': 'project'}
+        if self.timeout: raise TimeoutError()
+        return {'data': copy.deepcopy(self.sessions[body['id']])}
+
+    def create(self, op='create1', **kw):
+        return create_session(self.db, self.config, self, self.authorize, op,
+                              **{'directory': self.directory, 'title': 'Isolated check', 'project_id': 'project', **kw})
+
+    def test_durable_create_duplicate_conflict_and_no_inference(self):
+        with patch('workrelay.managed_control.admission') as admit:
+            result = self.create()
+            self.assertEqual(result['phase'], 'created'); self.assertFalse(result['inference_started'])
+            self.assertEqual(self.create(), result); admit.assert_not_called()
+            with self.assertRaises(BridgeError): self.create(title='Changed')
+        self.assertEqual(sum(m == 'POST' for m, _, _ in self.calls), 1)
+        session = self.sessions[result['session_id']]
+        self.assertEqual(session['model'], self.config['model'])
+        self.assertEqual(session['agent'], self.config['agent'])
+        self.assertNotIn('permissions', session)
+
+    def test_uncertain_create_exact_reconciliation_without_replay(self):
+        self.timeout = True
+        with self.assertRaises(BridgeError): self.create()
+        self.assertEqual(self.create()['phase'], 'created')
+        self.assertEqual(sum(m == 'POST' for m, _, _ in self.calls), 1)
+        self.sessions.clear()
+        with self.assertRaises(BridgeError): self.create()
+        self.assertEqual(sum(m == 'POST' for m, _, _ in self.calls), 1)
+
+    def test_workspace_project_revocation_and_identity_denied(self):
+        for args in ({'directory': '/'}, {'project_id': 'other'}):
+            with self.assertRaises(BridgeError): self.create(**args)
+        self.assertFalse(any(m == 'POST' for m, _, _ in self.calls))
+        self.binding = None
+        with self.assertRaises(BridgeError): self.create('revoked')
+        self.binding = 'a' * 64
+        result = self.create('valid')
+        self.sessions[result['session_id']]['model']['variant'] = 'wrong'
+        with self.assertRaises(BridgeError): self.create('valid')
+
+    def test_reserved_creation_not_replaced_by_parallel_caller(self):
+        original = self.request
+        observed = []
+        def request(method, path, body=None):
+            if path == '/api/project':
+                observed.append(self.create())
+            return original(method, path, body)
+        self.request = request
+        self.create()
+        self.assertEqual(observed[0]['phase'], 'reserved')
+        self.assertEqual(sum(m == 'POST' for m, _, _ in self.calls), 1)
 
 
 if __name__ == '__main__': unittest.main()

@@ -338,12 +338,12 @@ def main(argv=None):
         client = InstalledClient(config) if config.get("transport") == "installed-client" else Client(config, token)
         require(args.owner == config["authorized_owner"], "owner not authorized by private configuration")
         if args.command == 'managed-control':
-            from .managed_control import control
+            from .managed_control import control, create_session, creation_session_id, inspect_operation
             require(config.get('transport') == 'installed-client', 'managed control requires guarded installed transport')
             envelope = json.loads(sys.stdin.read(50000))
-            require(isinstance(envelope, dict) and envelope.get('action') in ('message', 'interrupt'), 'invalid control handoff')
+            require(isinstance(envelope, dict) and envelope.get('action') in ('message', 'steer', 'resume', 'interrupt', 'inspect', 'create'), 'invalid control handoff')
             config['_supervision_authority'] = {'managed': {'claims': envelope.get('claims'),
-                'session_id': envelope.get('session_id'), 'operation_id': envelope.get('operation_id')}}
+                'session_id': 'ses_workrelay_pending' if envelope['action'] == 'create' else envelope.get('session_id'), 'operation_id': envelope.get('operation_id')}}
             path = state / 'managed-control.sqlite'
             require(not path.is_symlink(), 'unsafe control ledger')
             fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -357,8 +357,19 @@ def main(argv=None):
                 def authorize():
                     result = client.request('GET', '/__managed/authorize')
                     return result.get('binding_id') if isinstance(result, dict) else None
-                print(json.dumps(control(db, config, client, authorize, envelope.get('session_id'), envelope.get('operation_id'),
-                    text=envelope.get('text'), interrupt=envelope['action'] == 'interrupt')))
+                if envelope['action'] == 'create':
+                    binding = authorize()
+                    config['_supervision_authority']['managed']['session_id'] = creation_session_id(binding, envelope.get('operation_id'))
+                    result = create_session(db, config, client, authorize, envelope.get('operation_id'),
+                        directory=envelope.get('directory', str(directory)), title=envelope.get('title'), project_id=envelope.get('project_id'))
+                elif envelope['action'] == 'inspect':
+                    result = inspect_operation(db, config, client, authorize, envelope.get('session_id'), envelope.get('operation_id'))
+                else:
+                    # Resume is a bounded continuation message through the same
+                    # native owner, not a new agent or approval reply.
+                    result = control(db, config, client, authorize, envelope.get('session_id'), envelope.get('operation_id'),
+                        text=envelope.get('text'), interrupt=envelope['action'] == 'interrupt', steer=envelope['action'] == 'steer')
+                print(json.dumps(result))
             except Exception:
                 raise BridgeError('managed control denied or uncertain; retry only the same operation ID to reconcile') from None
             finally:

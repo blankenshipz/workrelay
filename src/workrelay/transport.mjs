@@ -185,7 +185,7 @@ async function managedRequest(input, config) {
       internalAuthorize: async (request, binding, endpoint, headers) => {
         const sid = authority.session_id;
         if (request.method === 'GET' && request.body === null) {
-          if (rootRoutes.has(request.path) || request.path === `/api/session/${sid}` || request.path === `/api/session/${sid}/inbox`) return true;
+          if (rootRoutes.has(request.path) || request.path === '/api/project' || request.path === `/api/session/${sid}` || request.path === `/api/session/${sid}/inbox`) return true;
         }
         const code = `import json,sqlite3,sys
 db=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True,timeout=3)
@@ -197,10 +197,20 @@ print(json.dumps(r))`;
         if (request.method === 'GET' && request.body === null)
           return request.path === `/api/session/${sid}/message/${row[2]}`;
         if (request.method !== 'POST' || row[3] !== 'sending') return false;
-        if (row[0] === 'queue') {
+        if (row[0] === 'create') {
+          const body = JSON.parse(row[4]);
+          const allowed = config.managed_allowed_directories ?? [config.directory];
+          return request.path === '/api/session' && body.id === sid &&
+            isDeepStrictEqual(request.body, body) && isDeepStrictEqual(body.model, config.model) &&
+            body.agent === (config.agent ?? 'quick-builder') && Array.isArray(allowed) && allowed.includes(body.location?.directory) &&
+            fields(body, ['id', 'title', 'location', 'model', 'agent', 'metadata']) &&
+            fields(body.location, ['directory']) && fields(body.metadata, ['workrelayBinding', 'workrelayOperation']) &&
+            body.metadata.workrelayBinding === binding && body.metadata.workrelayOperation === authority.operation_id;
+        }
+        if (row[0] === 'queue' || row[0] === 'steer') {
           if (request.path !== `/api/session/${sid}/prompt` || !fields(request.body, ['id', 'text', 'delivery']) ||
-              request.body.id !== row[2] || request.body.delivery !== 'queue' || typeof request.body.text !== 'string' ||
-              createHash('sha256').update('queue\0' + request.body.text).digest('hex') !== row[1]) return false;
+              request.body.id !== row[2] || request.body.delivery !== row[0] || typeof request.body.text !== 'string' ||
+              createHash('sha256').update(row[0] + '\0' + request.body.text).digest('hex') !== row[1]) return false;
         } else if (row[0] !== 'interrupt' || request.path !== `/api/session/${sid}/interrupt?resume=false` || request.body !== null) return false;
         const found = await fetch(new URL(`/api/session/${sid}`, endpoint.url), { headers, redirect: 'manual', signal: AbortSignal.timeout(5000) });
         if (!found.ok) return false;
