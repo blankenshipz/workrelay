@@ -106,10 +106,60 @@ test('preapproval denial recorder is bounded, exclusive, categorical and target-
   } }, { principal: 'synthetic', resource: 'https://issuer.example.test/mcp', onDenied: record }),
   error => error.error === 'access_denied');
   assert.deepEqual(JSON.parse(await fs.readFile(receipt, 'utf8')),
-    { attemptId, stage: 'preapproval', rejectionClass: 'scope_other' });
+    { attemptId, stage: 'preapproval', rejectionClass: 'scope_other', scopeClass: 'valid-2-1-2' });
   assert.equal((await fs.stat(receipt)).mode & 0o777, 0o600);
   await prepare('preapproval'); record('account');
   assert.equal(JSON.parse(await fs.readFile(receipt, 'utf8')).rejectionClass, 'scope_other');
+});
+
+test('scope mismatch classification is finite and never persists unknown scope text', async t => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'workrelay-scope-class-'));
+  await fs.chmod(dir, 0o700);
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const resource = 'https://issuer.example.test/mcp';
+  for (const [scope, expected] of [
+    ['openid', 'valid-2-0-1'], ['offline_access', 'valid-4-0-1'],
+    ['workrelay:tasks openid', 'valid-3-0-2'],
+    ['openid workrelay:tasks', 'valid-3-0-2'],
+    ['workrelay:tasks offline_access profile email openid', 'valid-31-0-5'],
+    ['PRIVATE_UNKNOWN_MARKER', 'valid-0-1-1'],
+    ['workrelay:tasks PRIVATE_UNKNOWN_MARKER', 'valid-1-1-2'],
+    ['workrelay:tasks workrelay:tasks', 'valid-1-0-2'],
+    [Array(9).fill('openid').join(' '), 'valid-2-0-many'],
+    [' workrelay:tasks', 'invalid'], ['workrelay:tasks  openid', 'invalid'],
+    ['workrelay:tasks\topenid', 'invalid'], [['openid'], 'nonstring'],
+    ['X'.repeat(4097), 'overlong'],
+  ]) {
+    const attemptId = randomBytes(16).toString('hex'), issuedAt = Date.now();
+    await fs.writeFile(join(dir, 'preapproval-next.arm'), JSON.stringify({ target: 'preapproval',
+      attemptId, issuedAt, expiresAt: issuedAt + 1800000 }), { mode: 0o600, flag: 'wx' });
+    await assert.rejects(loadPreapprovedChatGPTGrant({ oidc: {
+      account: { accountId: 'synthetic' }, session: { accountId: 'synthetic' },
+      client: { clientId: CHATGPT_CIMD_ID }, params: { client_id: CHATGPT_CIMD_ID,
+        redirect_uri: CHATGPT_CIMD_REDIRECT, resource, scope, response_type: 'code' },
+    } }, { principal: 'synthetic', resource, onDenied: createPreapprovalDiagnostic(dir, { nextDenial: true }) }),
+    error => error.error === 'access_denied');
+    const text = await fs.readFile(join(dir, 'preapproval-next.receipt.json'), 'utf8');
+    assert.deepEqual(JSON.parse(text), { attemptId, stage: 'preapproval', rejectionClass: 'scope_other', scopeClass: expected });
+    assert.equal(text.includes('PRIVATE_UNKNOWN_MARKER'), false);
+    // Independent synthetic cases, not a production rearm mechanism.
+    await fs.unlink(join(dir, 'preapproval-next.receipt.json'));
+    await fs.unlink(join(dir, 'preapproval-next.used'));
+  }
+});
+
+test('scope recorder refuses caller-supplied nonfinite classifications', async t => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'workrelay-scope-output-'));
+  await fs.chmod(dir, 0o700); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  for (const classification of ['PRIVATE_UNKNOWN_MARKER', 'valid-32-0-1', 'valid-1-0-1\n', { raw: 'PRIVATE_UNKNOWN_MARKER' }]) {
+    const attemptId = randomBytes(16).toString('hex');
+    await fs.writeFile(join(dir, 'origin-post.arm'), JSON.stringify({ target: 'preapproval', attemptId,
+      expiresAt: Date.now() + 60000 }), { mode: 0o600 });
+    createPreapprovalDiagnostic(dir)('scope_other', classification);
+    assert.deepEqual(JSON.parse(await fs.readFile(join(dir, 'origin-post.receipt.json'), 'utf8')),
+      { attemptId, stage: 'preapproval', rejectionClass: 'scope_other' });
+    await fs.unlink(join(dir, 'origin-post.receipt.json')); await fs.unlink(join(dir, 'origin-post.used'));
+  }
 });
 
 test('preapproval hook rejects account and capability escalation and cannot resurrect referenced revoked grants', async () => {
@@ -365,11 +415,12 @@ for (const registration of ['static', 'chatgpt-cimd', 'chatgpt-preapproved']) te
   let documentFetches = 0;
   let accountLookups = 0;
   const deniedCategories = [];
+  const deniedScopeClasses = [];
   const provider = createUnexposedIssuerPolicy({ origin, principal: 'person1',
     jwks: { keys: [{ ...privateKey, kid: 'test', alg: 'RS256', use: 'sig' }] },
     cookieKeys: [randomBytes(32).toString('base64url')], clientId,
     clientRegistration: cimd ? 'chatgpt-cimd' : 'static', preapproveChatGPT,
-    onPreapprovalDenied: category => deniedCategories.push(category),
+    onPreapprovalDenied: (category, classification) => { deniedCategories.push(category); if (classification) deniedScopeClasses.push(classification); },
     ...(cimd ? { fetchClientDocument: async (id, options) => {
       assert.equal(id, CHATGPT_CIMD_ID);
       assert.equal(options.redirect, 'manual');
@@ -577,6 +628,14 @@ for (const registration of ['static', 'chatgpt-cimd', 'chatgpt-preapproved']) te
     assert.equal(claims.aud, origin + '/mcp');
     assert.equal(claims.scope, 'workrelay:tasks');
     assert.equal(claims.sub, 'person1');
+    for (const [scope, expected] of [['workrelay:tasks openid', 'valid-3-0-2'],
+      ['workrelay:tasks offline_access', 'valid-5-0-2'],
+      ['workrelay:tasks PRIVATE_UNKNOWN_MARKER', 'valid-1-1-2']]) {
+      deniedScopeClasses.length = 0;
+      const rejected = await request(auth.replace('workrelay%3Atasks', encodeURIComponent(scope)) + '&prompt=consent');
+      assert.equal(new URL(rejected.response.headers.get('location'), base).searchParams.has('code'), false);
+      assert.deepEqual(deniedScopeClasses, [expected], 'maintained provider rejection supplies only fixed classification');
+    }
     for (const invalid of [
       auth.replace('workrelay%3Atasks', 'openid'),
       auth.replace('workrelay%3Atasks', 'offline_access') + '&prompt=consent',

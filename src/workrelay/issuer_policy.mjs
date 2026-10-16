@@ -10,11 +10,28 @@ import { privateDirectory } from './issuer_interactions.mjs';
 const preapprovalReasons = new Set(['account', 'session', 'client', 'redirect',
   'resource_absent', 'resource_array', 'resource_other', 'scope_absent', 'scope_other', 'response_type']);
 
+// Diagnostic only: never return request text or use this classification to grant.
+function scopeClass(value) {
+  if (typeof value !== 'string') return 'nonstring';
+  if (value.length > 4096) return 'overlong';
+  if (!/^[\x21\x23-\x5B\x5D-\x7E]+(?: [\x21\x23-\x5B\x5D-\x7E]+)*$/.test(value)) return 'invalid';
+  const tokens = value.split(' ');
+  const known = ['workrelay:tasks', 'openid', 'offline_access', 'profile', 'email'];
+  let mask = 0, unknown = 0;
+  for (const token of tokens) {
+    const index = known.indexOf(token);
+    if (index < 0) unknown = 1;
+    else mask |= 1 << index;
+  }
+  return `valid-${mask}-${unknown}-${tokens.length > 8 ? 'many' : tokens.length}`;
+}
+const safeScopeClass = /^(?:nonstring|overlong|invalid|valid-(?:[0-9]|[12][0-9]|3[01])-[01]-(?:[1-8]|many))$(?![\s\S])/;
+
 // Same exclusive private arm/used/receipt protocol as the interaction recorder.
 // A separate target prevents a login/consent recorder from consuming this arm.
 export function createPreapprovalDiagnostic(directory, { nextDenial = false, now = Date.now } = {}) {
   const prefix = nextDenial === true ? 'preapproval-next' : 'origin-post';
-  return reason => {
+  return (reason, classification) => {
     let fd, temporary;
     try {
       if (!preapprovalReasons.has(reason)) return;
@@ -42,7 +59,9 @@ export function createPreapprovalDiagnostic(directory, { nextDenial = false, now
       unlinkSync(arm);
       temporary = join(directory, `${prefix}.${randomBytes(16).toString('hex')}.tmp`);
       fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-      writeFileSync(fd, JSON.stringify({ attemptId, stage: 'preapproval', rejectionClass: reason }));
+      writeFileSync(fd, JSON.stringify({ attemptId, stage: 'preapproval', rejectionClass: reason,
+        ...(reason === 'scope_other' && typeof classification === 'string' && safeScopeClass.test(classification) ?
+          { scopeClass: classification } : {}) }));
       fsyncSync(fd); closeSync(fd); fd = undefined;
       linkSync(temporary, receipt);
       fd = openSync(directory, constants.O_RDONLY | constants.O_NOFOLLOW); fsyncSync(fd);
@@ -155,7 +174,7 @@ export async function loadPreapprovedChatGPTGrant(ctx, { principal, resource, on
     params.scope !== 'workrelay:tasks' ? (params.scope ? 'scope_other' : 'scope_absent') :
     params.response_type !== 'code' ? 'response_type' : null;
   if (reason) {
-    try { onDenied?.(reason); } catch { /* never change the denial */ }
+    try { onDenied?.(reason, reason === 'scope_other' ? scopeClass(params.scope) : undefined); } catch { /* never change the denial */ }
     throw new errors.AccessDenied('request outside locally preapproved grant');
   }
   const grantId = ctx.oidc.result?.consent?.grantId || session.grantIdFor(client.clientId);
