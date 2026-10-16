@@ -169,9 +169,21 @@ test('provisioning refuses non-TTY; actual HTTPS provider interaction requires C
   assert.equal(url.pathname.startsWith('/interaction/'), true);
   next = await request(url.pathname);
   assert.equal(next.response.status, 200);
+  // Fetch's append-request-Origin algorithm serializes non-CORS POST Origin
+  // as null with no-referrer. Same-origin preserves the strict form boundary.
+  assert.equal(next.response.headers.get('referrer-policy'), 'same-origin');
+  assert.equal(next.response.headers.get('content-security-policy'),
+    "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
   const hidden = html => html.match(/name="csrf" value="([^"]+)"/)?.[1];
   const first = hidden(next.text);
   assert.ok(first);
+  for (const deniedOrigin of [undefined, 'null']) {
+    const denied = await request(url.pathname, { method: 'POST', headers: {
+      ...(deniedOrigin === undefined ? {} : { origin: deniedOrigin }),
+      'sec-fetch-site': 'same-origin', 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ csrf: first, password: 'synthetic-never-accepted' }) });
+    assert.equal(denied.response.status, 403, 'missing/null Origin is denied despite same-origin fetch-site');
+  }
   assert.doesNotMatch(next.text, new RegExp(fixturePassword));
   const post = async (csrf, fields) => request(url.pathname, { method: 'POST', headers: {
     origin, 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ csrf, ...fields }) });
@@ -204,6 +216,7 @@ test('provisioning refuses non-TTY; actual HTTPS provider interaction requires C
   next = await request(url.pathname);
   assert.equal(next.response.status, 200);
   assert.match(next.text, /Authorize/);
+  assert.equal(next.response.headers.get('referrer-policy'), 'same-origin', 'consent forms use the same policy');
   assert.match(next.text, /renewable access through refresh tokens/);
   assert.match(next.text, /No self-service revoke page exists/);
   assert.match(next.text, /access tokens can remain valid for up to five minutes/);
@@ -347,10 +360,12 @@ test('private issuer path rejects writable ancestors, symlink sidecars and swapp
   assert.throws(construct, /private file required/);
   await fs.unlink(sidecar);
   await fs.writeFile(sidecar, '', { mode: 0o644 });
+  await fs.chmod(sidecar, 0o644); // ensure unsafe mode even under owner-only umask
   assert.throws(construct, /private file required/);
   await fs.unlink(sidecar);
   const sqlite = join(directory, 'interactions.sqlite');
   await fs.writeFile(sqlite, '', { mode: 0o644 });
+  await fs.chmod(sqlite, 0o644);
   assert.throws(construct, /private file required/);
   await fs.chmod(sqlite, 0o600);
   const handler = construct();

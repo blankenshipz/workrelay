@@ -126,7 +126,10 @@ export function createOriginDiagnostic({ directory, origin, hostname, beforePubl
 function send(res, status, body = '') {
   res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',
     'content-security-policy': "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
-    'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer' });
+    // no-referrer also makes non-CORS form POST Origin serialize as null
+    // (Fetch: append a request Origin header). Keep same-origin forms usable
+    // without disclosing a referrer to cross-origin destinations.
+    'x-content-type-options': 'nosniff', 'referrer-policy': 'same-origin' });
   res.end(body);
 }
 
