@@ -5,6 +5,8 @@ import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
+import { createManagedReader } from './managed_server.mjs';
+import { readManagedCapability } from './mcp.mjs';
 
 const rootRoutes = new Set(['/api/plugin', '/api/integration/openai', '/api/provider/openai', '/api/model']);
 const sessionPath = /^\/api\/session\/(ses_bridge_[0-9a-f]{32})(?:\/(prompt|message\/(msg_[0-9a-f]{32})|inbox(?:\/(msg_[0-9a-f]{32}))?|interrupt\?resume=false))?$/;
@@ -170,6 +172,47 @@ async function allow(input, config, endpoint, headers) {
   return false;
 }
 
+async function managedRequest(input, config) {
+  const authority = input.managed;
+  if (!fields(authority, ['claims', 'session_id', 'operation_id']) ||
+      !/^ses[A-Za-z0-9_-]{1,160}$/.test(authority.session_id ?? '') ||
+      !/^[A-Za-z0-9_-]{1,80}$/.test(authority.operation_id ?? '') ||
+      config.server !== config.managed_server?.server ||
+      config.service_registration !== config.managed_server?.service_registration ||
+      config.client_service_module !== config.managed_server?.client_service_module) throw Error('managed handoff denied');
+  const reader = createManagedReader({ ...config.managed_identity, managed_server: config.managed_server },
+    () => readManagedCapability(config.managed_supervisor_file), {
+      internalAuthorize: async (request, binding, endpoint, headers) => {
+        const sid = authority.session_id;
+        if (request.method === 'GET' && request.body === null) {
+          if (rootRoutes.has(request.path) || request.path === `/api/session/${sid}` || request.path === `/api/session/${sid}/inbox`) return true;
+        }
+        const code = `import json,sqlite3,sys
+db=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True,timeout=3)
+r=db.execute('SELECT kind,digest,message,phase,identity FROM managed_operations WHERE binding=? AND session=? AND operation=?',sys.argv[2:5]).fetchone()
+print(json.dumps(r))`;
+        const row = JSON.parse(execFileSync('/usr/bin/python3', ['-c', code, `${config.state_dir}/managed-control.sqlite`, binding, sid, authority.operation_id],
+          { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }));
+        if (!row) return false;
+        if (request.method === 'GET' && request.body === null)
+          return request.path === `/api/session/${sid}/message/${row[2]}`;
+        if (request.method !== 'POST' || row[3] !== 'sending') return false;
+        if (row[0] === 'queue') {
+          if (request.path !== `/api/session/${sid}/prompt` || !fields(request.body, ['id', 'text', 'delivery']) ||
+              request.body.id !== row[2] || request.body.delivery !== 'queue' || typeof request.body.text !== 'string' ||
+              createHash('sha256').update('queue\0' + request.body.text).digest('hex') !== row[1]) return false;
+        } else if (row[0] !== 'interrupt' || request.path !== `/api/session/${sid}/interrupt?resume=false` || request.body !== null) return false;
+        const found = await fetch(new URL(`/api/session/${sid}`, endpoint.url), { headers, redirect: 'manual', signal: AbortSignal.timeout(5000) });
+        if (!found.ok) return false;
+        const session = (await boundedJSON(found))?.data;
+        const hash = execFileSync('/usr/bin/python3', ['-c', 'import json,sys;from workrelay.managed_control import identity;print(identity(json.load(sys.stdin),sys.argv[1]))', sid],
+          { input: JSON.stringify(session), encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'ignore'] }).trim();
+        return hash === row[4];
+      },
+    });
+  return reader(input.path === '/__managed/authorize' && input.method === 'GET' && input.body === null ? 'authorize' : 'internal', input, authority.claims);
+}
+
 try {
   const config = JSON.parse(readFileSync(process.argv[2], 'utf8'));
   const module = await import(pathToFileURL(config.client_service_module).href);
@@ -183,6 +226,11 @@ try {
     process.stdin.on('end', () => resolve(text));
     process.stdin.on('error', reject);
   }));
+  if (input.managed !== undefined) {
+    const data = await managedRequest(input, config);
+    process.stdout.write(JSON.stringify({ status: data === null ? 404 : 200, data }));
+    process.exit(0);
+  }
   const headers = { ...module.headers(endpoint), 'content-type': 'application/json' };
   if (!await allow(input, config, endpoint, headers)) throw new Error('request scope denied');
   const target = new URL(input.path, endpoint.url);

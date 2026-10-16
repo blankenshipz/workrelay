@@ -289,6 +289,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Scoped local OpenCode task adapter")
     parser.add_argument("--config", default=os.environ.get("AGENT_COMPUTER_BRIDGE_CONFIG", ""))
     commands = parser.add_subparsers(dest="command", required=True)
+    managed = commands.add_parser('managed-control', help='Internal authenticated managed control handoff')
+    managed.add_argument('--owner', required=True)
     discovery = commands.add_parser("discover", help="List permitted work without internal IDs")
     discovery.add_argument("--owner", required=True)
     discovery.add_argument("--offset", type=int, default=0)
@@ -335,6 +337,33 @@ def main(argv=None):
         config["_private_path"] = str(Path(args.config).expanduser().resolve())
         client = InstalledClient(config) if config.get("transport") == "installed-client" else Client(config, token)
         require(args.owner == config["authorized_owner"], "owner not authorized by private configuration")
+        if args.command == 'managed-control':
+            from .managed_control import control
+            require(config.get('transport') == 'installed-client', 'managed control requires guarded installed transport')
+            envelope = json.loads(sys.stdin.read(50000))
+            require(isinstance(envelope, dict) and envelope.get('action') in ('message', 'interrupt'), 'invalid control handoff')
+            config['_supervision_authority'] = {'managed': {'claims': envelope.get('claims'),
+                'session_id': envelope.get('session_id'), 'operation_id': envelope.get('operation_id')}}
+            path = state / 'managed-control.sqlite'
+            require(not path.is_symlink(), 'unsafe control ledger')
+            fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            try:
+                info = os.fstat(fd)
+                require(info.st_uid == os.getuid() and info.st_mode & 0o077 == 0, 'unsafe control ledger')
+            finally:
+                os.close(fd)
+            db = sqlite3.connect(path, isolation_level=None, timeout=20)
+            try:
+                def authorize():
+                    result = client.request('GET', '/__managed/authorize')
+                    return result.get('binding_id') if isinstance(result, dict) else None
+                print(json.dumps(control(db, config, client, authorize, envelope.get('session_id'), envelope.get('operation_id'),
+                    text=envelope.get('text'), interrupt=envelope['action'] == 'interrupt')))
+            except Exception:
+                raise BridgeError('managed control denied or uncertain; retry only the same operation ID to reconcile') from None
+            finally:
+                db.close()
+            return 0
         if args.command == "discover":
             print(json.dumps(discover(config, client, directory, state, args.offset, args.limit)))
             return 0

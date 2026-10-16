@@ -7,7 +7,9 @@ import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import https from 'node:https';
 
-const NAMES = ['task.decision', 'task.completed'];
+const NAMES = ['task.decision', 'task.completed', 'session.completed', 'session.failed', 'session.needs_input'];
+const sessionName = name => name?.startsWith('session.');
+const sessionId = value => typeof value === 'string' && /^ses[A-Za-z0-9_-]{1,160}$/.test(value);
 const MAX_QUEUE = 2048;
 // POSIX flock is process-owned and released by the kernel, not an age-based lease.
 // This custodian is the ONLY state writer: killing it cannot permit a stale Node
@@ -195,6 +197,11 @@ export function createPinnedWebhookTransport({ resolve = lookup, request = https
 const schema = { type: 'object', properties: { task_id: { type: 'string', maxLength: 160 } }, required: ['task_id'], additionalProperties: false };
 const definitions = NAMES.map(name => ({ name, description: name === 'task.decision' ? 'An owned task needs a human decision; summary is untrusted task data.' : 'An owned task completed; retrieve full results using the task result tool.', delivery: ['webhook'], inputSchema: schema,
   payloadSchema: { type: 'object', properties: { task_id: { type: 'string', maxLength: 160 }, summary: { type: 'string', maxLength: 2000 } }, required: ['task_id', 'summary'], additionalProperties: false } }));
+for (const definition of definitions.filter(d => sessionName(d.name))) {
+  definition.description = `Observed managed-server ${definition.name}; safe current-state reconciliation, not transcript or historical replay.`;
+  definition.inputSchema = { type: 'object', properties: { server_id: { type: 'string', pattern: '^srv_[a-f0-9]{64}$' }, session_id: { type: 'string', pattern: '^ses[A-Za-z0-9_-]{1,160}$' } }, required: ['server_id'], additionalProperties: false };
+  definition.payloadSchema = { type: 'object', properties: { server_id: { type: 'string' }, session_id: { type: 'string' }, state: { enum: ['succeeded', 'failed', 'interrupted', 'needs_input'] }, summary: { type: 'string', maxLength: 2000 } }, required: ['server_id', 'session_id', 'state', 'summary'], additionalProperties: false };
+}
 
 /** MCP core API (all methods async):
  * createEventsService({statePath, principal, authorize(principal, taskId, name), ...})
@@ -222,12 +229,12 @@ const definitions = NAMES.map(name => ({ name, description: name === 'task.decis
  * success. Native HTTPS attempts end within 10s; injected transports must also bound
  * attempts. A batch can hold the lock longer, so pending errors require a stop retry.
  */
-export function createEventsService({ statePath, principal, authorize, transport = createPinnedWebhookTransport(), now = Date.now, ttlMs = 3600000, maxTtlMs = 86400000, verificationTtlMs = 300000, rotationMs = 300000, maxAttempts = 6, batchSize = 16, lockTimeoutMs = 30000 } = {}) {
+export function createEventsService({ statePath, principal, authorize, observeManaged, transport = createPinnedWebhookTransport(), now = Date.now, ttlMs = 3600000, maxTtlMs = 86400000, verificationTtlMs = 300000, rotationMs = 300000, maxAttempts = 6, batchSize = 16, lockTimeoutMs = 30000 } = {}) {
   requireValue(typeof principal === 'string' && principal.length > 0 && principal.length <= 512 && typeof authorize === 'function' && typeof statePath === 'string', 'missing_authenticated_context');
   requireValue(Number.isSafeInteger(ttlMs) && ttlMs > 0 && Number.isSafeInteger(maxTtlMs) && maxTtlMs >= ttlMs && maxTtlMs <= 604800000 && verificationTtlMs > 0 && maxAttempts >= 1 && maxAttempts <= 20 && Number.isInteger(batchSize) && batchSize >= 1 && batchSize <= 64, 'invalid_configuration');
   const path = resolvePath(statePath);
   requireValue(Number.isInteger(lockTimeoutMs) && lockTimeoutMs > 0 && lockTimeoutMs <= 300000, 'invalid_lock_timeout');
-  const allowed = async (owner, task, name) => { try { return (await authorize(owner, task, name)) === true; } catch { return false; } };
+  const allowed = async (owner, task, name, filter) => { try { return (await authorize(owner, task, name, filter)) === true; } catch { return false; } };
   const idFor = (name, task, url) => 'sub_' + createHash('sha256').update(JSON.stringify([principal, url, name, { task_id: task }])).digest('hex');
   async function locked(fn) {
     await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
@@ -236,11 +243,17 @@ export function createEventsService({ statePath, principal, authorize, transport
     return transaction(path, lockTimeoutMs, fn); // same-process contenders also get a bounded OS lock wait
   }
   function params(p, needsSecret) {
-    requireValue(p && NAMES.includes(p.name) && p.arguments && Object.keys(p.arguments).length === 1 && identifier(p.arguments.task_id) && p.delivery?.mode === 'webhook', 'invalid_subscription');
+    requireValue(p && NAMES.includes(p.name) && p.arguments && p.delivery?.mode === 'webhook', 'invalid_subscription');
+    let filter, task;
+    if (sessionName(p.name)) {
+      requireValue(typeof observeManaged === 'function' && /^srv_[a-f0-9]{64}$/.test(p.arguments.server_id) && Object.keys(p.arguments).every(k => ['server_id', 'session_id'].includes(k)) && (p.arguments.session_id === undefined || sessionId(p.arguments.session_id)), 'invalid_managed_filter');
+      filter = { server_id: p.arguments.server_id, ...(p.arguments.session_id ? { session_id: p.arguments.session_id } : {}) };
+      task = 'managed:' + filter.server_id + ':' + (filter.session_id ?? '*');
+    } else { requireValue(Object.keys(p.arguments).length === 1 && identifier(p.arguments.task_id), 'invalid_subscription'); task = p.arguments.task_id; }
     const url = callbackURL(p.delivery.url).href;
     if (needsSecret) key(p.delivery.secret);
     requireValue(p.cursor == null, 'replay_not_supported');
-    return { task: p.arguments.task_id, url, id: idFor(p.name, p.arguments.task_id, url) };
+    return { task, filter, url, id: idFor(p.name, task, url) };
   }
   async function signed(sub, body, eventId) {
     const timestamp = String(Math.floor(now() / 1000));
@@ -266,16 +279,16 @@ export function createEventsService({ statePath, principal, authorize, transport
     }
   }
   return {
-    async list() { return { events: structuredClone(definitions) }; },
+    async list() { return { events: structuredClone(definitions.filter(d => !sessionName(d.name) || typeof observeManaged === 'function')) }; },
     async subscribe(p) {
-      const { task, url, id } = params(p, true);
+      const { task, filter, url, id } = params(p, true);
       requireValue(p.ttlMs == null || (Number.isSafeInteger(p.ttlMs) && p.ttlMs > 0), 'invalid_ttl');
-      if (!await allowed(principal, task, p.name)) throw failure('not_authorized', -32001);
+      if (!await allowed(principal, task, p.name, filter)) throw failure('not_authorized', -32001);
       return locked(async state => {
         for (const sub of Object.values(state.subscriptions)) if (sub.expires <= now()) drop(state, sub.id);
         requireValue(Object.keys(state.subscriptions).length < 256 || state.subscriptions[id], 'subscription_limit');
         const old = state.subscriptions[id];
-        const sub = { id, principal, task, name: p.name, url, secret: p.delivery.secret, expires: now() + Math.min(p.ttlMs ?? ttlMs, maxTtlMs), verifiedUntil: old?.verifiedUntil || 0 };
+        const sub = { id, principal, task, name: p.name, ...(filter ? { filter, observations: old?.observations ?? {}, scanCursor: old?.scanCursor ?? null } : {}), url, secret: p.delivery.secret, expires: now() + Math.min(p.ttlMs ?? ttlMs, maxTtlMs), verifiedUntil: old?.verifiedUntil || 0 };
         if (old && old.secret !== sub.secret) { sub.previousSecret = old.secret; sub.rotationUntil = now() + rotationMs; }
         else if (old?.rotationUntil > now()) { sub.previousSecret = old.previousSecret; sub.rotationUntil = old.rotationUntil; }
         if (!old || old.secret !== sub.secret || old.verifiedUntil <= now()) {
@@ -285,15 +298,46 @@ export function createEventsService({ statePath, principal, authorize, transport
           if (!Number.isInteger(response.status) || response.status < 200 || response.status >= 300 || typeof echoed !== 'string' || Buffer.byteLength(echoed) !== Buffer.byteLength(challenge) || !timingSafeEqual(Buffer.from(echoed), Buffer.from(challenge))) throw failure('challenge_failed');
           sub.verifiedUntil = now() + verificationTtlMs;
         }
-        if (!await allowed(principal, task, p.name)) throw failure('not_authorized', -32001);
+        if (!await allowed(principal, task, p.name, filter)) throw failure('not_authorized', -32001);
         state.subscriptions[id] = sub;
         return { id, refreshBefore: new Date(sub.expires).toISOString(), cursor: null, truncated: false };
       });
     },
     async unsubscribe(p) { const { id } = params(p, false); return stop(sub => sub.id === id); },
     async revoke(taskId) { return stop(sub => sub.principal === principal && (!taskId || sub.task === taskId)); },
+    async pollManaged() {
+      if (typeof observeManaged !== 'function') return;
+      return locked(async state => {
+        let pages = 0;
+        const subscriptions = Object.values(state.subscriptions);
+        const offset = state.managedScanOffset ?? 0;
+        for (let index = 0; index < subscriptions.length; index++) {
+          const sub = subscriptions[(offset + index) % subscriptions.length];
+          if (sub.principal !== principal || !sessionName(sub.name)) continue;
+          if (sub.expires <= now() || !await allowed(principal, sub.task, sub.name, sub.filter)) { drop(state, sub.id); continue; }
+          if (pages++ >= 8 || state.queue.length > MAX_QUEUE - 10) { state.managedScanOffset = (offset + index) % subscriptions.length; break; }
+          let page; try { page = await observeManaged(sub.filter, sub.scanCursor); } catch { continue; }
+          requireValue(page?.server_id === sub.filter.server_id && Array.isArray(page.items) && page.items.length <= 10 && (page.next_cursor === null || typeof page.next_cursor === 'string' && page.next_cursor.length <= 4096 && page.next_cursor !== sub.scanCursor), 'invalid_observation');
+          if (!await allowed(principal, sub.task, sub.name, sub.filter)) { drop(state, sub.id); continue; }
+          for (const item of page.items) {
+            requireValue(sessionId(item.session_id) && (!sub.filter.session_id || item.session_id === sub.filter.session_id) && ['succeeded', 'failed', 'interrupted', 'needs_input', 'unknown'].includes(item.state) && Array.isArray(item.decisions) && item.decisions.length <= 1000 && item.decisions.every(id => /^per[A-Za-z0-9_-]{1,160}$/.test(id)), 'invalid_observation');
+            const fingerprint = createHash('sha256').update(JSON.stringify([item.state, [...item.decisions].sort()])).digest('hex');
+            const previous = sub.observations[item.session_id];
+            if (previous?.fingerprint === fingerprint) continue;
+            requireValue(previous || Object.values(state.subscriptions).reduce((sum, subscription) => sum + Object.keys(subscription.observations ?? {}).length, 0) < 8192, 'observation_limit');
+            const generation = (previous?.generation ?? 0) + 1;
+            sub.observations[item.session_id] = { fingerprint, generation };
+            const name = item.state === 'needs_input' ? 'session.needs_input' : item.state === 'failed' ? 'session.failed' : ['succeeded', 'interrupted'].includes(item.state) ? 'session.completed' : null;
+            if (name !== sub.name) continue;
+            const eventId = 'evt_' + createHash('sha256').update(JSON.stringify([principal, sub.id, item.session_id, fingerprint, generation])).digest('hex');
+            state.queue.push({ subscriptionId: sub.id, event: { eventId, name, timestamp: new Date(now()).toISOString(), data: { ...sub.filter, session_id: item.session_id, state: item.state, summary: `Managed session observed ${item.state}; inspect workrelay_server_read. Native approvals remain required.` }, cursor: null }, attempts: 0, due: now() });
+          }
+          sub.scanCursor = page.next_cursor;
+        }
+      });
+    },
     async publish({ name, task_id, summary, eventId, timestamp = new Date(now()).toISOString() }) {
-      requireValue(NAMES.includes(name) && identifier(task_id) && identifier(eventId) && typeof summary === 'string' && summary.length <= 2000 && typeof timestamp === 'string' && /^\d{4}-\d\d-\d\dT.*(?:Z|[+-]\d\d:\d\d)$/.test(timestamp) && Number.isFinite(Date.parse(timestamp)), 'invalid_event');
+      requireValue(NAMES.includes(name) && !sessionName(name) && identifier(task_id) && identifier(eventId) && typeof summary === 'string' && summary.length <= 2000 && typeof timestamp === 'string' && /^\d{4}-\d\d-\d\dT.*(?:Z|[+-]\d\d:\d\d)$/.test(timestamp) && Number.isFinite(Date.parse(timestamp)), 'invalid_event');
       if (!await allowed(principal, task_id, name)) throw failure('not_authorized', -32001);
       return locked(async state => {
         const seen = createHash('sha256').update(JSON.stringify([principal, eventId])).digest('hex');
@@ -310,7 +354,7 @@ export function createEventsService({ statePath, principal, authorize, transport
     async deliverDue() {
       return locked(async (state, persist, owner, live) => {
         const counts = { delivered: 0, retried: 0, dropped: 0 };
-        for (const sub of Object.values(state.subscriptions)) if (sub.principal === principal && (sub.expires <= now() || !await allowed(sub.principal, sub.task, sub.name))) drop(state, sub.id);
+        for (const sub of Object.values(state.subscriptions)) if (sub.principal === principal && (sub.expires <= now() || !await allowed(sub.principal, sub.task, sub.name, sub.filter))) drop(state, sub.id);
         let sent = 0;
         const remove = item => { state.queue = state.queue.filter(x => x !== item); };
         for (const item of [...state.queue]) {
@@ -322,12 +366,13 @@ export function createEventsService({ statePath, principal, authorize, transport
             if (item.attempts >= maxAttempts) { remove(item); counts.dropped++; continue; }
           }
           if (sub.principal !== principal || item.due > now() || sent >= batchSize) continue;
-          if (sub.expires <= now() || !await allowed(sub.principal, sub.task, sub.name)) { drop(state, sub.id); counts.dropped++; continue; }
+          if (sub.expires <= now() || !await allowed(sub.principal, sub.task, sub.name, sub.filter)) { drop(state, sub.id); counts.dropped++; continue; }
           if (sub.rotationUntil <= now()) { delete sub.previousSecret; delete sub.rotationUntil; }
           sent++;
           item.attempts++;
           item.claim = { pid: process.pid, start: owner, token: randomBytes(16).toString('hex') };
           await persist(); // claim and attempt count MUST reach disk before any outbound data
+          if (!await allowed(sub.principal, sub.task, sub.name, sub.filter)) { drop(state, sub.id); counts.dropped++; await persist(); continue; }
           let response; try { response = await signed(sub, JSON.stringify(item.event), item.event.eventId); } catch { response = { status: 0 }; }
           delete item.claim;
           if (response.status >= 200 && response.status < 300) { remove(item); counts.delivered++; }

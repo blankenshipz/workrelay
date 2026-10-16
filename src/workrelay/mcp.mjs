@@ -12,6 +12,7 @@ import { McpServer, createMcpHandler, ProtocolError } from '@modelcontextprotoco
 import { z } from 'zod';
 import { createLocalJWKSet, createRemoteJWKSet, jwtVerify } from 'jose';
 import { createEventsService } from './events.mjs';
+import { createManagedReader, managedServerID } from './managed_server.mjs';
 import { createIssuerAdapter } from './oidc_adapter.mjs';
 import { createUnexposedIssuerPolicy, createPreapprovalDiagnostic } from './issuer_policy.mjs';
 import { createLocalInteractions, createOriginDiagnostic } from './issuer_interactions.mjs';
@@ -92,6 +93,9 @@ const schema = {
 
 export function validateConfig(config, { testIssuer = false } = {}) {
   if (!config || typeof config !== 'object') throw Error('invalid MCP configuration');
+  if (config.managed_supervisor_file !== undefined && (typeof config.managed_supervisor_file !== 'string' ||
+      !config.managed_supervisor_file.startsWith('/') || resolve(config.managed_supervisor_file) !== config.managed_supervisor_file))
+    throw Error('managed supervisor requires an exact private capability reference');
   if (config.issuer_mode === 'self-hosted' && !config.issuer_state_dir)
     throw Error('self-hosted issuer is not safely available without private state');
   const publicProxy = config.issuer_mode === 'self-hosted' && config.issuer_exposure === 'public-proxy';
@@ -202,11 +206,16 @@ export function readPrivateConfig(path) {
   } catch { throw Error('private MCP config permissions denied'); }
 }
 
+export function readManagedCapability(path) {
+  if (typeof path !== 'string' || !path.startsWith('/') || resolve(path) !== path) throw Error('private capability unavailable');
+  return privateIssuerFile(dirname(path), basename(path));
+}
+
 function bridge(config, command, input) {
   return new Promise((done, reject) => {
     const args = ['-m', 'workrelay.cli', '--config', config.bridge_config,
       command === 'enrolled_result' ? 'enrolled-result' : command,
-      ...(command === 'discover' ? ['--offset', String(input.offset ?? 0), '--limit', String(input.limit ?? 20)] :
+      ...(command === 'managed-control' ? [] : command === 'discover' ? ['--offset', String(input.offset ?? 0), '--limit', String(input.limit ?? 20)] :
         command === 'enrolled_result' ? ['--grant-id', input.grant_id] : ['--key', input.key]), '--owner', config.owner];
     if (command === 'respond') args.push('--feedback-key', input.feedback_key);
     if (command === 'respond' || command === 'start') args.push('--stdin-text');
@@ -227,14 +236,15 @@ function bridge(config, command, input) {
         done(code === 0 ? value : { error: value.error ?? 'local adapter denied request' });
       } catch { done({ error: 'local adapter unavailable' }); }
     });
-    child.stdin.end(input.text ?? '');
+    child.stdin.end(command === 'managed-control' ? JSON.stringify(input) : input.text ?? '');
   });
 }
 
-function mcp(config, invoke, events) {
+function mcp(config, invoke, events, managedReader) {
   const server = new McpServer({ name: 'workrelay', version: '0.1.0' },
     { ...(events ? { capabilities: { events: {} } } : {}),
-      instructions: 'Start with workrelay_discover({}) when asked to show available work. It needs no task key or grant ID. Follow returned actions and next_offset. Runs and enrolled sessions are not agent definitions. Never infer access to unlisted sessions.' });
+      instructions: managedReader ? 'Start with workrelay_server_discover({}) for explicitly authorized managed-server access, or workrelay_discover({}) for ordinary scoped work. Server tools verify the pinned principal and client on every call. No enrollment is needed for approved server access. Message queues to the existing owner with native approvals and financial admission; interrupt is not rollback and does not cancel descendants. Reuse operation_id and identical inputs after uncertainty; do not blindly replay. When Events are enabled, session.completed/session.failed/session.needs_input accept the returned server_id and optional session_id; omitting session_id monitors the bound server. Events reconcile observed state, not transcript/history; idle is not completion. Unsubscribe stops monitoring, not ordinary work.' :
+        'Start with workrelay_discover({}) when asked to show available work. It needs no task key or grant ID. Follow returned actions and next_offset. Runs and enrolled sessions are not agent definitions. Never infer access to unlisted sessions.' });
   for (const name of Object.keys(schema)) {
     const readOnly = ['discover', 'profile', 'status', 'result', 'enrolled_result'].includes(name);
     server.registerTool(`workrelay_${name}`, {
@@ -256,6 +266,36 @@ function mcp(config, invoke, events) {
       } catch { return { isError: true, content: [{ type: 'text', text: 'local adapter unavailable' }] }; }
     });
   }
+  if (managedReader) for (const action of ['discover', 'read']) {
+    server.registerTool(`workrelay_server_${action}`, {
+      description: action === 'discover' ? 'First call for explicitly authorized managed-server supervision: list sessions across projects without enrollment. Metadata only, no inference. Use next_cursor.' :
+        'Read safe metadata of an exact session on the explicitly bound managed server. No transcript, inference or mutation.',
+      inputSchema: action === 'discover' ? z.object({ cursor: z.string().min(1).max(4096).optional(), limit: z.number().int().min(1).max(50).optional() }).strict() :
+        z.object({ session_id: z.string().regex(/^ses[A-Za-z0-9_-]{1,160}$/) }).strict(),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    }, async (input, ctx) => {
+      try {
+        const output = await managedReader(action, input, ctx.http?.authInfo?.extra?.managedClaims);
+        return { content: [{ type: 'text', text: JSON.stringify(output) }], structuredContent: output };
+      } catch { return { isError: true, content: [{ type: 'text', text: 'Managed server capability unavailable or denied.' }] }; }
+    });
+  }
+  if (managedReader) for (const action of ['message', 'interrupt']) {
+    server.registerTool(`workrelay_server_${action}`, {
+      description: action === 'message' ? 'Queue a bounded message to the existing session owner; preserves agent/model/permissions. Native approval gates still apply. Reuse operation_id with identical text to reconcile uncertain delivery; never blindly replay.' :
+        'Interrupt only this existing session, not descendants. Not rollback; native permissions remain. Reuse operation_id to inspect the same attempt.',
+      inputSchema: z.object({ session_id: z.string().regex(/^ses[A-Za-z0-9_-]{1,160}$/), operation_id: key,
+        ...(action === 'message' ? { text } : {}) }).strict(),
+      annotations: { readOnlyHint: false, destructiveHint: action === 'interrupt', idempotentHint: true, openWorldHint: false },
+    }, async (input, ctx) => {
+      try {
+        const claims = ctx.http?.authInfo?.extra?.managedClaims;
+        await managedReader('read', { session_id: input.session_id }, claims);
+        const output = await invoke(config, 'managed-control', { ...input, action, claims });
+        return { content: [{ type: 'text', text: JSON.stringify(output) }], structuredContent: output, isError: Boolean(output.error) };
+      } catch { return { isError: true, content: [{ type: 'text', text: 'Managed control unavailable or denied.' }] }; }
+    });
+  }
   if (events) {
     const invokeEvent = action => async params => {
       try { return await events[action](params); }
@@ -263,8 +303,8 @@ function mcp(config, invoke, events) {
     };
     server.server.setRequestHandler('events/list', { params: z.object({ cursor: z.string().optional() }).strict() },
       invokeEvent('list'));
-    const eventParams = z.object({ name: z.enum(['task.decision', 'task.completed']),
-      arguments: z.object({ task_id: key }).strict(),
+    const eventParams = z.object({ name: z.enum(['task.decision', 'task.completed', 'session.completed', 'session.failed', 'session.needs_input']),
+      arguments: z.union([z.object({ task_id: key }).strict(), z.object({ server_id: z.string().regex(/^srv_[a-f0-9]{64}$/), session_id: z.string().regex(/^ses[A-Za-z0-9_-]{1,160}$/).optional() }).strict()]),
       delivery: z.object({ mode: z.literal('webhook'), url: z.string().url().max(2048),
         secret: z.string().max(128).optional() }).strict(),
       cursor: z.null().optional(), ttlMs: z.number().int().positive().optional().nullable() }).strict();
@@ -348,8 +388,14 @@ export function createGateway(rawConfig, options = {}) {
       throw Error('private issuer store unavailable');
   }
   const invoke = options.invoke ?? bridge;
-  const authorized = async (_principal, task) => {
-    if (!active() || !approved() || unsafeMarker || markerState() === 'pending' || !key.safeParse(task).success) return false;
+  const managedClaims = { iss: config.issuer, aud: config.audience, sub: config.principal, client_id: 'https://chatgpt.com/oauth/client.json' };
+  const authorized = async (_principal, task, name, filter) => {
+    if (_principal !== config.principal || !active() || !approved() || unsafeMarker || markerState() === 'pending') return false;
+    if (name?.startsWith('session.')) {
+      if (!managedReader || filter?.server_id !== managedServerID(config.managed_server)) return false;
+      try { await managedReader(filter.session_id ? 'read' : 'authorize', filter.session_id ? { session_id: filter.session_id } : {}, managedClaims); return true; } catch { return false; }
+    }
+    if (!key.safeParse(task).success) return false;
     try {
       const status = await invoke(config, 'status', { key: task });
       return status?.key === task && status.owner === config.owner && status.prompt_observed === true &&
@@ -358,6 +404,7 @@ export function createGateway(rawConfig, options = {}) {
   };
   const events = config.events_enabled === true ? createEventsService({ statePath: config.events_state_path,
     principal: config.principal, authorize: authorized,
+    ...(config.managed_supervisor_file ? { observeManaged: (filter, cursor) => managedReader('events', { ...filter, ...(cursor ? { cursor } : {}), limit: 10 }, managedClaims) } : {}),
     ...(options.eventTransport ? { transport: options.eventTransport } : {}),
     ...(options.eventLockTimeoutMs ? { lockTimeoutMs: options.eventLockTimeoutMs } : {}) }) : null;
   const marker = events ? `${config.events_state_path}.revoke` : null;
@@ -457,7 +504,9 @@ export function createGateway(rawConfig, options = {}) {
     }
     return null;
   }
-  const handler = options.sdkHandler ?? createMcpHandler(() => mcp(config, invoke, events));
+  const managedReader = config.managed_supervisor_file ? createManagedReader(config, () =>
+    privateIssuerFile(dirname(config.managed_supervisor_file), basename(config.managed_supervisor_file))) : undefined;
+  const handler = options.sdkHandler ?? createMcpHandler(() => mcp(config, invoke, events, managedReader));
   const jwks = localJwks ?? createRemoteJWKSet(new URL(config.jwks_uri), { timeoutDuration: 3000, cooldownDuration: 1000 });
   const metadataUrl = `${config.public_origin}/.well-known/oauth-protected-resource/mcp`;
   const resource = `${config.public_origin}/mcp`;
@@ -678,11 +727,13 @@ export function createGateway(rawConfig, options = {}) {
     if (req.headers['content-encoding']) return failure(res, 415, 'unsupported_encoding');
     const bearer = /^Bearer ([A-Za-z0-9._~-]+)$/.exec(req.headers.authorization ?? '');
     if (!bearer) return failure(res, 401, 'invalid_token');
+    let managedClaims;
     try {
       const { payload } = await jwtVerify(bearer[1], jwks, { issuer: config.issuer, audience: config.audience,
         algorithms: ['RS256', 'ES256'], clockTolerance: 0, requiredClaims: ['sub', 'exp', 'iat'] });
       if (payload.sub !== config.principal || !String(payload.scope ?? '').split(' ').includes('workrelay:tasks'))
         return failure(res, 403, 'insufficient_scope');
+      managedClaims = { iss: payload.iss, aud: payload.aud, sub: payload.sub, client_id: payload.client_id };
     } catch { return failure(res, 401, 'invalid_token'); }
     let parsedBody;
     if (req.method === 'POST') {
@@ -705,6 +756,12 @@ export function createGateway(rawConfig, options = {}) {
       return failure(res, 503, 'revocation_pending');
     }
     if (access === 'revoked') return failure(res, 403, 'access_revoked');
+    if (/^events\/(subscribe|unsubscribe)$/.test(parsedBody?.method ?? req.headers['mcp-method'] ?? '') && parsedBody?.params?.name?.startsWith('session.')) {
+      try {
+        if (!managedReader || parsedBody.params.arguments?.server_id !== managedServerID(config.managed_server)) throw Error('denied');
+        await managedReader('authorize', {}, managedClaims);
+      } catch { return failure(res, 403, 'managed_events_denied'); }
+    }
     // Official v2 HTTP entry classifies 2025 initialize and 2026-07-28 discover
     // without weakening the explicit token, Host, Origin or byte-limit boundary.
     try {
@@ -712,7 +769,7 @@ export function createGateway(rawConfig, options = {}) {
       const request = new Request(`http://${localHost}${req.url}`, { method: req.method,
         headers: req.headers, signal: abort.signal });
       const response = await handler.fetch(request, { parsedBody, authInfo: {
-        token: bearer[1], clientId: config.principal, scopes: ['workrelay:tasks'],
+        token: bearer[1], clientId: config.principal, scopes: ['workrelay:tasks'], extra: { managedClaims },
       } });
       await relayResponse(response, req, res, abort);
     }
@@ -743,7 +800,7 @@ export function createGateway(rawConfig, options = {}) {
         const state = JSON.parse(readFileSync(config.events_state_path, 'utf8'));
         const activeSubscriptions = Object.values(state.subscriptions ?? {}).filter(sub =>
           sub.principal === config.principal && sub.expires > Date.now());
-        const keys = [...new Set(activeSubscriptions.map(sub => sub.task))].slice(0, 256);
+        const keys = [...new Set(activeSubscriptions.filter(sub => !sub.name.startsWith('session.')).map(sub => sub.task))].slice(0, 256);
         for (const task of keys) {
           if (!await authorized(config.principal, task)) continue;
           const status = await invoke(config, 'status', { key: task });
@@ -763,6 +820,7 @@ export function createGateway(rawConfig, options = {}) {
               ['succeeded', 'failed', 'interrupted'].includes(result.phase))
             await emit('task.completed', result.phase, 'Owned task reached a terminal OpenCode outcome; inspect read-only result.');
         }
+        try { await events.pollManaged(); } catch { /* keep ordinary delivery alive during managed reconciliation failure */ }
         await events.deliverDue();
       } catch { /* private state or OpenCode unavailable: do not fabricate events */ }
       finally { busy = false; }
