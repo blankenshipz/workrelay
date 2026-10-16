@@ -124,12 +124,24 @@ const exactHttps = (value, allowOrigin = false) => {
   return uri;
 };
 
+// RFC8707/provider parameters may retain repeated resource indicators as an
+// array. Accept only a bounded repetition of the one locally approved target,
+// never a distinct additional audience or a missing/empty resource.
+function exactResource(value, resource) {
+  if (value === resource) return true;
+  if (!Array.isArray(value) || value.length < 1 || value.length > 8) return false;
+  for (let index = 0; index < value.length; index++) {
+    if (!Object.hasOwn(value, index) || typeof value[index] !== 'string' || value[index] !== resource) return false;
+  }
+  return true;
+}
+
 export async function loadPreapprovedChatGPTGrant(ctx, { principal, resource, onDenied }) {
   const { account, session, client, params, provider } = ctx.oidc;
   const reason = account?.accountId !== principal ? 'account' : session?.accountId !== principal ? 'session' :
     client?.clientId !== CHATGPT_CIMD_ID || params.client_id !== CHATGPT_CIMD_ID ? 'client' :
     params.redirect_uri !== CHATGPT_CIMD_REDIRECT ? 'redirect' :
-    params.resource !== resource ? (params.resource === undefined ? 'resource_absent' :
+    !exactResource(params.resource, resource) ? (params.resource === undefined ? 'resource_absent' :
       Array.isArray(params.resource) ? 'resource_array' : 'resource_other') :
     params.scope !== 'workrelay:tasks' ? (params.scope ? 'scope_other' : 'scope_absent') :
     params.response_type !== 'code' ? 'response_type' : null;
@@ -191,7 +203,7 @@ export function createUnexposedIssuerPolicy({ origin, principal, jwks, cookieKey
     // rotated refresh grant. Never let a code inherit its authorized resource
     // when this token request omitted the RFC 8707 resource parameter.
     extraTokenClaims: async (ctx, token) => {
-      if (ctx.oidc.route !== 'token' || ctx.oidc.params.resource !== resource ||
+      if (ctx.oidc.route !== 'token' || !exactResource(ctx.oidc.params.resource, resource) ||
           token.accountId !== principal || ctx.oidc.client?.clientId !== clientId)
         throw new errors.InvalidTarget();
       return undefined;

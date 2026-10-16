@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { generateKeyPairSync, randomBytes } from 'node:crypto';
+import { generateKeyPairSync, randomBytes, createHash } from 'node:crypto';
 import { createServer, request as httpsRequest } from 'node:https';
 import { execFileSync, spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
@@ -66,6 +66,45 @@ test('preapproval hook rejects account and capability escalation and cannot resu
       error => error.error === 'access_denied');
   }
   assert.equal(created, 0, 'denied requests never create a grant');
+  const cases = [
+    ['account', c => { c.account = undefined; }],
+    ['session', c => { c.session.accountId = 'wrong'; }],
+    ['client', c => { c.client.clientId = 'wrong'; }],
+    ['client', c => { c.params.client_id = 'wrong'; }],
+    ['redirect', c => { c.params.redirect_uri += '/wrong'; }],
+    ['resource_absent', c => { delete c.params.resource; }],
+    ['resource_array', c => { c.params.resource = []; }],
+    ['resource_array', c => { c.params.resource = Array(1); }],
+    ['resource_array', c => { c.params.resource = [resource, , resource]; }],
+    ['resource_array', c => { c.params.resource = [new String(resource)]; }],
+    ['resource_array', c => { c.params.resource = Array(9).fill(resource); }],
+    ['resource_array', c => { c.params.resource = [resource, 'https://wrong.example.test']; }],
+    ['resource_other', c => { c.params.resource += '/wrong'; }],
+    ['scope_absent', c => { delete c.params.scope; }],
+    ['scope_other', c => { c.params.scope = 'openid workrelay:tasks'; }],
+    ['scope_other', c => { c.params.scope = 'workrelay:tasks profile'; }],
+    ['response_type', c => { c.params.response_type = 'token'; }],
+  ];
+  for (const [expected, mutate] of cases) {
+    const ctx = context(); mutate(ctx.oidc);
+    const observed = [];
+    await assert.rejects(loadPreapprovedChatGPTGrant(ctx, { principal, resource,
+      onDenied: category => observed.push(category) }), error => error.error === 'access_denied');
+    assert.deepEqual(observed, [expected]);
+  }
+  assert.equal(created, 0);
+  for (const resourceValue of [[resource], [resource, resource]]) {
+    const ctx = context(); ctx.oidc.params.resource = resourceValue;
+    let saved = false, granted;
+    ctx.oidc.provider.Grant = class {
+      constructor(input) { assert.deepEqual(input, { accountId: principal, clientId: CHATGPT_CIMD_ID }); }
+      addResourceScope(target, scope) { granted = [target, scope]; }
+      async save() { saved = true; }
+    };
+    await loadPreapprovedChatGPTGrant(ctx, { principal, resource });
+    assert.equal(saved, true);
+    assert.deepEqual(granted, [resource, 'workrelay:tasks']);
+  }
 });
 import { createLocalInteractions, createOriginDiagnostic, provisionLocalHuman } from '../src/workrelay/issuer_interactions.mjs';
 
@@ -254,10 +293,12 @@ for (const registration of ['static', 'chatgpt-cimd', 'chatgpt-preapproved']) te
   const redirect = cimd ? CHATGPT_CIMD_REDIRECT : 'https://client.example.test/callback';
   let documentFetches = 0;
   let accountLookups = 0;
+  const deniedCategories = [];
   const provider = createUnexposedIssuerPolicy({ origin, principal: 'person1',
     jwks: { keys: [{ ...privateKey, kid: 'test', alg: 'RS256', use: 'sig' }] },
     cookieKeys: [randomBytes(32).toString('base64url')], clientId,
     clientRegistration: cimd ? 'chatgpt-cimd' : 'static', preapproveChatGPT,
+    onPreapprovalDenied: category => deniedCategories.push(category),
     ...(cimd ? { fetchClientDocument: async (id, options) => {
       assert.equal(id, CHATGPT_CIMD_ID);
       assert.equal(options.redirect, 'manual');
@@ -314,8 +355,10 @@ for (const registration of ['static', 'chatgpt-cimd', 'chatgpt-preapproved']) te
     }
     return { response, text: response.text };
   }
+  const verifier = randomBytes(32).toString('base64url');
+  const challenge = createHash('sha256').update(verifier).digest('base64url');
   const auth = `/auth?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent(redirect)}` +
-    `&scope=workrelay%3Atasks&resource=${encodeURIComponent(origin + '/mcp')}&code_challenge=${'a'.repeat(43)}` +
+    `&scope=workrelay%3Atasks&resource=${encodeURIComponent(origin + '/mcp')}&code_challenge=${challenge}` +
     '&code_challenge_method=S256&state=test';
   let next = await request(auth);
   assert.equal(accountLookups, 0, 'fresh no-cookie request has no authenticated account lookup');
@@ -398,6 +441,37 @@ for (const registration of ['static', 'chatgpt-cimd', 'chatgpt-preapproved']) te
     assert.equal(callback.searchParams.has('code'), true);
     assert.equal(callback.searchParams.get('state'), 'test');
     assert.ok(documentFetches > 0);
+    // Real provider normalization, after authentication and with its existing
+    // session/grant. Duplicate scope tokens normalize to the same capability.
+    const repeatedScope = await request(auth.replace('workrelay%3Atasks', 'workrelay%3Atasks%20workrelay%3Atasks'));
+    assert.equal(new URL(repeatedScope.response.headers.get('location')).searchParams.has('code'), true);
+    // Repeated resource parameters are retained as an array by the provider,
+    // even when they name only the same server. Equivalent targets may not
+    // introduce a new scope, account or audience.
+    deniedCategories.length = 0;
+    const repeatedResource = await request(auth + '&resource=' + encodeURIComponent(origin + '/mcp'));
+    assert.equal(new URL(repeatedResource.response.headers.get('location')).searchParams.has('code'), true);
+    assert.deepEqual(deniedCategories, []);
+    const code = new URL(repeatedResource.response.headers.get('location')).searchParams.get('code');
+    const tokenBody = new URLSearchParams({ grant_type: 'authorization_code', client_id: clientId,
+      redirect_uri: redirect, code, code_verifier: verifier });
+    tokenBody.append('resource', origin + '/mcp');
+    const duplicateTokenBody = new URLSearchParams(tokenBody);
+    duplicateTokenBody.set('code', callback.searchParams.get('code'));
+    duplicateTokenBody.append('resource', origin + '/mcp');
+    const duplicateExchange = await request('/token', { method: 'POST', headers: {
+      'content-type': 'application/x-www-form-urlencoded' }, body: duplicateTokenBody });
+    assert.equal(duplicateExchange.response.status, 400, 'provider requires a single token resource target');
+    const exchanged = await request('/token', { method: 'POST', headers: {
+      'content-type': 'application/x-www-form-urlencoded' }, body: tokenBody });
+    assert.equal(exchanged.response.status, 200, 'real repeated-resource authorization code exchanges with PKCE');
+    let token;
+    try { token = JSON.parse(exchanged.text).access_token; } catch { assert.fail('token response JSON invalid'); }
+    assert.equal(typeof token, 'string', 'access token issued');
+    const claims = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
+    assert.equal(claims.aud, origin + '/mcp');
+    assert.equal(claims.scope, 'workrelay:tasks');
+    assert.equal(claims.sub, 'person1');
     for (const invalid of [
       auth.replace('workrelay%3Atasks', 'openid'),
       auth.replace(encodeURIComponent(origin + '/mcp'), encodeURIComponent('https://wrong.example.test/mcp')),
