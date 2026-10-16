@@ -11,6 +11,21 @@ const close = server => new Promise(resolve => server.close(resolve));
 const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
 const jwk = { ...await exportJWK(publicKey), kid: 'test-key', alg: 'RS256', use: 'sig' };
 
+test('preapproval observation config requires exact explicit public-proxy opt-in', () => {
+  const config = { issuer_mode: 'self-hosted', issuer_exposure: 'public-proxy',
+    public_origin: 'https://workrelay.example', audience: 'https://workrelay.example/mcp',
+    issuer_state_dir: '/synthetic-private', revocation_file: '/synthetic-private/revocations',
+    issuer_public_proxy: { origin: 'https://workrelay.example', acknowledge_tls_terminator_and_loopback_exclusivity: true },
+    principal: 'person1', owner: 'person1', bridge_config: '/synthetic-private/bridge', port: 12345,
+    clientRegistration: 'chatgpt-cimd', issuer_preapprove_chatgpt: true };
+  assert.equal(validateConfig(config).issuer_preapproval_observation, undefined);
+  const option = { enabled: true, arm_file: '/synthetic-private/preapproval-next.arm' };
+  assert.deepEqual(validateConfig({ ...config, issuer_preapproval_observation: option }).issuer_preapproval_observation, option);
+  for (const bad of [null, false, { ...option, enabled: false }, { ...option, arm_file: '/wrong' }])
+    assert.throws(() => validateConfig({ ...config, issuer_preapproval_observation: bad }), /preapproval observation/);
+  assert.throws(() => validateConfig({ ...config, issuer_preapprove_chatgpt: false, issuer_preapproval_observation: option }), /preapproval observation/);
+});
+
 test('signed OAuth JWT, strict boundary, and real MCP2 client handshake/tools', async () => {
   const issuerServer = createServer((req, res) => {
     res.setHeader('Content-Type', 'application/json');

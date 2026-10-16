@@ -12,6 +12,74 @@ import argon2 from 'argon2';
 import { createIssuerAdapter } from '../src/workrelay/oidc_adapter.mjs';
 import { createUnexposedIssuerPolicy, loadPreapprovedChatGPTGrant, createPreapprovalDiagnostic, CHATGPT_CIMD_ID, CHATGPT_CIMD_REDIRECT } from '../src/workrelay/issuer_policy.mjs';
 
+test('preapproval next-denial mode has absolute 30-minute bounds and independent exclusive restart-safe files', async t => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'workrelay-next-denial-'));
+  await fs.chmod(dir, 0o700);
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const arm = join(dir, 'preapproval-next.arm'), used = join(dir, 'preapproval-next.used');
+  const receipt = join(dir, 'preapproval-next.receipt.json');
+  const start = 1000000, attemptId = randomBytes(16).toString('hex');
+  const data = { target: 'preapproval', attemptId, issuedAt: start, expiresAt: start + 1800000 };
+  const present = file => fs.access(file).then(() => true, () => false);
+  const write = value => fs.writeFile(arm, JSON.stringify(value), { mode: 0o600 });
+  for (const [value, instant] of [
+    [{ ...data, expiresAt: start + 1800001 }, start],
+    [{ ...data, issuedAt: start + 1 }, start],
+    [data, data.expiresAt], [data, data.expiresAt + 1],
+    [{ ...data, issuedAt: undefined }, start],
+    [{ ...data, extra: 'PRIVATE_MARKER' }, start],
+    [{ ...data, attemptId: 'invalid' }, start],
+  ]) {
+    await write(value);
+    createPreapprovalDiagnostic(dir, { nextDenial: true, now: () => instant })('scope_other');
+    assert.equal(await present(used), false);
+    assert.equal(await present(receipt), false);
+  }
+  await write(data);
+  const record = createPreapprovalDiagnostic(dir, { nextDenial: true, now: () => start });
+  record('scope_other PRIVATE_MARKER'); record({ reason: 'scope_other' });
+  assert.equal(await present(used), false, 'only fixed primitive enum accepted');
+  await fs.rename(arm, arm + '.saved'); await fs.symlink(arm + '.saved', arm);
+  record('scope_other');
+  assert.equal(await present(used), false, 'symlink refused');
+  await fs.unlink(arm); await fs.rename(arm + '.saved', arm);
+  await fs.writeFile(receipt, '{}', { mode: 0o600 });
+  record('scope_other');
+  assert.equal(await present(used), false, 'stale receipt alone refuses capture');
+  await fs.unlink(receipt);
+  createPreapprovalDiagnostic(dir, { now: () => start + 300000 })('scope_other');
+  assert.equal(await present(used), false, 'default mode never reads longer-mode arm');
+  const legacy = join(dir, 'origin-post.arm');
+  await fs.writeFile(legacy, JSON.stringify({ target: 'preapproval', attemptId, expiresAt: start + 120001 }), { mode: 0o600 });
+  createPreapprovalDiagnostic(dir, { now: () => start })('scope_other');
+  assert.equal(await present(join(dir, 'origin-post.used')), false, 'legacy120s cap unchanged');
+  await fs.chmod(arm, 0o644);
+  createPreapprovalDiagnostic(dir, { nextDenial: true, now: () => start })('scope_other');
+  assert.equal(await present(used), false);
+  await fs.chmod(arm, 0o600);
+  await fs.chmod(dir, 0o755);
+  assert.doesNotThrow(() => createPreapprovalDiagnostic(dir, { nextDenial: true, now: () => start })('scope_other'));
+  assert.equal(await present(used), false, 'diagnostic errors never escape');
+  await fs.chmod(dir, 0o700);
+  const url = new URL('../src/workrelay/issuer_policy.mjs', import.meta.url).href;
+  const script = `import { createPreapprovalDiagnostic } from ${JSON.stringify(url)};
+    createPreapprovalDiagnostic(process.argv[1], { nextDenial:true, now:()=>${data.expiresAt - 1} })('scope_other');`;
+  await Promise.all(Array.from({ length: 2 }, () => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script, dir], { stdio: 'ignore' });
+    child.once('error', reject); child.once('exit', code => code === 0 ? resolve() : reject(Error('diagnostic child failed')));
+  })));
+  const captured = await fs.readFile(receipt, 'utf8');
+  assert.deepEqual(JSON.parse(captured), { attemptId, stage: 'preapproval', rejectionClass: 'scope_other' });
+  assert.equal((await fs.stat(receipt)).mode & 0o777, 0o600);
+  assert.equal(await present(arm), false);
+  await write(data); // a reconstructed recorder cannot overwrite old evidence
+  createPreapprovalDiagnostic(dir, { nextDenial: true, now: () => start + 300000 })('account');
+  assert.equal(await fs.readFile(receipt, 'utf8'), captured);
+  await fs.unlink(receipt);
+  createPreapprovalDiagnostic(dir, { nextDenial: true, now: () => start + 300000 })('account');
+  assert.equal(await present(receipt), false, 'used marker blocks restart even if receipt removed');
+});
+
 test('preapproval denial recorder is bounded, exclusive, categorical and target-specific', async t => {
   const dir = await fs.mkdtemp(join(tmpdir(), 'workrelay-preauth-diagnostic-'));
   await fs.chmod(dir, 0o700);
@@ -91,6 +159,9 @@ test('preapproval hook rejects account and capability escalation and cannot resu
     await assert.rejects(loadPreapprovedChatGPTGrant(ctx, { principal, resource,
       onDenied: category => observed.push(category) }), error => error.error === 'access_denied');
     assert.deepEqual(observed, [expected]);
+    await assert.rejects(loadPreapprovedChatGPTGrant(ctx, { principal, resource,
+      onDenied: createPreapprovalDiagnostic('/nonexistent-diagnostic-directory', { nextDenial: true }) }),
+    error => error.error === 'access_denied');
   }
   assert.equal(created, 0);
   for (const resourceValue of [[resource], [resource, resource]]) {

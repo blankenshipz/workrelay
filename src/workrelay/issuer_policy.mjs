@@ -12,26 +12,35 @@ const preapprovalReasons = new Set(['account', 'session', 'client', 'redirect',
 
 // Same exclusive private arm/used/receipt protocol as the interaction recorder.
 // A separate target prevents a login/consent recorder from consuming this arm.
-export function createPreapprovalDiagnostic(directory) {
+export function createPreapprovalDiagnostic(directory, { nextDenial = false, now = Date.now } = {}) {
+  const prefix = nextDenial === true ? 'preapproval-next' : 'origin-post';
   return reason => {
     let fd, temporary;
     try {
       if (!preapprovalReasons.has(reason)) return;
       privateDirectory(directory);
-      const arm = join(directory, 'origin-post.arm'), used = join(directory, 'origin-post.used');
-      const receipt = join(directory, 'origin-post.receipt.json');
+      const arm = join(directory, `${prefix}.arm`), used = join(directory, `${prefix}.used`);
+      const receipt = join(directory, `${prefix}.receipt.json`);
       fd = openSync(arm, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
       const info = fstatSync(fd), pathInfo = lstatSync(arm);
       if (!info.isFile() || info.uid !== process.getuid() || info.mode & 0o077 || info.nlink !== 1 ||
-          info.size > 160 || info.dev !== pathInfo.dev || info.ino !== pathInfo.ino) return;
-      const { target, attemptId, expiresAt } = JSON.parse(readFileSync(fd, 'utf8'));
+          nextDenial === true && (info.mode & 0o777) !== 0o600 ||
+          info.size > (nextDenial === true ? 256 : 160) || info.dev !== pathInfo.dev || info.ino !== pathInfo.ino) return;
+      const data = JSON.parse(readFileSync(fd, 'utf8'));
+      const { target, attemptId, issuedAt, expiresAt } = data;
       closeSync(fd); fd = undefined;
-      if (target !== 'preapproval' || !/^[a-f0-9]{32}$/.test(attemptId ?? '') ||
-          !Number.isSafeInteger(expiresAt) || expiresAt <= Date.now() || expiresAt > Date.now() + 120000) return;
+      const instant = now();
+      if (target !== 'preapproval' || typeof attemptId !== 'string' || !/^[a-f0-9]{32}$/.test(attemptId) ||
+          !Number.isSafeInteger(expiresAt) || expiresAt <= instant) return;
+      if (nextDenial === true) {
+        if (Object.keys(data).sort().join(',') !== 'attemptId,expiresAt,issuedAt,target' ||
+            !Number.isSafeInteger(issuedAt) || issuedAt < 0 || issuedAt > instant || expiresAt <= issuedAt ||
+            expiresAt - issuedAt > 1800000) return;
+      } else if (expiresAt > instant + 120000) return;
       try { lstatSync(receipt); return; } catch (error) { if (error.code !== 'ENOENT') return; }
       linkSync(arm, used);
       unlinkSync(arm);
-      temporary = join(directory, `origin-post.${randomBytes(16).toString('hex')}.tmp`);
+      temporary = join(directory, `${prefix}.${randomBytes(16).toString('hex')}.tmp`);
       fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
       writeFileSync(fd, JSON.stringify({ attemptId, stage: 'preapproval', rejectionClass: reason }));
       fsyncSync(fd); closeSync(fd); fd = undefined;

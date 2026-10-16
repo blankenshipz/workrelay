@@ -118,6 +118,11 @@ export function validateConfig(config, { testIssuer = false } = {}) {
       (typeof config.issuer_preapprove_chatgpt !== 'boolean' ||
         config.issuer_preapprove_chatgpt && (!selfHosted || config.clientRegistration !== 'chatgpt-cimd')))
     throw Error('preapproval requires explicit self-hosted ChatGPT CIMD config');
+  if (config.issuer_preapproval_observation !== undefined &&
+      (!publicProxy || config.issuer_preapprove_chatgpt !== true ||
+        config.issuer_preapproval_observation?.enabled !== true ||
+        config.issuer_preapproval_observation.arm_file !== join(config.issuer_state_dir, 'preapproval-next.arm')))
+    throw Error('preapproval observation requires exact private public-proxy opt-in');
   if (!config.audience || typeof config.audience !== 'string' || !config.principal ||
       typeof config.principal !== 'string' || !key.safeParse(config.owner).success ||
       !config.bridge_config || typeof config.bridge_config !== 'string')
@@ -286,8 +291,9 @@ export function createGateway(rawConfig, options = {}) {
       redirectUris: settings.redirectUris, clientRegistration: settings.clientRegistration ?? 'static',
       fetchClientDocument: options.fetchClientDocument,
       preapproveChatGPT: config.issuer_preapprove_chatgpt ?? false,
-      onPreapprovalDenied: config.issuer_origin_diagnostic?.enabled === true ?
-        createPreapprovalDiagnostic(config.issuer_state_dir) : undefined,
+      onPreapprovalDenied: config.issuer_preapproval_observation?.enabled === true ?
+        createPreapprovalDiagnostic(config.issuer_state_dir, { nextDenial: true }) :
+        config.issuer_origin_diagnostic?.enabled === true ? createPreapprovalDiagnostic(config.issuer_state_dir) : undefined,
       adapter: createIssuerAdapter(config.issuer_state_dir),
       findAccount: async (_ctx, id) => id === config.principal ? {
         accountId: id, claims: async () => ({ sub: id }),
