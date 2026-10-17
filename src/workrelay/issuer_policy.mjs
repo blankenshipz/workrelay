@@ -29,12 +29,23 @@ const safeScopeClass = /^(?:nonstring|overlong|invalid|valid-(?:[0-9]|[12][0-9]|
 
 // Same exclusive private arm/used/receipt protocol as the interaction recorder.
 // A separate target prevents a login/consent recorder from consuming this arm.
-export function createPreapprovalDiagnostic(directory, { nextDenial = false, now = Date.now } = {}) {
-  const prefix = nextDenial === true ? 'preapproval-next' : 'origin-post';
+export function createPreapprovalDiagnostic(directory, options = {}) {
+  return createFiniteDiagnostic(directory, options);
+}
+
+const authorizationOutcomes = new Set(['success_response_prepared', 'invalid_request', 'invalid_client', 'invalid_scope',
+  'invalid_redirect_uri', 'invalid_resource', 'unauthorized_client', 'unsupported_response_type', 'access_denied',
+  'login_required', 'consent_required', 'interaction_required', 'other']);
+export function createAuthorizationOutcomeDiagnostic(directory, { now = Date.now } = {}) {
+  return createFiniteDiagnostic(directory, { nextDenial: true, authorizationOutcome: true, now });
+}
+
+function createFiniteDiagnostic(directory, { nextDenial = false, authorizationOutcome = false, now = Date.now } = {}) {
+  const prefix = authorizationOutcome ? 'authorization-outcome' : nextDenial === true ? 'preapproval-next' : 'origin-post';
   return (reason, classification) => {
     let fd, temporary;
     try {
-      if (!preapprovalReasons.has(reason)) return;
+      if (!(authorizationOutcome ? authorizationOutcomes : preapprovalReasons).has(reason)) return;
       privateDirectory(directory);
       const arm = join(directory, `${prefix}.arm`), used = join(directory, `${prefix}.used`);
       const receipt = join(directory, `${prefix}.receipt.json`);
@@ -47,7 +58,7 @@ export function createPreapprovalDiagnostic(directory, { nextDenial = false, now
       const { target, attemptId, issuedAt, expiresAt } = data;
       closeSync(fd); fd = undefined;
       const instant = now();
-      if (target !== 'preapproval' || typeof attemptId !== 'string' || !/^[a-f0-9]{32}$/.test(attemptId) ||
+      if (target !== (authorizationOutcome ? 'authorization-outcome' : 'preapproval') || typeof attemptId !== 'string' || !/^[a-f0-9]{32}$/.test(attemptId) ||
           !Number.isSafeInteger(expiresAt) || expiresAt <= instant) return;
       if (nextDenial === true) {
         if (Object.keys(data).sort().join(',') !== 'attemptId,expiresAt,issuedAt,target' ||
@@ -59,7 +70,9 @@ export function createPreapprovalDiagnostic(directory, { nextDenial = false, now
       unlinkSync(arm);
       temporary = join(directory, `${prefix}.${randomBytes(16).toString('hex')}.tmp`);
       fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-      writeFileSync(fd, JSON.stringify({ attemptId, stage: 'preapproval', rejectionClass: reason,
+      writeFileSync(fd, JSON.stringify(authorizationOutcome ? { attemptId, stage: 'authorization',
+        outcome: reason === 'success_response_prepared' ? 'success_response_prepared' : 'authorization_error',
+        ...(reason === 'success_response_prepared' ? {} : { errorClass: reason }) } : { attemptId, stage: 'preapproval', rejectionClass: reason,
         ...(reason === 'scope_other' && typeof classification === 'string' && safeScopeClass.test(classification) ?
           { scopeClass: classification } : {}) }));
       fsyncSync(fd); closeSync(fd); fd = undefined;
@@ -200,7 +213,7 @@ export async function loadPreapprovedChatGPTGrant(ctx, { principal, resource, on
 
 export function createUnexposedIssuerPolicy({ origin, principal, jwks, cookieKeys, clientId,
   redirectUris, adapter, findAccount, clientRegistration = 'static', fetchClientDocument, preapproveChatGPT = false,
-  onPreapprovalDenied }) {
+  onPreapprovalDenied, onAuthorizationOutcome }) {
   const issuer = exactHttps(origin, true);
   if (issuer.pathname !== '/' || issuer.search || !principal || typeof principal !== 'string' ||
       !Array.isArray(jwks?.keys) || !jwks.keys.length ||
@@ -277,5 +290,15 @@ export function createUnexposedIssuerPolicy({ origin, principal, jwks, cookieKey
       ctx.remove('Content-Length'); // Koa serializes and sizes the new JSON body.
     }
   });
+  if (typeof onAuthorizationOutcome === 'function') {
+    // oidc-provider respond.js emits before response-mode delivery: this proves
+    // preparation, NOT network redirect receipt or a client token exchange.
+    const record = category => { try { onAuthorizationOutcome(category); } catch { /* diagnostic only */ } };
+    provider.on('authorization.success', () => record('success_response_prepared'));
+    provider.on('authorization.error', (_ctx, error) => {
+      try { record(authorizationOutcomes.has(error?.error) && error.error !== 'success_response_prepared' ? error.error : 'other'); }
+      catch { record('other'); }
+    });
+  }
   return provider;
 }

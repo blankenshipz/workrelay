@@ -13,7 +13,35 @@ import argon2 from 'argon2';
 import { importJWK, jwtVerify } from 'jose';
 import { createIssuerAdapter } from '../src/workrelay/oidc_adapter.mjs';
 import { createGateway } from '../src/workrelay/mcp.mjs';
-import { createUnexposedIssuerPolicy, loadPreapprovedChatGPTGrant, createPreapprovalDiagnostic, CHATGPT_CIMD_ID, CHATGPT_CIMD_REDIRECT } from '../src/workrelay/issuer_policy.mjs';
+import { createUnexposedIssuerPolicy, loadPreapprovedChatGPTGrant, createPreapprovalDiagnostic, createAuthorizationOutcomeDiagnostic, CHATGPT_CIMD_ID, CHATGPT_CIMD_REDIRECT } from '../src/workrelay/issuer_policy.mjs';
+
+test('authorization outcome recorder is finite, private, exclusive, expiring and nonthrowing', async t => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'workrelay-auth-outcome-')); await fs.chmod(dir, 0o700);
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const arm = join(dir, 'authorization-outcome.arm'), receipt = join(dir, 'authorization-outcome.receipt.json');
+  const now = 1000000, attemptId = randomBytes(16).toString('hex');
+  const data = { target: 'authorization-outcome', attemptId, issuedAt: now, expiresAt: now + 1800000 };
+  const record = createAuthorizationOutcomeDiagnostic(dir, { now: () => now });
+  for (const invalid of [{ ...data, expiresAt: now }, { ...data, expiresAt: now + 1800001 }, { ...data, issuedAt: now + 1 }, { ...data, extra: 'PRIVATE' }]) {
+    await fs.writeFile(arm, JSON.stringify(invalid), { mode: 0o600 }); record('success_response_prepared');
+    await assert.rejects(fs.access(receipt));
+  }
+  await fs.writeFile(arm, JSON.stringify(data), { mode: 0o600 });
+  record('malicious PRIVATE'); await assert.rejects(fs.access(receipt));
+  await fs.chmod(arm, 0o644); assert.doesNotThrow(() => record('other')); await assert.rejects(fs.access(receipt));
+  await fs.chmod(arm, 0o600);
+  const url = new URL('../src/workrelay/issuer_policy.mjs', import.meta.url).href;
+  const script = `import {createAuthorizationOutcomeDiagnostic} from ${JSON.stringify(url)}; createAuthorizationOutcomeDiagnostic(process.argv[1],{now:()=>${now}})('other');`;
+  await Promise.all([1, 2].map(() => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script, dir], { stdio: 'ignore' });
+    child.once('error', reject); child.once('exit', code => code === 0 ? resolve() : reject(Error('recorder failed')));
+  })));
+  const captured = await fs.readFile(receipt, 'utf8');
+  assert.deepEqual(JSON.parse(captured), { attemptId, stage: 'authorization', outcome: 'authorization_error', errorClass: 'other' });
+  assert.equal((await fs.stat(receipt)).mode & 0o777, 0o600);
+  await fs.writeFile(arm, JSON.stringify(data), { mode: 0o600 }); record('success_response_prepared');
+  assert.equal(await fs.readFile(receipt, 'utf8'), captured);
+});
 
 test('preapproval next-denial mode has absolute 30-minute bounds and independent exclusive restart-safe files', async t => {
   const dir = await fs.mkdtemp(join(tmpdir(), 'workrelay-next-denial-'));
@@ -417,11 +445,13 @@ for (const registration of ['static', 'chatgpt-cimd', 'chatgpt-preapproved']) te
   let accountLookups = 0;
   const deniedCategories = [];
   const deniedScopeClasses = [];
+  const authorizationOutcomes = [];
   const provider = createUnexposedIssuerPolicy({ origin, principal: 'person1',
     jwks: { keys: [{ ...privateKey, kid: 'test', alg: 'RS256', use: 'sig' }] },
     cookieKeys: [randomBytes(32).toString('base64url')], clientId,
     clientRegistration: cimd ? 'chatgpt-cimd' : 'static', preapproveChatGPT,
     onPreapprovalDenied: (category, classification) => { deniedCategories.push(category); if (classification) deniedScopeClasses.push(classification); },
+    onAuthorizationOutcome: category => { authorizationOutcomes.push(category); throw Error('synthetic diagnostic failure'); },
     ...(cimd ? { fetchClientDocument: async (id, options) => {
       assert.equal(id, CHATGPT_CIMD_ID);
       assert.equal(options.redirect, 'manual');
@@ -440,6 +470,8 @@ for (const registration of ['static', 'chatgpt-cimd', 'chatgpt-preapproved']) te
     findAccount: async (_ctx, id) => { accountLookups++;
       return id === 'person1' ? { accountId: id, claims: async () => ({ sub: id }) } : undefined; } });
   let originalDiscovery;
+  provider.emit('authorization.error', { query: 'PRIVATE' }, { error: 'PRIVATE_UNKNOWN_ERROR', message: 'PRIVATE', stack: 'PRIVATE' });
+  assert.equal(authorizationOutcomes.pop(), 'other');
   if (preapproveChatGPT) {
     const grant = new provider.Grant({ accountId: 'person1', clientId });
     grant.addResourceScope(origin + '/mcp', 'workrelay:tasks');
@@ -610,6 +642,7 @@ for (const registration of ['static', 'chatgpt-cimd', 'chatgpt-preapproved']) te
     const callback = new URL(next.response.headers.get('location'));
     assert.equal(callback.origin + callback.pathname, redirect, 'preapproved login goes directly to exact callback');
     assert.equal(callback.searchParams.has('code'), true);
+    assert.ok(authorizationOutcomes.includes('success_response_prepared'), 'actual maintained authorization response path emits success despite diagnostic failure');
     assert.equal(callback.searchParams.get('state'), 'test');
     assert.ok(documentFetches > 0);
     const initialExchange = await request('/token', { method: 'POST', headers: {
@@ -704,6 +737,7 @@ for (const registration of ['static', 'chatgpt-cimd', 'chatgpt-preapproved']) te
       const failure = new URL(rejected.response.headers.get('location'), base);
       assert.equal(failure.searchParams.has('code'), false);
       assert.equal(failure.searchParams.get('error'), 'access_denied');
+      assert.ok(authorizationOutcomes.includes('access_denied'), 'actual maintained authorization rejection emits fixed error category');
       assert.deepEqual(deniedCategories, ['scope_other']);
       assert.deepEqual(deniedScopeClasses, [expected], 'maintained provider rejection supplies only fixed classification');
     }

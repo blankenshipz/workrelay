@@ -15,7 +15,7 @@ import { createEventsService } from './events.mjs';
 import { createManagedEventTools, managedEventToolDefinitions } from './managed_event_tools.mjs';
 import { createManagedReader, managedServerID } from './managed_server.mjs';
 import { createIssuerAdapter } from './oidc_adapter.mjs';
-import { createUnexposedIssuerPolicy, createPreapprovalDiagnostic } from './issuer_policy.mjs';
+import { createUnexposedIssuerPolicy, createPreapprovalDiagnostic, createAuthorizationOutcomeDiagnostic } from './issuer_policy.mjs';
 import { createLocalInteractions, createOriginDiagnostic } from './issuer_interactions.mjs';
 const loopback = new Set(['127.0.0.1', '::1']);
 const key = z.string().regex(/^[A-Za-z0-9_-]{1,80}$/);
@@ -129,6 +129,10 @@ export function validateConfig(config, { testIssuer = false } = {}) {
         config.issuer_preapproval_observation?.enabled !== true ||
         config.issuer_preapproval_observation.arm_file !== join(config.issuer_state_dir, 'preapproval-next.arm')))
     throw Error('preapproval observation requires exact private public-proxy opt-in');
+  if (config.issuer_authorization_observation !== undefined &&
+      (!publicProxy || config.issuer_authorization_observation?.enabled !== true ||
+        config.issuer_authorization_observation.arm_file !== join(config.issuer_state_dir, 'authorization-outcome.arm')))
+    throw Error('authorization observation requires exact private public-proxy opt-in');
   if (!config.audience || typeof config.audience !== 'string' || !config.principal ||
       typeof config.principal !== 'string' || !key.safeParse(config.owner).success ||
       !config.bridge_config || typeof config.bridge_config !== 'string')
@@ -366,6 +370,7 @@ export function createGateway(rawConfig, options = {}) {
       redirectUris: settings.redirectUris, clientRegistration: settings.clientRegistration ?? 'static',
       fetchClientDocument: options.fetchClientDocument,
       preapproveChatGPT: config.issuer_preapprove_chatgpt ?? false,
+      onAuthorizationOutcome: config.issuer_authorization_observation?.enabled === true ? createAuthorizationOutcomeDiagnostic(config.issuer_state_dir) : undefined,
       onPreapprovalDenied: config.issuer_preapproval_observation?.enabled === true ?
         createPreapprovalDiagnostic(config.issuer_state_dir, { nextDenial: true }) :
         config.issuer_origin_diagnostic?.enabled === true ? createPreapprovalDiagnostic(config.issuer_state_dir) : undefined,
