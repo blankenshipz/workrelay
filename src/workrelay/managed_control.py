@@ -12,6 +12,7 @@ import math
 from pathlib import Path
 
 from .cli import admission, BridgeError, require
+from .supervision import redact_text
 
 
 def initialize(db):
@@ -88,6 +89,62 @@ def identity(session, sid):
     return hashlib.sha256(json.dumps(selected, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
+def native_waits(client, authorize, session_id, *, limit=20):
+    """Bounded actionable native permission waits; NEVER replies or approves.
+
+    The installed V2 schema provides session.permission.list/get/reply, but no
+    question list/reply/reject route. Do not manufacture question responses by
+    treating ordinary owner messages as native decisions. Human permission
+    decisions stay in the native approval UI; no model-supplied approval boolean.
+    """
+    require(isinstance(session_id, str) and bool(re.fullmatch(r'ses[A-Za-z0-9_-]{1,160}', session_id)), 'invalid session')
+    require(type(limit) is int and 1 <= limit <= 50, 'invalid wait limit')
+    binding = authorize(); creation_session_id(binding, 'native-waits-read')
+    def get(path):
+        require(authorize() == binding, 'authority changed')
+        value = client.request('GET', path)
+        require(authorize() == binding, 'authority changed')
+        return value
+    first = get('/api/session/' + session_id)
+    session = first.get('data') if isinstance(first, dict) else None
+    snapshot = identity(session, session_id)
+    pending = get(f'/api/session/{session_id}/permission')
+    require(isinstance(pending, dict) and isinstance(pending.get('data'), list) and len(pending['data']) <= 1000,
+            'native permission state unavailable or exceeds bound')
+    seen = set(); items = []
+    for item in pending['data']:
+        require(isinstance(item, dict) and item.get('sessionID') == session_id and isinstance(item.get('id'), str) and
+                bool(re.fullmatch(r'per[A-Za-z0-9_-]{1,160}', item['id'])) and item['id'] not in seen,
+                'native permission ownership mismatch')
+        seen.add(item['id'])
+        require(isinstance(item.get('action'), str) and isinstance(item.get('resources'), list) and
+                len(item['resources']) <= 1000 and all(isinstance(resource, str) for resource in item['resources']),
+                'native permission projection unavailable')
+        if len(items) < limit:
+            items.append({'request_id': item['id'], 'action': redact_text(item['action'], 200),
+                          'resource_preview': [redact_text(resource, 400) for resource in item['resources'][:3]],
+                          'resources_omitted': max(0, len(item['resources']) - 3),
+                          'content_trust': 'untrusted_native_request_text',
+                          'requires_explicit_human_decision': True,
+                          'respond_via': 'native_opencode_or_openchamber_permission_ui'})
+    last = get('/api/session/' + session_id)
+    require(identity(last.get('data') if isinstance(last, dict) else None, session_id) == snapshot, 'session identity changed')
+    return {'session_id': session_id, 'pending_permission_count': len(seen), 'items': items,
+            'truncated': len(seen) > len(items), 'inference_started': False,
+            'native_permission_reply_exposed': False, 'native_question_reply_exposed': False,
+            'guidance': 'Open this exact session/request in the native OpenCode/OpenChamber approval UI. Review and explicitly decide there; then read waits again. Messages, resume, and server-wide authorization do not approve permission requests. No blanket approval is available.',
+            'ordinary_follow_up': 'Use same-session message/steer for normal visible conversation only, not as a native permission/question reply.',
+            'task_outcome': 'unverified'}
+
+
+def control_result(operation_id, session_id, message_id, phase, interrupt):
+    value = {'operation_id': operation_id, 'session_id': session_id, 'message_id': message_id, 'phase': phase}
+    if interrupt:
+        value.update(cancellation_is_rollback=False, queued_inputs_removed=False,
+                     guidance='Only this session active execution is interrupted with resume=false. Queued inputs are preserved and may run on later resume. No file edits are rolled back; idle_noop is not active-cancel proof.')
+    return value
+
+
 def control(db, config, client, authorize, session_id, operation_id, *, text=None, interrupt=False, steer=False):
     """authorize() must revalidate pinned JWT/capability/registration and return
     a stable opaque binding ID. Failure must raise, never return a user owner label.
@@ -155,7 +212,7 @@ def control(db, config, client, authorize, session_id, operation_id, *, text=Non
                     phase = 'queued_observed'
                     db.execute('UPDATE managed_operations SET phase=? WHERE binding=? AND session=? AND operation=?',
                                (phase, binding, session_id, operation_id))
-            return {'operation_id': operation_id, 'session_id': session_id, 'message_id': row[2], 'phase': phase}
+            return control_result(operation_id, session_id, row[2], phase, interrupt)
         if not recovering:
             busy = db.execute("SELECT 1 FROM managed_operations WHERE session=? AND phase IN ('reserved','sending','uncertain') LIMIT 1",
                               (session_id,)).fetchone()
@@ -198,7 +255,7 @@ def control(db, config, client, authorize, session_id, operation_id, *, text=Non
         raise BridgeError('control outcome uncertain; reconcile exact ID, never blindly replay') from None
     db.execute('UPDATE managed_operations SET phase=? WHERE binding=? AND session=? AND operation=?',
                (phase, binding, session_id, operation_id))
-    return {'operation_id': operation_id, 'session_id': session_id, 'message_id': message, 'phase': phase}
+    return control_result(operation_id, session_id, message, phase, interrupt)
 
 
 def creation_session_id(binding, operation_id):

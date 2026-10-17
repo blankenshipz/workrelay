@@ -14,6 +14,7 @@ import { createLocalJWKSet, createRemoteJWKSet, jwtVerify } from 'jose';
 import { createEventsService } from './events.mjs';
 import { createMcpObservation } from './mcp_observation.mjs';
 import { createManagedEventTools, managedEventToolDefinitions } from './managed_event_tools.mjs';
+import { createManagedEventSource } from './managed_event_source.mjs';
 import { createManagedReader, managedServerID } from './managed_server.mjs';
 import { createIssuerAdapter } from './oidc_adapter.mjs';
 import { createUnexposedIssuerPolicy, createPreapprovalDiagnostic, createAuthorizationOutcomeDiagnostic } from './issuer_policy.mjs';
@@ -316,23 +317,39 @@ function mcp(config, invoke, events, managedReader, eventTools) {
           tools: catalog, events_protocol: events ? ['events/list', 'events/subscribe', 'events/unsubscribe'] : [],
           guidance: 'Use tools/list for exact schemas. Existing read includes bounded visible results, not verified task completion. Projects and agent definitions do not authorize execution. Native approvals and financial admission still apply.',
           unsupported: ['verified harness task outcome through native session metadata'],
+          journey: [
+            { stage: 'select_existing', tool: 'workrelay_server_discover', requires: [] },
+            { stage: 'select_creation_project', tool: 'workrelay_server_projects', requires: [] },
+            { stage: 'create_idle', tool: 'workrelay_server_create', requires: ['project_id', 'operation_id', 'title'] },
+            { stage: 'read_results_or_return', tool: 'workrelay_server_read', requires: ['session_id'], arguments: { include_messages: true } },
+            { stage: 'inspect_native_waits', tool: 'workrelay_server_waits', requires: ['session_id'] },
+            { stage: 'queue_continuation', tool: 'workrelay_server_message', requires: ['session_id', 'operation_id', 'text'] },
+            { stage: 'steer_existing_owner', tool: 'workrelay_server_steer', requires: ['session_id', 'operation_id', 'text'] },
+            { stage: 'recover_original_operation', tool: 'workrelay_server_operation_status', requires: ['operation_id'] },
+            { stage: 'stop_execution_only', tool: 'workrelay_server_interrupt', requires: ['session_id', 'operation_id'] },
+            ...(eventTools ? [{ stage: 'events_prerequisites', tool: 'workrelay_event_capabilities', requires: [] },
+              { stage: 'return_to_subscriptions', tool: 'workrelay_event_subscriptions', requires: [] },
+              { stage: 'stop_monitoring_only', tool: 'workrelay_event_unsubscribe', requires: ['subscription_id'] }] : []),
+          ],
           next_action: { tool: 'workrelay_server_discover', arguments: {} } } : await managedReader(action, input, ctx.http?.authInfo?.extra?.managedClaims);
         if (action === 'read') { try { ctx.http?.authInfo?.extra?.readObservation?.(input, output); } catch { /* diagnostic only */ } }
         return { content: [{ type: 'text', text: JSON.stringify(output) }], structuredContent: output };
       } catch { return { isError: true, content: [{ type: 'text', text: 'Managed server capability unavailable or denied.' }] }; }
     });
   }
-  if (managedReader) for (const action of ['create', 'message', 'steer', 'resume', 'inspect', 'interrupt']) {
+  if (managedReader) for (const action of ['create', 'message', 'steer', 'resume', 'inspect', 'waits', 'interrupt']) {
     register(`workrelay_server_${action === 'inspect' ? 'operation_status' : action}`, {
       description: action === 'create' ? 'For the pinned server-wide principal, select project_id from workrelay_server_projects and omit directory to create an idle session at that verified native project canonical root. Optional creation_target selects the default project only. Explicit directory must be the selected root or an operator-allowlisted location within it; no arbitrary filesystem access. Supply operation_id/title. Inspect original operations before retry; never change arguments on an existing operation ID. Native model/permission/financial checks remain.' :
+        action === 'waits' ? 'Read bounded redacted native permission waits for an exact session; no operation_id, inference, permission reply or approval. Decide in the native OpenCode/OpenChamber UI, then read waits again. Native question list/reply/reject routes are unsupported; messages are not approval replies.' :
         action === 'inspect' ? 'Inspect a durable managed operation by operation_id; session_id is optional when unknown after failed creation. No continuation or interruption. Ambiguous/missing operations fail closed. Unknown is not permission to replay.' :
         action === 'steer' ? 'Steer bounded text to the existing native owner at its supported boundary. No agent transfer or permission approval. Reuse operation_id and identical inputs.' :
         ['message', 'resume'].includes(action) ? 'Queue a bounded continuation to the existing session owner; preserves agent/model/permissions. Native approval gates and financial admission apply. Reuse operation_id with identical text to reconcile uncertainty; never blindly replay.' :
-        'Interrupt only this existing session, not descendants. Not rollback; native permissions remain. Reuse operation_id to inspect the same attempt.',
+        'Interrupt only this existing session, not descendants. Not rollback; queued inputs remain and may run on later resume. Idle no-op is not active-cancel proof. Native permissions remain. Reuse operation_id to inspect the same attempt.',
       inputSchema: action === 'create' ? z.object({ operation_id: key, project_id: z.string().regex(/^project_[a-f0-9]{64}$/), title: z.string().trim().min(1).max(160), directory: z.string().min(1).max(4096).optional() }).strict() :
-        z.object({ session_id: action === 'inspect' ? z.string().regex(/^ses[A-Za-z0-9_-]{1,160}$/).optional() : z.string().regex(/^ses[A-Za-z0-9_-]{1,160}$/), operation_id: key,
+        z.object({ session_id: action === 'inspect' ? z.string().regex(/^ses[A-Za-z0-9_-]{1,160}$/).optional() : z.string().regex(/^ses[A-Za-z0-9_-]{1,160}$/),
+        ...(action === 'waits' ? { limit: z.number().int().min(1).max(50).optional() } : { operation_id: key }),
         ...(['message', 'steer', 'resume'].includes(action) ? { text } : {}) }).strict(),
-      annotations: { readOnlyHint: action === 'inspect', destructiveHint: action === 'interrupt', idempotentHint: true, openWorldHint: false },
+      annotations: { readOnlyHint: ['inspect', 'waits'].includes(action), destructiveHint: action === 'interrupt', idempotentHint: true, openWorldHint: false },
     }, async (input, ctx) => {
       try {
         const claims = ctx.http?.authInfo?.extra?.managedClaims;
@@ -861,11 +878,41 @@ export function createGateway(rawConfig, options = {}) {
   if (events) {
     let busy = false;
     let activeTick = Promise.resolve();
+    let stopped = false, sourceRun = null, reconnectAfter = 0;
+    const subscriptions = () => {
+      try {
+        const file = lstatSync(config.events_state_path);
+        if (!file.isFile() || file.isSymbolicLink() || file.uid !== process.getuid() || file.mode & 0o077 || file.size > 16777216) return [];
+        const state = JSON.parse(readFileSync(config.events_state_path, 'utf8'));
+        return Object.values(state.subscriptions ?? {}).filter(sub => sub.principal === config.principal && sub.expires > Date.now() &&
+          sub.name?.startsWith('session.') && sub.filter?.server_id === managedServerID(config.managed_server));
+      } catch { return []; }
+    };
+    const sourceAuthorized = async () => {
+      if (stopped || !managedReader || !active() || !approved() || unsafeMarker || markerState() === 'pending' || !subscriptions().length) return false;
+      try { await managedReader('authorize', {}, managedClaims); return true; } catch { return false; }
+    };
+    const source = managedReader ? createManagedEventSource({ serverId: managedServerID(config.managed_server),
+      authorize: sourceAuthorized,
+      openStream: ({ signal }) => managedReader('open_events', { signal }, managedClaims),
+      onNativeEvent: event => events.noteNativeEvent(event),
+      isSubscribed: sessionID => subscriptions().some(sub => !sub.filter.session_id || sub.filter.session_id === sessionID),
+      reconcile: async () => { await tick(); },
+    }) : null;
+    const maintainSource = async () => {
+      if (!source || !await sourceAuthorized()) { sourceRun?.controller.abort(); return; }
+      if (sourceRun || Date.now() < reconnectAfter) return;
+      const run = { controller: new AbortController(), promise: null }; sourceRun = run;
+      run.promise = source.consume({ signal: run.controller.signal, durationMs: 10000 }).catch(() => {
+        // Native source is only a wake-up hint. Durable polling/delivery remains active.
+      }).finally(() => { if (sourceRun === run) sourceRun = null; reconnectAfter = Date.now() + 1000; });
+    };
     const tick = async () => {
-      if (busy) return;
+      if (busy || stopped) return;
       busy = true;
       try {
-        if (await reconcile()) return;
+        if (await reconcile()) { sourceRun?.controller.abort(); return; }
+        await maintainSource();
         // Only inspect keys already subscribed through a verified callback; never
         // enumerate or adopt unrelated OpenCode sessions. Ledger status/result
         // independently recheck ownership and workspace on every observation.
@@ -900,10 +947,10 @@ export function createGateway(rawConfig, options = {}) {
       } catch { /* private state or OpenCode unavailable: do not fabricate events */ }
       finally { busy = false; }
     };
-    const timer = setInterval(() => { activeTick = tick(); }, options.eventIntervalMs ?? 5000);
+    const timer = setInterval(() => { if (!busy && !stopped) activeTick = tick(); }, options.eventIntervalMs ?? 5000);
     timer.unref();
-    server.stopEvents = async () => { clearInterval(timer); await activeTick; };
-    server.on('close', () => { clearInterval(timer); void handler.close?.(); });
+    server.stopEvents = async () => { stopped = true; clearInterval(timer); const run = sourceRun; run?.controller.abort(); await activeTick; await run?.promise; };
+    server.on('close', () => { void server.stopEvents(); void handler.close?.(); });
   } else server.on('close', () => { void handler.close?.(); });
   return server;
 }

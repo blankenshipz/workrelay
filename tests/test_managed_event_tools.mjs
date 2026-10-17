@@ -99,7 +99,7 @@ test('revocation races with views/delivery fail closed and subscription stop nev
   await assert.rejects(f.tools.call('workrelay_event_capabilities', {}, claims));
   const g = await fixture(t), other = await g.events.subscribe(subscription('session.failed', 'ses_other')), wanted = await g.events.subscribe(subscription());
   await call(g.tools, 'workrelay_event_unsubscribe', { subscription_id: wanted.id });
-  assert.ok((await call(g.tools, 'workrelay_event_subscription_status', { subscription_id: other.id })).subscription); g.phase('failed'); await g.events.pollManaged(); await g.events.deliverDue();
+  assert.ok((await call(g.tools, 'workrelay_event_subscription_status', { subscription_id: other.id })).subscription); await g.events.pollManaged(); g.phase('failed'); await g.events.pollManaged(); await g.events.deliverDue();
   assert.equal(g.calls.filter(c => c.body.name === 'session.failed').length, 1);
   const status = await f.events.subscriptionStatus({ id: accepted.id, filter: { server_id: server } }); assert.equal(status.subscription, null);
 });

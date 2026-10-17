@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from workrelay.cli import BridgeError
-from workrelay.managed_control import control, reservation_owner_dead, create_session, creation_session_id, inspect_operation, identity, resolve_operation, classified_failure
+from workrelay.managed_control import control, reservation_owner_dead, create_session, creation_session_id, inspect_operation, identity, resolve_operation, classified_failure, native_waits
 
 
 class ManagedControlTests(unittest.TestCase):
@@ -94,10 +94,14 @@ class ManagedControlTests(unittest.TestCase):
 
     @patch('workrelay.managed_control.admission')
     def test_interrupt_only_exact_session_no_inference(self, admit):
-        self.assertEqual(self.run_control(interrupt=True)['phase'], 'idle_noop')
+        first = self.run_control(interrupt=True)
+        self.assertEqual(first['phase'], 'idle_noop')
+        self.assertFalse(first['cancellation_is_rollback'])
+        self.assertFalse(first['queued_inputs_removed'])
+        self.assertIn('may run on later resume', first['guidance'])
         admit.assert_not_called()
         self.assertEqual(self.posts(), [('POST', '/api/session/ses_existing/interrupt?resume=false', None)])
-        self.run_control(interrupt=True)
+        self.assertEqual(self.run_control(interrupt=True), first)
         self.assertEqual(len(self.posts()), 1)
 
     @patch('workrelay.managed_control.admission')
@@ -541,6 +545,65 @@ class CreationTests(unittest.TestCase):
         self.assertEqual(inspect_operation(self.db, self.config, self, self.authorize, None, 'create1')['phase'], 'created_observed')
         self.assertEqual(self.db.execute('SELECT * FROM managed_operations').fetchall(), before)
         self.assertEqual(sum(m == 'POST' for m, _, _ in self.calls), 1)
+
+
+class NativeWaitTests(unittest.TestCase):
+    def setUp(self):
+        self.binding = 'a' * 64; self.calls = []; self.after_permission = None
+        self.session = {'id': 'ses_waits', 'model': {'providerID': 'other', 'id': 'read-without-inference'},
+                        'agent': 'native-owner', 'metadata': {'owner': 'untouched'}, 'permissions': {'ask': True}}
+        self.pending = [{'id': 'per_wait', 'sessionID': 'ses_waits', 'action': 'shell',
+                         'resources': ['token=synthetic-sensitive', 'Bearer synthetic-private-token'],
+                         'metadata': {'approval': True, 'secret': 'never-expose'}, 'message': 'never-expose'}]
+    def authorize(self):
+        if self.binding is None: raise BridgeError('revoked')
+        return self.binding
+    def request(self, method, path, body=None):
+        self.calls.append((method, path, body))
+        self.assertEqual(method, 'GET'); self.assertIsNone(body)
+        if path == '/api/session/ses_waits/permission':
+            if self.after_permission: self.after_permission()
+            return {'data': self.pending}
+        self.assertEqual(path, '/api/session/ses_waits')
+        return {'data': copy.deepcopy(self.session)}
+
+    @patch('workrelay.managed_control.admission')
+    def test_actionable_waits_read_only_redacted_not_permission_approval(self, admit):
+        before = copy.deepcopy(self.session)
+        result = native_waits(self, self.authorize, 'ses_waits')
+        self.assertEqual(result['pending_permission_count'], 1)
+        self.assertEqual(result['items'][0]['request_id'], 'per_wait')
+        self.assertTrue(result['items'][0]['requires_explicit_human_decision'])
+        self.assertFalse(result['native_permission_reply_exposed'])
+        self.assertFalse(result['native_question_reply_exposed'])
+        self.assertIn('approval UI', result['guidance'])
+        for secret in ('synthetic-sensitive', 'synthetic-private-token', 'never-expose'):
+            self.assertNotIn(secret, str(result))
+        self.assertEqual(self.session, before); admit.assert_not_called()
+        self.assertEqual([path for _, path, _ in self.calls],
+                         ['/api/session/ses_waits', '/api/session/ses_waits/permission', '/api/session/ses_waits'])
+
+    def test_bounds_other_session_duplicate_and_unknown_permissions_fail_closed(self):
+        original = copy.deepcopy(self.pending)
+        self.pending *= 2
+        with self.assertRaises(BridgeError): native_waits(self, self.authorize, 'ses_waits')
+        self.pending = copy.deepcopy(original); self.pending[0]['sessionID'] = 'ses_other'
+        with self.assertRaises(BridgeError): native_waits(self, self.authorize, 'ses_waits')
+        self.pending = copy.deepcopy(original); self.pending[0]['resources'] = [None]
+        with self.assertRaises(BridgeError): native_waits(self, self.authorize, 'ses_waits')
+        self.pending = copy.deepcopy(original) * 1001
+        with self.assertRaises(BridgeError): native_waits(self, self.authorize, 'ses_waits')
+        with self.assertRaises(BridgeError): native_waits(self, self.authorize, 'ses_waits', limit=0)
+
+    def test_bounded_preview_revocation_and_owner_change(self):
+        self.pending += [{**self.pending[0], 'id': 'per_second'}]
+        result = native_waits(self, self.authorize, 'ses_waits', limit=1)
+        self.assertTrue(result['truncated']); self.assertEqual(len(result['items']), 1)
+        self.after_permission = lambda: setattr(self, 'binding', None)
+        with self.assertRaises(BridgeError): native_waits(self, self.authorize, 'ses_waits')
+        self.binding = 'a' * 64
+        self.after_permission = lambda: self.session.update(agent='other-owner')
+        with self.assertRaises(BridgeError): native_waits(self, self.authorize, 'ses_waits')
 
 
 if __name__ == '__main__': unittest.main()

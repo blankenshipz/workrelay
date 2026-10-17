@@ -338,10 +338,12 @@ def main(argv=None):
         client = InstalledClient(config) if config.get("transport") == "installed-client" else Client(config, token)
         require(args.owner == config["authorized_owner"], "owner not authorized by private configuration")
         if args.command == 'managed-control':
-            from .managed_control import control, create_session, creation_session_id, inspect_operation, resolve_operation, classified_failure
+            from .managed_control import control, create_session, creation_session_id, inspect_operation, resolve_operation, classified_failure, native_waits
             require(config.get('transport') == 'installed-client', 'managed control requires guarded installed transport')
             envelope = json.loads(sys.stdin.read(50000))
-            require(isinstance(envelope, dict) and envelope.get('action') in ('message', 'steer', 'resume', 'interrupt', 'inspect', 'create'), 'invalid control handoff')
+            require(isinstance(envelope, dict) and envelope.get('action') in ('message', 'steer', 'resume', 'interrupt', 'inspect', 'create', 'waits'), 'invalid control handoff')
+            if envelope['action'] == 'waits':
+                envelope['operation_id'] = 'native-waits-read'
             config['_supervision_authority'] = {'managed': {'claims': envelope.get('claims'),
                 'session_id': 'ses_workrelay_pending' if envelope['action'] == 'create' or envelope['action'] == 'inspect' and envelope.get('session_id') is None else envelope.get('session_id'), 'operation_id': envelope.get('operation_id')}}
             path = state / 'managed-control.sqlite'
@@ -357,7 +359,9 @@ def main(argv=None):
                 def authorize():
                     result = client.request('GET', '/__managed/authorize')
                     return result.get('binding_id') if isinstance(result, dict) else None
-                if envelope['action'] == 'create':
+                if envelope['action'] == 'waits':
+                    result = native_waits(client, authorize, envelope.get('session_id'), limit=envelope.get('limit', 20))
+                elif envelope['action'] == 'create':
                     binding = authorize()
                     config['_supervision_authority']['managed']['session_id'] = creation_session_id(binding, envelope.get('operation_id'))
                     result = create_session(db, config, client, authorize, envelope.get('operation_id'),

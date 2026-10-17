@@ -67,23 +67,44 @@ test('durable reconciliation, retry, restart, filters and revocation never emit 
 });
 
 test('server-wide pagination cursor and queued event IDs survive restart without skipping or duplicating pages', async t => {
-  const dir = await directory(t), server = 'srv_' + 'd'.repeat(64), calls = [], cursors = [];
+  const dir = await directory(t), server = 'srv_' + 'd'.repeat(64), calls = [], cursors = []; let phase = 'unknown';
   const config = { statePath: join(dir, 'pages.json'), principal: 'alice', authorize: async () => true, transport: callback(calls),
-    observeManaged: async (_filter, cursor) => { cursors.push(cursor); return { server_id: server, items: [{ session_id: cursor ? 'ses_page_two' : session, state: 'failed', decisions: [] }], next_cursor: cursor ? null : 'second-page' }; } };
+    observeManaged: async (_filter, cursor) => { cursors.push(cursor); return { server_id: server, items: [{ session_id: cursor ? 'ses_page_two' : session, state: phase, decisions: [] }], next_cursor: cursor ? null : 'second-page' }; } };
   let events = createEventsService(config); await events.subscribe(subscription(server, 'session.failed', null)); await events.pollManaged();
-  events = createEventsService(config); await events.pollManaged(); await events.deliverDue();
-  assert.deepEqual(cursors, [null, 'second-page']); assert.equal(new Set(calls.filter(e => e.eventId).map(e => e.eventId)).size, 2);
+  events = createEventsService(config); await events.pollManaged(); phase = 'failed'; await events.pollManaged(); await events.pollManaged(); await events.deliverDue();
+  assert.deepEqual(cursors, [null, 'second-page', null, 'second-page']); assert.equal(new Set(calls.filter(e => e.eventId).map(e => e.eventId)).size, 2);
   await events.pollManaged(); await events.deliverDue(); assert.equal(calls.filter(e => e.eventId).length, 2);
+});
+
+test('a real pending permission projection outranks a previous terminal outcome without granting it', async t => {
+  const dir = await directory(t), server = 'srv_' + 'e'.repeat(64), calls = []; let waiting = true;
+  const events = createEventsService({ statePath: join(dir, 'wait.json'), principal: 'alice', authorize: async () => true, transport: callback(calls),
+    observeManaged: async () => ({ server_id: server, items: [{ session_id: session, state: 'succeeded', decisions: waiting ? ['per_owned_fixture'] : [] }], next_cursor: null }) });
+  await events.subscribe(subscription(server, 'session.completed')); await events.subscribe(subscription(server)); await events.pollManaged(); await events.deliverDue();
+  assert.equal(calls.filter(e => e.name === 'session.completed').length, 0); assert.equal(calls.filter(e => e.name === 'session.needs_input').length, 1);
+  waiting = false; await events.pollManaged(); await events.deliverDue(); assert.equal(calls.filter(e => e.name === 'session.completed').length, 0);
+});
+
+test('terminal snapshots are baselines; only observed change or fresh scoped native generation emits completion', async t => {
+  const dir = await directory(t), server = 'srv_' + 'f'.repeat(64), calls = [];
+  const events = createEventsService({ statePath: join(dir, 'native.json'), principal: 'alice', authorize: async () => true, transport: callback(calls),
+    observeManaged: async () => ({ server_id: server, items: [{ session_id: session, state: 'succeeded', decisions: [] }], next_cursor: null }) });
+  await events.subscribe(subscription(server, 'session.completed')); await events.pollManaged(); await events.deliverDue(); assert.equal(calls.filter(e => e.eventId).length, 0);
+  await events.noteNativeEvent({ server_id: server, session_id: session, kind: 'session.execution.succeeded', event_id: 'evt_stale', created: Date.now() - 60000 }); await events.pollManaged(); await events.deliverDue(); assert.equal(calls.filter(e => e.eventId).length, 0);
+  await events.noteNativeEvent({ server_id: server, session_id: session, kind: 'session.execution.failed', event_id: 'evt_wrong_outcome', created: Date.now() }); await events.pollManaged(); await events.deliverDue(); assert.equal(calls.filter(e => e.eventId).length, 0);
+  const created = Date.now(); const native = { server_id: server, session_id: session, kind: 'session.execution.succeeded', event_id: 'evt_fresh', created };
+  await events.noteNativeEvent(native); await events.pollManaged(); await events.deliverDue(); assert.equal(calls.filter(e => e.eventId).length, 1); assert.equal(calls.find(e => e.eventId).timestamp, new Date(created).toISOString());
+  await events.noteNativeEvent(native); await events.pollManaged(); await events.deliverDue(); assert.equal(calls.filter(e => e.eventId).length, 1);
 });
 
 test('actual authenticated MCP facade: pinned ChatGPT server/session subscriptions, reconnect dedup and authority revoke', { timeout: 30000 }, async t => {
   const dir = await directory(t), { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
-  const jwk = { ...await exportJWK(publicKey), kid: 'fixture', alg: 'RS256', use: 'sig' }; let outcome, permissions = ['per_pending'];
+  const jwk = { ...await exportJWK(publicKey), kid: 'fixture', alg: 'RS256', use: 'sig' }; let outcome, permissions = ['per_pending'], idle = true;
   const backend = createServer((req, res) => { res.setHeader('content-type', 'application/json');
     if (req.url === '/jwks') return res.end(JSON.stringify({ keys: [jwk] }));
     assert.equal(req.method, 'GET');
     if (req.url === `/api/session/${session}/permission`) return res.end(JSON.stringify({ data: permissions.map(id => ({ id, sessionID: session, text: 'SECRET' })) }));
-    const item = { id: session, projectID: 'private/path', title: 'SECRET', outcome, time: { idle: 1 } };
+    const item = { id: session, projectID: 'private/path', title: 'SECRET', outcome, time: idle ? { idle: 1 } : {} };
     res.end(JSON.stringify(req.url.startsWith('/api/session?') ? { data: [item], cursor: {} } : { data: item }));
   }); await listen(backend); t.after(() => close(backend)); const origin = `http://127.0.0.1:${backend.address().port}`;
   const registration = join(dir, 'service.json'), module = join(dir, 'client', 'service.mjs'), capability = join(dir, 'capability.json');
@@ -109,8 +130,10 @@ test('actual authenticated MCP facade: pinned ChatGPT server/session subscriptio
   await until(() => calls.some(e => e.name === 'session.needs_input'));
   await gateway.stopEvents(); await close(gateway); gateway = createGateway(config, options); await new Promise(resolve => gateway.listen(port, '127.0.0.1', resolve));
   await new Promise(resolve => setTimeout(resolve, 400)); assert.equal(calls.filter(e => e.name === 'session.needs_input').length, 1);
-  assert.ok((await post('events/subscribe', subscription(managedServerID(binding), 'session.failed', null))).body.result.id);
-  outcome = 'failed'; permissions = []; await until(() => calls.some(e => e.name === 'session.failed'));
+  const failing = (await post('events/subscribe', subscription(managedServerID(binding), 'session.failed', null))).body.result.id; assert.ok(failing);
+  permissions = []; idle = false;
+  await until(async () => JSON.parse(await fs.readFile(config.events_state_path)).subscriptions[failing]?.observations[session]?.lastTerminal === null);
+  outcome = 'failed'; await until(() => calls.some(e => e.name === 'session.failed'));
   assert.ok(!JSON.stringify(calls).includes('SECRET'));
   await post('events/unsubscribe', filter); binding.revoked = true; await fs.writeFile(capability, JSON.stringify(binding), { mode: 0o600 });
   assert.equal((await post('events/subscribe', filter)).status, 403);

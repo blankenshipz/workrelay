@@ -186,7 +186,8 @@ async function managedRequest(input, config) {
       internalAuthorize: async (request, binding, endpoint, headers) => {
         const sid = authority.session_id;
         if (request.method === 'GET' && request.body === null) {
-          if (rootRoutes.has(request.path) || request.path === '/api/project' || request.path === `/api/session/${sid}` || request.path === `/api/session/${sid}/inbox`) return true;
+          if (rootRoutes.has(request.path) || request.path === '/api/project' || request.path === `/api/session/${sid}` ||
+              request.path === `/api/session/${sid}/inbox` || request.path === `/api/session/${sid}/permission`) return true;
         }
         const code = `import json,sqlite3,sys
 db=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True,timeout=3)

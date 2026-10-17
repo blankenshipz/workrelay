@@ -49,6 +49,7 @@ test('managed registration read boundary is pinned, revoked, bounded and sanitiz
       if (url.searchParams.has('search')) assert.equal(url.searchParams.get('search'), 'release notes');
       const session = { id: root, projectID: '/PRIVATE/SECRET_PROJECT?token=SECRET', title: surfaceText ?? 'Useful project password=SECRET', metadata: { password: 'SECRET' }, location: { directory: '/PRIVATE' }, time: { idle: 1 }, outcome: 'succeeded' };
       if (during) during(session);
+      if (url.pathname === '/api/event') return new Response('data: {}\n\n', { headers: { 'content-type': 'text/event-stream' } });
       if (url.pathname.endsWith('/message')) {
         assert.equal(url.pathname, `/api/session/${root}/message`);
         if (messageRevocation) binding.revoked = true;
@@ -65,6 +66,12 @@ test('managed registration read boundary is pinned, revoked, bounded and sanitiz
     },
   });
   const page = await reader('discover', {}, claims);
+  const opened = await reader('open_events', { signal: new AbortController().signal }, claims);
+  assert.equal(opened.server_id, page.server_id); assert.match(opened.response.headers.get('content-type'), /text\/event-stream/);
+  await opened.response.body.cancel();
+  during = () => { binding.revoked = true; };
+  await assert.rejects(reader('open_events', { signal: new AbortController().signal }, claims));
+  binding = { ...b }; during = undefined;
   await reader('discover', { search: 'release notes' }, claims);
   await reader('discover', { search: 'release notes', cursor: 'page2' }, claims);
   await assert.rejects(reader('discover', { search: '\n' }, claims));
@@ -85,6 +92,16 @@ test('managed registration read boundary is pinned, revoked, bounded and sanitiz
   assert.equal(context.items[0].text, 'Please repair navigation token=[REDACTED]');
   assert.equal(context.items[1].text, 'Implemented navigation; live acceptance pending.');
   assert.equal(context.items[2].omission, 'Non-user/assistant message excluded.');
+  assert.deepEqual(context.visible_results.message_ids, ['msg_assistant']);
+  assert.equal(context.visible_results.verification, 'unverified');
+  assert.equal(context.visible_results.scope, 'this_page_only');
+  assert.deepEqual(context.next_action, { tool: 'workrelay_server_read', arguments: { session_id: root, include_messages: true, limit: 3, cursor: 'older' } });
+  const older = await reader('read', context.next_action.arguments, claims);
+  assert.equal(Object.hasOwn(older.return_action.arguments, 'cursor'), false, 'return starts at newest state, not stale historical cursor');
+  assert.equal(older.return_action.arguments.include_messages, true);
+  assert.equal(older.progress.verification, 'unverified');
+  const searched = await reader('discover', { search: 'release notes', limit: 1 }, claims);
+  assert.deepEqual(searched.next_action.arguments, { cursor: 'page2', limit: 1, search: 'release notes' });
   assert.doesNotMatch(JSON.stringify(context), /SECRET|HIDDEN/);
   // Synthetic established formats, independently exercised through every public text surface.
   for (const credential of ['Basic dGVzdDpmaXh0dXJl', 'AKIA' + 'A'.repeat(16),
@@ -141,10 +158,19 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
   let reads = 0;
   const session = { id: root, projectID: 'project', agent: 'existing-owner', parentID: 'ses_parent',
     model: { providerID: 'openai', id: 'fixture' }, metadata: { intent: 'unchanged' }, time: {} };
-  const posts = [], inbox = []; let dropAck = false;
+  const posts = [], inbox = []; let dropAck = false, sourceConnections = 0, activeSources = 0, maxSources = 0;
+  let nativeHint = { type: 'session.updated', id: 'evt_old_fixture', created: Date.now() - 1000 };
   const guardEntry = join(dir, 'runtime', 'plugins', 'subscription-guard', 'index.mjs');
   const backend = createServer(async (req, res) => {
     res.setHeader('content-type', 'application/json');
+    if (req.url === '/api/event') {
+      sourceConnections++; activeSources++; maxSources = Math.max(maxSources, activeSources);
+      assert.equal(req.method, 'GET'); assert.equal(req.headers['last-event-id'], undefined);
+      res.setHeader('content-type', 'text/event-stream');
+      for (let index = 0; index < 3; index++) res.write(`data: ${JSON.stringify({ ...nativeHint, data: { sessionID: root, text: 'PRIVATE_NATIVE_PAYLOAD' } })}\n\n`);
+      const end = setTimeout(() => res.end(), 150);
+      res.on('close', () => { clearTimeout(end); activeSources--; }); return;
+    }
     if (req.url === '/jwks') return res.end(JSON.stringify({ keys: [jwk] }));
     if (req.method === 'POST') {
       let text = ''; for await (const chunk of req) text += chunk;
@@ -171,6 +197,7 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
     if (req.url === `/api/session/${root}`) return res.end(JSON.stringify({ data: session }));
     if (req.url.startsWith(`/api/session/${root}/message?`)) return res.end(JSON.stringify({ data: [{ id: 'msg_visible', time: { created: 1 }, type: 'user', text: 'Review the release documentation.' }], cursor: {} }));
     if (req.url === `/api/session/${root}/inbox`) return res.end(JSON.stringify({ data: inbox }));
+    if (req.url === `/api/session/${root}/permission`) return res.end(JSON.stringify({ data: [] }));
     if (req.url.includes('/message/')) { res.statusCode = 404; return res.end('{}'); }
     reads++;
     res.end(JSON.stringify({ data: [{ id: root, projectID: 'project', time: {} }], cursor: {} }));
@@ -218,6 +245,18 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
       return { result: await sdk.callTool({ name, arguments: args }), tools: (await sdk.listTools()).tools };
     } finally { await sdk.close(); }
   };
+  const nativeWaits = await call(client, 'workrelay_server_waits', { session_id: root, limit: 1 });
+  assert.notEqual(nativeWaits.result.isError, true);
+  assert.equal(nativeWaits.result.structuredContent.pending_permission_count, 0);
+  assert.equal(nativeWaits.result.structuredContent.inference_started, false);
+  assert.equal(nativeWaits.result.structuredContent.native_permission_reply_exposed, false);
+  assert.equal(nativeWaits.result.structuredContent.native_question_reply_exposed, false);
+  const waitsDefinition = nativeWaits.tools.find(tool => tool.name === 'workrelay_server_waits');
+  assert.equal(waitsDefinition.annotations.readOnlyHint, true);
+  assert.equal(Object.hasOwn(waitsDefinition.inputSchema.properties, 'operation_id'), false);
+  assert.equal((await call('other', 'workrelay_server_waits', { session_id: root })).result.isError, true);
+  assert.equal((await call(client, 'workrelay_server_waits', { session_id: root, limit: 51 })).result.isError, true);
+  assert.equal(posts.length, 0, 'wait reads never post or start inference');
   await armObservation('mcp-catalog');
   await assert.rejects(call(client, 'workrelay_server_capabilities', {}, { subject: 'other' }));
   await assert.rejects(fs.access(join(observerDirectory, 'mcp-observation.receipt.json')));
@@ -269,9 +308,16 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
   await fs.writeFile(revocation, JSON.stringify({ revoked_principals: [], revoked_tokens: [] }), { mode: 0o600 });
   const integratedReserve = createServer(); await listen(integratedReserve);
   const integratedPort = integratedReserve.address().port; await close(integratedReserve);
+  const delivered = [];
   const integrated = createGateway({ ...config, port: integratedPort, events_enabled: true, events_state_path: join(dir, 'events.sqlite'), revocation_file: revocation }, {
-    testIssuer: true, invoke: async (_config, command, payload) => {
+    testIssuer: true, eventIntervalMs: 50, eventTransport: async (_url, request) => {
+      const body = JSON.parse(request.body); delivered.push(body); return { status: 200, body: JSON.stringify({ challenge: body.challenge }) };
+    }, invoke: async (_config, command, payload) => {
       handed.push({ command, payload });
+      if (payload.action === 'waits') return { session_id: payload.session_id, pending_permission_count: 1,
+        items: [{ request_id: 'per_fixture', action: 'read', resource_preview: ['sanitized fixture'], requires_explicit_human_decision: true,
+          respond_via: 'native_opencode_or_openchamber_permission_ui' }], inference_started: false,
+        native_permission_reply_exposed: false, native_question_reply_exposed: false };
       if (payload.action === 'inspect' && payload.operation_id === 'dot-acceptance-create-20261017-0220') return {
         phase: 'denied', recorded_phase: 'denied', kind: 'create', exact_session_exists: false, effect: 'not_applied', task_outcome: 'unverified' };
       if (payload.action === 'inspect' && ['ambiguous', 'missing'].includes(payload.operation_id)) return { error: 'PRIVATE', code: 'CONTROL_AUTHORIZATION_OR_VALIDATION_DENIED', effect: 'not_established' };
@@ -317,6 +363,56 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
     assert.equal(handed.length, count);
   }
   const full = await integratedCall('workrelay_server_capabilities');
+  const until = async condition => { for (let attempt = 0; attempt < 150; attempt++) { if (await condition()) return; await new Promise(resolve => setTimeout(resolve, 30)); } assert.fail('bounded native-source observation missing'); };
+  assert.equal(sourceConnections, 0, 'no stream before active managed subscription');
+  const eventToken = await new SignJWT({ scope: 'workrelay:tasks', client_id: client }).setProtectedHeader({ alg: 'RS256', kid: 'test' })
+    .setIssuer(origin).setAudience(config.audience).setSubject('alice').setIssuedAt().setExpirationTime('5m').sign(keys.privateKey);
+  const eventCall = async (method, params) => {
+    const response = await fetch(`http://127.0.0.1:${integratedPort}/mcp`, { method: 'POST', headers: { authorization: `Bearer ${eventToken}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'MCP-Protocol-Version': '2026-07-28', 'Mcp-Method': method },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params: { ...params, _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28', 'io.modelcontextprotocol/clientCapabilities': {} } } }) });
+    assert.equal(response.status, 200); return response.json();
+  };
+  const subscription = { name: 'session.failed', arguments: { server_id: full.result.structuredContent.server_id, session_id: root },
+    delivery: { mode: 'webhook', url: 'https://receiver.example/callback', secret: 'whsec_' + Buffer.alloc(32, 9).toString('base64') } };
+  session.outcome = 'failed';
+  const subscribed = await eventCall('events/subscribe', subscription); assert.ok(subscribed.result.id);
+  await until(() => sourceConnections >= 2);
+  assert.equal(delivered.filter(event => event.name === 'session.failed').length, 0, 'stale terminal baseline is not a fresh completion');
+  nativeHint = { type: 'session.execution.failed', id: 'evt_current_generation_one', created: Date.now() };
+  await until(() => delivered.some(event => event.name === 'session.failed'));
+  const firstGenerationConnections = sourceConnections;
+  await until(() => sourceConnections > firstGenerationConnections);
+  assert.equal(maxSources, 1, 'normal gateway owns only one bounded native stream');
+  assert.equal(delivered.filter(event => event.name === 'session.failed').length, 1, 'duplicate native wakes reconcile the same durable observation');
+  nativeHint = { type: 'session.execution.failed', id: 'evt_current_generation_two', created: Date.now() };
+  await until(() => delivered.filter(event => event.name === 'session.failed').length === 2);
+  const generations = delivered.filter(event => event.name === 'session.failed');
+  assert.notEqual(generations[0].eventId, generations[1].eventId, 'same terminal state in a new native generation is a distinct durable event');
+  assert.doesNotMatch(JSON.stringify(delivered), /PRIVATE_NATIVE_PAYLOAD/);
+  await eventCall('events/unsubscribe', subscription);
+  await until(() => activeSources === 0);
+  const afterUnsubscribe = sourceConnections;
+  await new Promise(resolve => setTimeout(resolve, 1100)); assert.equal(sourceConnections, afterUnsubscribe);
+  await eventCall('events/subscribe', subscription);
+  await until(() => sourceConnections > afterUnsubscribe);
+  await fs.writeFile(capability, JSON.stringify({ ...binding, revoked: true }));
+  await until(() => activeSources === 0);
+  const afterRevocation = sourceConnections;
+  await new Promise(resolve => setTimeout(resolve, 1100)); assert.equal(sourceConnections, afterRevocation);
+  await integrated.stopEvents();
+  await fs.writeFile(capability, JSON.stringify(binding)); delete session.outcome;
+  const pendingWaits = (await integratedCall('workrelay_server_waits', { session_id: root, limit: 2 })).result;
+  assert.equal(pendingWaits.structuredContent.items[0].requires_explicit_human_decision, true);
+  assert.equal(handed.at(-1).payload.action, 'waits');
+  assert.equal(Object.hasOwn(handed.at(-1).payload, 'operation_id'), false);
+  assert.equal(handed.at(-1).payload.claims.sub, 'alice');
+  assert.equal(handed.at(-1).payload.limit, 2);
+  for (const step of full.result.structuredContent.journey) {
+    const definition = full.tools.find(tool => tool.name === step.tool);
+    assert.ok(definition, `journey stage ${step.stage} must resolve to registered tool`);
+    for (const field of [...step.requires, ...Object.keys(step.arguments ?? {})]) assert.ok(Object.hasOwn(definition.inputSchema.properties, field));
+    for (const field of definition.inputSchema.required ?? []) assert.ok(step.requires.includes(field) || Object.hasOwn(step.arguments ?? {}, field));
+  }
   const observedFull = catalogShape({ tools: full.tools });
   assert.deepEqual(observedFull.known_tools, full.tools.map(tool => tool.name).sort());
   assert.equal(observedFull.unknown_count, 0, 'all actual registered tools, including creation_target and Events, are known');
@@ -372,6 +468,8 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
   assert.equal((await call(client, 'workrelay_server_message', { ...message, operation_id: 'financial-denial' })).result.isError, true);
   assert.equal(posts.length, 2);
   const stopped = await call(client, 'workrelay_server_interrupt', { session_id: root, operation_id: 'stop' });
+  assert.equal(stopped.result.structuredContent.queued_inputs_removed, false);
+  assert.match(stopped.result.structuredContent.guidance, /may run on later resume/);
   assert.equal(stopped.result.structuredContent.phase, 'interrupt_acknowledged');
   assert.equal(posts.length, 3);
   assert.equal(posts[2].path, `/api/session/${root}/interrupt?resume=false`);

@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { dirname, resolve as resolvePath } from 'node:path';
-import { lookup } from 'node:dns/promises';
+import { lookup, resolve4, resolve6 } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import https from 'node:https';
 
@@ -164,11 +164,31 @@ export function isPublicAddress(address) {
  * actual TLS connection's lookup while retaining hostname certificate verification. No fetch,
  * redirects, proxy environment, connection pooling, or second unvalidated DNS resolution.
  */
-export function createPinnedWebhookTransport({ resolve = lookup, request = https.request, timeoutMs = 10000, maxResponseBytes = 8192 } = {}) {
+// getaddrinfo can hide AAAA-only records when AI_ADDRCONFIG filters unavailable
+// address families. Query the SAME configured DNS resolver only on no-answer OS
+// lookup; never substitute public DNS/proxy or bypass rejected/private answers.
+export function createCallbackResolver({ osLookup = lookup, ipv4 = resolve4, ipv6 = resolve6 } = {}) {
+  return async (hostname, options) => {
+    try { return await osLookup(hostname, options); }
+    catch (cause) {
+      if (!['ENOTFOUND', 'EAI_AGAIN'].includes(cause?.code)) throw cause;
+      const results = await Promise.allSettled([ipv4(hostname), ipv6(hostname)]);
+      const addresses = results.flatMap((result, index) => result.status === 'fulfilled' ? result.value.map(address => ({ address, family: index === 0 ? 4 : 6 })) : []);
+      if (!addresses.length) throw cause;
+      return addresses; // transport validates EVERY answer, then pins at connect
+    }
+  };
+}
+export function createPinnedWebhookTransport({ resolve = createCallbackResolver(), request = https.request, timeoutMs = 10000, maxResponseBytes = 8192 } = {}) {
   return async (url, { body, headers }) => {
     const u = callbackURL(url);
     if (Buffer.byteLength(body) > 262144) throw failure('payload_too_large');
-    let req, timer, expired = false;
+    let req, timer, expired = false, phase = 'dns';
+    const networkFailure = cause => {
+      const known = new Set(['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH', 'ERR_INVALID_IP_ADDRESS', 'ERR_TLS_CERT_ALTNAME_INVALID', 'CERT_HAS_EXPIRED', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'SELF_SIGNED_CERT_IN_CHAIN', 'DEPTH_ZERO_SELF_SIGNED_CERT', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY']);
+      const codes = [cause?.code, ...(Array.isArray(cause?.errors) ? cause.errors.map(error => error?.code) : [])];
+      const rejected = failure('network_error'); rejected.data.phase = phase; rejected.data.native_code = codes.find(code => known.has(code)) ?? 'OTHER_NETWORK_ERROR'; return rejected;
+    };
     const timeout = new Promise((_, reject) => { timer = setTimeout(() => { expired = true; req?.destroy(); reject(failure('timeout')); }, timeoutMs); });
     try {
       return await Promise.race([timeout, (async () => {
@@ -176,20 +196,23 @@ export function createPinnedWebhookTransport({ resolve = lookup, request = https
         if (expired) throw failure('timeout');
         if (!Array.isArray(addresses) || !addresses.length || addresses.some(x => !isPublicAddress(x.address) || isIP(x.address) !== x.family)) throw failure('non_public_address');
         const pinned = addresses[0];
+        phase = 'connect';
         return await new Promise((accept, reject) => {
           req = request(u, { method: 'POST', agent: false, servername: u.hostname, rejectUnauthorized: true, minVersion: 'TLSv1.2',
             lookup: (_hostname, options, cb) => options?.all ? cb(null, [pinned]) : cb(null, pinned.address, pinned.family), headers }, res => {
             if (res.statusCode >= 300 && res.statusCode < 400) { res.destroy(); reject(failure('redirect')); return; }
             const chunks = []; let size = 0;
             res.on('data', chunk => { size += chunk.length; if (size > maxResponseBytes) { res.destroy(); reject(failure('response_too_large')); } else chunks.push(chunk); });
-            res.on('error', () => reject(failure('network_error')));
+            phase = 'response';
+            res.on('error', cause => reject(networkFailure(cause)));
             res.on('end', () => accept({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
           });
-          req.on('error', () => reject(failure('network_error')));
+          req.on('socket', socket => { socket.once('connect', () => { phase = 'tls'; }); socket.once('secureConnect', () => { phase = 'response'; }); });
+          req.on('error', cause => reject(networkFailure(cause)));
           req.end(body);
         });
       })()]);
-    } catch (error) { throw error?.code === -32015 ? error : failure('network_error'); }
+    } catch (error) { throw error?.code === -32015 ? error : networkFailure(error); }
     finally { clearTimeout(timer); }
   };
 }
@@ -319,7 +342,7 @@ export function createEventsService({ statePath, principal, authorize, observeMa
         for (const sub of Object.values(state.subscriptions)) if (sub.expires <= now()) drop(state, sub.id);
         requireValue(Object.keys(state.subscriptions).length < 256 || state.subscriptions[id], 'subscription_limit');
         const old = state.subscriptions[id];
-        const sub = { id, principal, task, name: p.name, ...(filter ? { filter, observations: old?.observations ?? {}, scanCursor: old?.scanCursor ?? null } : {}), ...(old?.delivery ? { delivery: old.delivery } : {}), url, secret: p.delivery.secret, expires: now() + Math.min(p.ttlMs ?? ttlMs, maxTtlMs), verifiedUntil: old?.verifiedUntil || 0 };
+        const sub = { id, principal, task, name: p.name, createdAt: old?.createdAt ?? now(), ...(filter ? { filter, observations: old?.observations ?? {}, nativeEvents: old?.nativeEvents ?? {}, scanCursor: old?.scanCursor ?? null } : {}), ...(old?.delivery ? { delivery: old.delivery } : {}), url, secret: p.delivery.secret, expires: now() + Math.min(p.ttlMs ?? ttlMs, maxTtlMs), verifiedUntil: old?.verifiedUntil || 0 };
         if (old && old.secret !== sub.secret) { sub.previousSecret = old.secret; sub.rotationUntil = now() + rotationMs; }
         else if (old?.rotationUntil > now()) { sub.previousSecret = old.previousSecret; sub.rotationUntil = old.rotationUntil; }
         if (!old || old.secret !== sub.secret || old.verifiedUntil <= now()) {
@@ -336,6 +359,21 @@ export function createEventsService({ statePath, principal, authorize, observeMa
     },
     async unsubscribe(p) { const { id } = params(p, false); return stop(sub => sub.id === id); },
     async revoke(taskId) { return stop(sub => sub.principal === principal && (!taskId || sub.task === taskId)); },
+    async noteNativeEvent({ server_id, session_id, kind, event_id, created }) {
+      requireValue(/^srv_[a-f0-9]{64}$/.test(server_id) && sessionId(session_id) && /^evt_[A-Za-z0-9_-]{1,150}$/.test(event_id) && Number.isFinite(created) && created > 0 && created <= now() + 30000, 'invalid_native_event');
+      if (!['session.execution.started', 'session.execution.succeeded', 'session.execution.failed', 'session.execution.interrupted'].includes(kind)) return;
+      return locked(async state => {
+        for (const sub of Object.values(state.subscriptions)) {
+          if (!matchesFilter(sub, { server_id }) || sub.filter.session_id && sub.filter.session_id !== session_id || sub.expires <= now() || created < (sub.createdAt ?? 0)) continue;
+          if (!await allowed(principal, sub.task, sub.name, sub.filter)) continue;
+          sub.nativeEvents ??= {}; const previous = sub.nativeEvents[session_id];
+          if (previous?.last?.created > created || previous?.last?.event_id === event_id) continue;
+          requireValue(previous || Object.keys(sub.nativeEvents).length < 1000, 'observation_limit');
+          const marker = { event_id, kind, created };
+          sub.nativeEvents[session_id] = { last: marker, terminal: kind === 'session.execution.started' ? previous?.terminal ?? null : marker };
+        }
+      });
+    },
     async pollManaged() {
       if (typeof observeManaged !== 'function') return;
       return locked(async state => {
@@ -352,16 +390,27 @@ export function createEventsService({ statePath, principal, authorize, observeMa
           if (!await allowed(principal, sub.task, sub.name, sub.filter)) { drop(state, sub.id); continue; }
           for (const item of page.items) {
             requireValue(sessionId(item.session_id) && (!sub.filter.session_id || item.session_id === sub.filter.session_id) && ['succeeded', 'failed', 'interrupted', 'needs_input', 'unknown', 'running', 'retrying', 'idle'].includes(item.state) && Array.isArray(item.decisions) && item.decisions.length <= 1000 && item.decisions.every(id => /^per[A-Za-z0-9_-]{1,160}$/.test(id)), 'invalid_observation');
-            const fingerprint = createHash('sha256').update(JSON.stringify([item.state, item.state === 'needs_input' ? [...item.decisions].sort() : []])).digest('hex');
+            // A live native permission gate wins over a previous turn's outcome.
+            // This changes neither permission policy nor any approval decision.
+            const observed = { ...item, state: item.decisions.length ? 'needs_input' : item.state };
+            const native = sub.nativeEvents?.[item.session_id]?.terminal;
+            const fingerprint = createHash('sha256').update(JSON.stringify([observed.state, observed.state === 'needs_input' ? [...observed.decisions].sort() : [], native?.event_id ?? null])).digest('hex');
             const previous = sub.observations[item.session_id];
             if (previous?.fingerprint === fingerprint) continue;
             requireValue(previous || Object.values(state.subscriptions).reduce((sum, subscription) => sum + Object.keys(subscription.observations ?? {}).length, 0) < 8192, 'observation_limit');
             const generation = (previous?.generation ?? 0) + 1;
-            sub.observations[item.session_id] = { fingerprint, generation };
-            const name = item.state === 'needs_input' ? 'session.needs_input' : item.state === 'failed' ? 'session.failed' : ['succeeded', 'interrupted'].includes(item.state) ? 'session.completed' : ['running', 'retrying', 'idle'].includes(item.state) ? 'session.progress' : null;
+            const terminal = ['succeeded', 'failed', 'interrupted'].includes(observed.state);
+            const nativeState = { 'session.execution.succeeded': 'succeeded', 'session.execution.failed': 'failed', 'session.execution.interrupted': 'interrupted' }[native?.kind];
+            const freshNative = terminal && nativeState === observed.state && native.event_id !== previous?.terminalEventId && native.created >= (sub.createdAt ?? 0);
+            const changedTerminal = previous && Object.hasOwn(previous, 'lastTerminal') && previous.lastTerminal !== 'unobserved' && previous.lastTerminal !== observed.state;
+            const underlyingTerminal = ['succeeded', 'failed', 'interrupted'].includes(item.state) ? item.state : 'unobserved';
+            const lastTerminal = terminal ? observed.state : ['unknown', 'running', 'retrying'].includes(observed.state) ? null : previous && Object.hasOwn(previous, 'lastTerminal') ? previous.lastTerminal : underlyingTerminal;
+            sub.observations[item.session_id] = { fingerprint, generation, lastTerminal, terminalEventId: native?.event_id ?? previous?.terminalEventId ?? null };
+            if (terminal && !freshNative && !changedTerminal) continue; // no stale baseline or permission-clear pseudo-completion
+            const name = observed.state === 'needs_input' ? 'session.needs_input' : observed.state === 'failed' ? 'session.failed' : ['succeeded', 'interrupted'].includes(observed.state) ? 'session.completed' : ['running', 'retrying', 'idle'].includes(observed.state) ? 'session.progress' : null;
             if (name !== sub.name) continue;
             const eventId = 'evt_' + createHash('sha256').update(JSON.stringify([principal, sub.id, item.session_id, fingerprint, generation])).digest('hex');
-            state.queue.push({ subscriptionId: sub.id, event: { eventId, name, timestamp: new Date(now()).toISOString(), data: { ...sub.filter, session_id: item.session_id, state: item.state, summary: `Managed session observed ${item.state}; inspect workrelay_server_read. Runtime idle is not task completion. Native approvals remain required.` }, cursor: null }, attempts: 0, due: now() });
+            state.queue.push({ subscriptionId: sub.id, event: { eventId, name, timestamp: new Date(freshNative ? native.created : now()).toISOString(), data: { ...sub.filter, session_id: item.session_id, state: observed.state, summary: `Managed session observed ${observed.state}; inspect workrelay_server_read. Runtime idle is not task completion. Native approvals remain required.` }, cursor: null }, attempts: 0, due: now() });
           }
           sub.scanCursor = page.next_cursor;
         }
