@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createManagedReader, managedText } from '../src/workrelay/managed_server.mjs';
-import { createGateway } from '../src/workrelay/mcp.mjs';
+import { createGateway, safeControlFailure } from '../src/workrelay/mcp.mjs';
+import { catalogShape } from '../src/workrelay/mcp_observation.mjs';
 import { createServer } from 'node:http';
 import { generateKeyPairSync, createHash } from 'node:crypto';
 import { exportJWK, SignJWT } from 'jose';
@@ -14,6 +15,12 @@ const client = 'https://chatgpt.com/oauth/client.json';
 const root = 'ses_ec3ddf9ebffe9cDFhA0VKjmkRn';
 const listen = s => new Promise(resolve => s.listen(0, '127.0.0.1', resolve));
 const close = s => new Promise(resolve => { s.close(resolve); s.closeAllConnections(); });
+
+test('control errors expose only finite code/effect/reason, never upstream text', () => {
+  assert.deepEqual(safeControlFailure({ error: 'PRIVATE', code: 'CONTROL_NOT_SENT', effect: 'no_post_permitted', reason: 'PROJECT_WORKSPACE_MISMATCH', stack: 'PRIVATE' }), {
+    error: 'Managed control denied or uncertain; inspect the original operation ID.', code: 'CONTROL_NOT_SENT', effect: 'no_post_permitted', reason: 'PROJECT_WORKSPACE_MISMATCH' });
+  assert.doesNotMatch(JSON.stringify(safeControlFailure({ error: 'PRIVATE', code: 'PRIVATE', reason: 'PRIVATE', effect: 'PRIVATE' })), /PRIVATE/);
+});
 
 test('visible text preserves meaning, redacts established credentials before truncation', () => {
   const source = 'Fix navigation.\nCookie: session=hidden; second=hidden\nAuthorization: Bearer hidden\npassword="hidden words" token=hidden\nhttps://user:pass@example.test/path\n-----BEGIN PRIVATE KEY-----\nhidden\n-----END PRIVATE KEY-----\nsk-examplekey\nContinue safely.';
@@ -151,8 +158,8 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
     }
     assert.equal(req.method, 'GET');
     if (req.url === '/api/project') return res.end(JSON.stringify([
-      { id: 'project', name: 'Useful project', directory: '/PRIVATE', commands: { start: 'SECRET' } },
-      { id: 'empty-project', name: 'Empty project token=SECRET' }
+      { id: 'project', name: 'Useful project', canonical: dir, directory: '/PRIVATE', commands: { start: 'SECRET' } },
+      { id: 'empty-project', name: 'Empty project token=SECRET', canonical: '/outside-authorized-workspace' }
     ]));
     if (req.url === '/api/agent') return res.end(JSON.stringify({ location: { directory: '/PRIVATE' }, data: [
       { id: 'reviewer', name: 'Review helper', description: 'Review code token=SECRET', mode: 'subagent', hidden: false, system: 'HIDDEN', request: { password: 'SECRET' }, permissions: {} }
@@ -197,6 +204,9 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
     managed_identity: { issuer: origin, audience: config.audience, principal: 'alice' },
     managed_server: config.managed_server, managed_supervisor_file: capability };
   await fs.writeFile(config.bridge_config, JSON.stringify(bridge), { mode: 0o600 });
+  const observerDirectory = join(dir, 'observer'); await fs.mkdir(observerDirectory, { mode: 0o700 });
+  config.mcp_observation = { enabled: true, directory: observerDirectory, arm_file: join(observerDirectory, 'mcp-observation.arm') };
+  const armObservation = async target => fs.writeFile(config.mcp_observation.arm_file, JSON.stringify({ target, attemptId: 'b'.repeat(32), issuedAt: Date.now(), expiresAt: Date.now() + 60000 }), { mode: 0o600, flag: 'wx' });
   const gateway = createGateway(config, { testIssuer: true }); await new Promise(resolve => gateway.listen(port, '127.0.0.1', resolve)); t.after(() => close(gateway));
   const call = async (clientID, name = 'workrelay_server_discover', args = {}, tokenOptions = {}, target = gateway) => {
     const token = await new SignJWT({ scope: 'workrelay:tasks', client_id: clientID }).setProtectedHeader({ alg: 'RS256', kid: 'test' })
@@ -208,7 +218,23 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
       return { result: await sdk.callTool({ name, arguments: args }), tools: (await sdk.listTools()).tools };
     } finally { await sdk.close(); }
   };
+  await armObservation('mcp-catalog');
+  await assert.rejects(call(client, 'workrelay_server_capabilities', {}, { subject: 'other' }));
+  await assert.rejects(fs.access(join(observerDirectory, 'mcp-observation.receipt.json')));
   assert.equal((await call(client)).result.structuredContent.items[0].session_id, root);
+  const catalogReceipt = join(observerDirectory, 'mcp-observation.receipt.json');
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (await fs.access(catalogReceipt).then(() => true, () => false)) break;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  const servedCatalog = JSON.parse(await fs.readFile(catalogReceipt, 'utf8'));
+  assert.equal(servedCatalog.layer, 'sdk_response_before_delivery');
+  assert.equal(servedCatalog.read_schema_include_messages, true);
+  assert.ok(servedCatalog.known_tools.includes('workrelay_server_read'));
+  assert.ok(servedCatalog.known_tools.includes('workrelay_server_creation_target'));
+  assert.equal(servedCatalog.unknown_count, 0);
+  await fs.rename(catalogReceipt, catalogReceipt + '.saved');
+  await fs.rename(join(observerDirectory, 'mcp-observation.used'), join(observerDirectory, 'mcp-observation.used.saved'));
   assert.equal(reads, 1);
   const catalogue = await call(client, 'workrelay_server_capabilities');
   assert.deepEqual(catalogue.result.structuredContent.tools.map(tool => tool.name).sort(), catalogue.tools.map(tool => tool.name).sort());
@@ -231,6 +257,11 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
   }
   assert.equal((await call(client, 'workrelay_server_agents', { cursor: projects.next_cursor })).result.isError, true);
   assert.equal(posts.length, 0);
+  const creationTarget = (await call(client, 'workrelay_server_creation_target')).result.structuredContent;
+  assert.equal(creationTarget.available, true);
+  assert.equal(creationTarget.project_id, 'project_' + createHash('sha256').update('project').digest('hex'));
+  assert.equal(JSON.stringify(creationTarget).includes(dir), false);
+  assert.equal((await call('other', 'workrelay_server_creation_target')).result.isError, true);
   // Isolated router contract tests: the existing gateway below still exercises
   // the real guarded CLI. This separate gateway captures only router handoff.
   const handed = [];
@@ -239,12 +270,41 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
   const integratedReserve = createServer(); await listen(integratedReserve);
   const integratedPort = integratedReserve.address().port; await close(integratedReserve);
   const integrated = createGateway({ ...config, port: integratedPort, events_enabled: true, events_state_path: join(dir, 'events.sqlite'), revocation_file: revocation }, {
-    testIssuer: true, invoke: async (_config, command, payload) => { handed.push({ command, payload }); return { phase: 'fixture_dispatch', inference_started: false }; }
+    testIssuer: true, invoke: async (_config, command, payload) => {
+      handed.push({ command, payload });
+      if (payload.action === 'inspect' && payload.operation_id === 'dot-acceptance-create-20261017-0220') return {
+        phase: 'denied', recorded_phase: 'denied', kind: 'create', exact_session_exists: false, effect: 'not_applied', task_outcome: 'unverified' };
+      if (payload.action === 'inspect' && ['ambiguous', 'missing'].includes(payload.operation_id)) return { error: 'PRIVATE', code: 'CONTROL_AUTHORIZATION_OR_VALIDATION_DENIED', effect: 'not_established' };
+      if (payload.action === 'create' && payload.project_id === 'empty-project' && Object.hasOwn(payload, 'directory')) return { error: 'PRIVATE workspace does not belong to selected discovered project', code: 'CONTROL_NOT_SENT', effect: 'no_post_permitted', reason: 'PROJECT_WORKSPACE_MISMATCH' };
+      return { phase: 'fixture_dispatch', inference_started: false };
+    }
   });
   await new Promise(resolve => integrated.listen(integratedPort, '127.0.0.1', resolve)); t.after(() => close(integrated));
   const integratedCall = (name, args = {}, who = client) => call(who, name, args, {}, integrated);
+  const recovery = { operation_id: 'dot-acceptance-create-20261017-0220' };
+  const recovered = (await integratedCall('workrelay_server_operation_status', recovery)).result;
+  assert.equal(recovered.structuredContent.effect, 'not_applied');
+  assert.equal(recovered.structuredContent.exact_session_exists, false);
+  assert.equal(handed.at(-1).payload.session_id, undefined);
+  const recoveryCount = handed.length;
+  assert.equal((await integratedCall('workrelay_server_operation_status', recovery, 'other')).result.isError, true);
+  assert.equal(handed.length, recoveryCount);
+  for (const operation_id of ['missing', 'ambiguous']) {
+    const rejected = (await integratedCall('workrelay_server_operation_status', { operation_id })).result;
+    assert.equal(rejected.isError, true); assert.doesNotMatch(JSON.stringify(rejected), /PRIVATE/);
+  }
+  const nondefault = { operation_id: 'nondefault-native-project', project_id: 'project_' + createHash('sha256').update('empty-project').digest('hex'), title: 'Native project idle session' };
+  const nativeCreate = (await integratedCall('workrelay_server_create', nondefault)).result;
+  assert.notEqual(nativeCreate.isError, true);
+  assert.equal(handed.at(-1).payload.project_id, 'empty-project');
+  assert.equal(Object.hasOwn(handed.at(-1).payload, 'directory'), false, 'omission reaches CLI unchanged, never filled with profile default');
+  assert.equal(handed.at(-1).payload.title, nondefault.title);
+  const deniedCreate = (await integratedCall('workrelay_server_create', { ...nondefault, operation_id: 'explicit-bad-path', directory: '/outside-selected-project' })).result;
+  assert.equal(handed.at(-1).payload.directory, '/outside-selected-project', 'explicit paths are delegated to the guarded CLI, not silently rewritten');
+  assert.equal(deniedCreate.isError, true); assert.equal(deniedCreate.structuredContent.reason, 'PROJECT_WORKSPACE_MISMATCH');
+  assert.equal(deniedCreate.structuredContent.effect, 'no_post_permitted'); assert.doesNotMatch(JSON.stringify(deniedCreate), /PRIVATE/);
   for (const action of ['create', 'operation_status', 'steer', 'resume']) {
-    const args = action === 'create' ? { operation_id: 'new', project_id: projects.items[0].project_id, title: 'Isolated creation' } :
+    const args = action === 'create' ? { operation_id: 'new', project_id: creationTarget.project_id, title: 'Isolated creation' } :
       { session_id: root, operation_id: 'inspect', ...(['steer', 'resume'].includes(action) ? { text: 'Bounded continuation' } : {}) };
     assert.notEqual((await integratedCall(`workrelay_server_${action}`, args)).result.isError, true);
     assert.equal(handed.at(-1).command, 'managed-control');
@@ -257,6 +317,14 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
     assert.equal(handed.length, count);
   }
   const full = await integratedCall('workrelay_server_capabilities');
+  const observedFull = catalogShape({ tools: full.tools });
+  assert.deepEqual(observedFull.known_tools, full.tools.map(tool => tool.name).sort());
+  assert.equal(observedFull.unknown_count, 0, 'all actual registered tools, including creation_target and Events, are known');
+  const withUnknown = catalogShape({ tools: [...full.tools, { name: 'PRIVATE_UNKNOWN_TOOL_VALUE' }] });
+  assert.deepEqual(withUnknown.known_tools, observedFull.known_tools);
+  assert.equal(withUnknown.unknown_count, 1);
+  assert.equal(withUnknown.tool_count, full.tools.length + 1);
+  assert.doesNotMatch(JSON.stringify(withUnknown), /PRIVATE_UNKNOWN_TOOL_VALUE/);
   assert.deepEqual(full.result.structuredContent.tools.map(tool => tool.name).sort(), full.tools.map(tool => tool.name).sort());
   for (const name of ['workrelay_event_capabilities', 'workrelay_event_subscriptions', 'workrelay_event_subscription_status', 'workrelay_event_unsubscribe']) {
     const args = ['workrelay_event_subscription_status', 'workrelay_event_unsubscribe'].includes(name) ? { subscription_id: 'sub_' + 'a'.repeat(64) } : {};
@@ -265,7 +333,20 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
   }
   reads = 1; // Remaining legacy assertions count session-discovery calls only.
   const readArgs = { session_id: root, include_messages: true, limit: 1 };
+  await armObservation('mcp-read');
+  assert.equal((await call('other', 'workrelay_server_read', readArgs)).result.isError, true);
+  await assert.rejects(fs.access(join(observerDirectory, 'mcp-observation.receipt.json')));
   const visible = (await call(client, 'workrelay_server_read', readArgs)).result;
+  const observedRead = JSON.parse(await fs.readFile(join(observerDirectory, 'mcp-observation.receipt.json'), 'utf8'));
+  assert.equal(observedRead.incoming.flag_value, true); assert.equal(observedRead.parsed.flag_value, true);
+  assert.equal(observedRead.item_count, 1); assert.equal(JSON.stringify(observedRead).includes(root), false);
+  await fs.rename(join(observerDirectory, 'mcp-observation.receipt.json'), join(observerDirectory, 'read.saved'));
+  await fs.rename(join(observerDirectory, 'mcp-observation.used'), join(observerDirectory, 'read-used.saved'));
+  await armObservation('mcp-read');
+  await call(client, 'workrelay_server_read', { session_id: root });
+  const omittedRead = JSON.parse(await fs.readFile(join(observerDirectory, 'mcp-observation.receipt.json'), 'utf8'));
+  assert.equal(omittedRead.incoming.flag_present, false); assert.equal(omittedRead.parsed.flag_present, false);
+  assert.equal(omittedRead.omission_present, true);
   assert.notEqual(visible.isError, true);
   assert.equal(visible.structuredContent.context.items[0].text, 'Review the release documentation.');
   assert.equal(visible.structuredContent.task_outcome.status, 'unknown');

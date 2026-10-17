@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from workrelay.cli import BridgeError
-from workrelay.managed_control import control, reservation_owner_dead, create_session, creation_session_id, inspect_operation, identity
+from workrelay.managed_control import control, reservation_owner_dead, create_session, creation_session_id, inspect_operation, identity, resolve_operation, classified_failure
 
 
 class ManagedControlTests(unittest.TestCase):
@@ -282,6 +282,19 @@ class ManagedControlTests(unittest.TestCase):
             inspect_operation(self.db, self.config, self, self.authorize, self.sid, 'operation')
         self.assertEqual(self.db.execute('SELECT * FROM managed_operations').fetchall(), before)
 
+    @patch('workrelay.managed_control.admission')
+    def test_operation_only_recovery_principal_isolation_and_collision(self, admit):
+        self.run_control(text='hello')
+        self.assertEqual(inspect_operation(self.db, self.config, self, self.authorize, None, 'operation')['session_id'], self.sid)
+        self.binding = 'b' * 64
+        with self.assertRaises(BridgeError): resolve_operation(self.db, self.authorize, 'operation')
+        self.binding = 'a' * 64
+        self.db.execute("INSERT INTO managed_operations SELECT binding,'ses_other',operation,kind,digest,message,phase,identity,reservation_pid FROM managed_operations")
+        with self.assertRaises(BridgeError): resolve_operation(self.db, self.authorize, 'operation')
+        self.assertEqual(resolve_operation(self.db, self.authorize, 'operation', self.sid)[1], self.sid)
+        self.binding = None
+        with self.assertRaises(BridgeError): resolve_operation(self.db, self.authorize, 'operation', self.sid)
+
 
 class CreationTests(unittest.TestCase):
     def setUp(self):
@@ -297,13 +310,16 @@ class CreationTests(unittest.TestCase):
 
     def request(self, method, path, body=None):
         self.calls.append((method, path, copy.deepcopy(body)))
-        if path == '/api/project': return [{'id': 'project', 'canonical': self.directory}]
+        if path == '/api/project': return getattr(self, 'project_records', [{'id': 'project', 'canonical': self.directory}])
         if method == 'GET':
             session = self.sessions.get(path.split('/')[-1])
             return {'data': copy.deepcopy(session)} if session else None
         self.assertEqual((method, path), ('POST', '/api/session'))
         self.assertNotIn('permissions', body); self.assertNotIn('parentID', body)
-        self.sessions[body['id']] = {**copy.deepcopy(body), 'projectID': 'project'}
+        projects = getattr(self, 'project_records', [{'id': 'project', 'canonical': self.directory}])
+        matches = [p for p in projects if Path(body['location']['directory']).is_relative_to(Path(p['canonical']))]
+        selected = max(matches, key=lambda p: len(p['canonical']))
+        self.sessions[body['id']] = {**copy.deepcopy(body), 'projectID': selected['id']}
         if self.timeout: raise TimeoutError()
         return {'data': copy.deepcopy(self.sessions[body['id']])}
 
@@ -353,6 +369,177 @@ class CreationTests(unittest.TestCase):
         self.request = request
         self.create()
         self.assertEqual(observed[0]['phase'], 'reserved')
+        self.assertEqual(sum(m == 'POST' for m, _, _ in self.calls), 1)
+
+    def test_real_failure_shape_valid_project_wrong_workspace_is_definite_denial(self):
+        original = self.request
+        def request(method, path, body=None):
+            if path == '/api/project': return [{'id': 'project', 'canonical': '/unrelated-project'}]
+            return original(method, path, body)
+        self.request = request
+        with self.assertRaises(BridgeError) as caught: self.create()
+        failure = classified_failure(self.db, self.authorize, 'create1', None, caught.exception)
+        self.assertEqual(failure.control_details['code'], 'CONTROL_NOT_SENT')
+        self.assertEqual(failure.control_details['reason'], 'PROJECT_WORKSPACE_MISMATCH')
+        before = self.db.execute('SELECT * FROM managed_operations').fetchall()
+        recovered = inspect_operation(self.db, self.config, self, self.authorize, None, 'create1')
+        self.assertEqual(recovered['recorded_phase'], 'denied')
+        self.assertFalse(recovered['exact_session_exists'])
+        self.assertEqual(recovered['effect'], 'not_applied')
+        self.assertEqual(self.db.execute('SELECT * FROM managed_operations').fetchall(), before)
+        self.assertFalse(any(m == 'POST' for m, _, _ in self.calls))
+
+    def test_operation_only_uncertain_create_readonly_reconcile_not_absence_proof(self):
+        self.timeout = True
+        with self.assertRaises(BridgeError) as caught: self.create()
+        failure = classified_failure(self.db, self.authorize, 'create1', None, caught.exception)
+        self.assertEqual(failure.control_details['code'], 'CONTROL_UNCERTAIN')
+        self.assertEqual(inspect_operation(self.db, self.config, self, self.authorize, None, 'create1')['phase'], 'created_observed')
+        sid = creation_session_id(self.binding, 'create1')
+        self.sessions[sid]['permissions'] = {'allow': True}
+        with self.assertRaises(BridgeError):
+            inspect_operation(self.db, self.config, self, self.authorize, None, 'create1')
+        self.sessions.clear()
+        recovered = inspect_operation(self.db, self.config, self, self.authorize, None, 'create1')
+        self.assertEqual(recovered['effect'], 'unknown')
+        self.assertEqual(recovered['recorded_phase'], 'uncertain')
+        self.assertEqual(sum(m == 'POST' for m, _, _ in self.calls), 1)
+
+    def setup_native_projects(self):
+        other = Path(self.directory) / 'other-project'; other.mkdir()
+        self.other = str(other)
+        self.project_records = [{'id': 'project', 'canonical': self.directory}, {'id': 'other', 'canonical': self.other}]
+
+    def native_create(self, op='native', **overrides):
+        return create_session(self.db, self.config, self, self.authorize, op,
+            **{'title': 'Workrelay acceptance test', 'project_id': 'other', 'authorize_native_projects': self.authorize, **overrides})
+
+    def test_remote_shape_omitted_directory_selects_verified_native_root(self):
+        self.setup_native_projects()
+        result = self.native_create()
+        self.assertEqual(self.sessions[result['session_id']]['location'], {'directory': self.other})
+        self.assertEqual(self.sessions[result['session_id']]['model'], self.config['model'])
+        self.assertFalse(result['inference_started'])
+        self.assertEqual(self.native_create(), result)
+        self.sessions[result['session_id']]['metadata']['openchamber'] = {'work': {'state': 'open', 'openedAt': 1}}
+        self.assertEqual(self.native_create(), result)
+        self.sessions[result['session_id']]['metadata']['workrelayBinding'] = 'changed'
+        with self.assertRaises(BridgeError): self.native_create()
+        self.assertEqual(sum(m == 'POST' for m, _, _ in self.calls), 1)
+        with self.assertRaises(BridgeError): self.native_create(directory=self.directory)
+        with self.assertRaises(BridgeError):
+            create_session(self.db, self.config, self, self.authorize, 'lower-scope', title='Lower scoped', project_id='other')
+
+    def test_native_scope_wrong_authority_and_traversal_symlink_denied(self):
+        self.setup_native_projects()
+        with self.assertRaises(BridgeError): self.native_create('wrong-authority', authorize_native_projects=lambda: 'b' * 64)
+        with self.assertRaises(BridgeError): self.native_create('traversal', directory=self.other + '/../other-project')
+        link = Path(self.directory) / 'linked'; link.symlink_to(self.other, target_is_directory=True)
+        self.config['managed_allowed_directories'] = [str(link)]
+        with self.assertRaises(BridgeError): self.native_create('explicit-symlink', directory=str(link))
+        self.project_records[1]['canonical'] = str(link)
+        with self.assertRaises(BridgeError): self.native_create('native-symlink')
+        self.assertFalse(any(m == 'POST' for m, _, _ in self.calls))
+
+    def test_native_project_change_before_post_denied_and_old_denial_immutable(self):
+        self.setup_native_projects()
+        original = self.request; count = 0
+        def request(method, path, body=None):
+            nonlocal count
+            if path == '/api/project':
+                count += 1
+                if count > 1: return [{'id': 'other', 'canonical': self.directory}]
+            return original(method, path, body)
+        self.request = request
+        with self.assertRaises(BridgeError): self.native_create()
+        self.assertEqual(self.db.execute("SELECT phase FROM managed_operations WHERE operation='native'").fetchone()[0], 'denied')
+        before = self.db.execute('SELECT * FROM managed_operations').fetchall()
+        self.request = original
+        self.assertEqual(self.native_create()['phase'], 'denied')
+        self.assertEqual(self.db.execute('SELECT * FROM managed_operations').fetchall(), before)
+        self.assertFalse(any(m == 'POST' for m, _, _ in self.calls))
+
+    def test_native_uncertain_creation_not_replayed(self):
+        self.setup_native_projects(); self.timeout = True
+        with self.assertRaises(BridgeError): self.native_create()
+        self.assertEqual(self.native_create()['phase'], 'created')
+        self.assertEqual(sum(m == 'POST' for m, _, _ in self.calls), 1)
+
+    def test_early_denials_bind_raw_arguments_before_project_or_path_validation(self):
+        self.setup_native_projects()
+        cases = [('unknown-project', {'project_id': 'missing'}, {'project_id': 'other'}),
+                 ('invalid-path', {'directory': self.other + '/../other-project'}, {'directory': self.other}),
+                 ('missing-path', {'directory': self.other + '/not-present'}, {'directory': self.other})]
+        for op, bad, corrected in cases:
+            with self.subTest(op=op):
+                with self.assertRaises(BridgeError): self.native_create(op, **bad)
+                before = self.db.execute('SELECT * FROM managed_operations WHERE operation=?', (op,)).fetchall()
+                self.assertEqual(before[0][6], 'denied')
+                self.assertTrue(before[0][4].startswith('args-v2:'))
+                with self.assertRaisesRegex(BridgeError, 'operation conflict'):
+                    self.native_create(op, **corrected)
+                self.assertEqual(self.native_create(op, **bad)['phase'], 'denied')
+                observed = inspect_operation(self.db, self.config, self, self.authorize, None, op)
+                self.assertEqual(observed['effect'], 'not_applied')
+                self.assertEqual(self.db.execute('SELECT * FROM managed_operations WHERE operation=?', (op,)).fetchall(), before)
+        self.assertFalse(any(m == 'POST' for m, _, _ in self.calls))
+
+    def test_prevalidation_reservation_serializes_same_and_changed_arguments(self):
+        self.setup_native_projects(); original = self.request; observed = []
+        def request(method, path, body=None):
+            if path == '/api/project' and not observed:
+                observed.append(self.native_create())
+                with self.assertRaisesRegex(BridgeError, 'operation conflict'):
+                    self.native_create(title='Changed while validation pending')
+            return original(method, path, body)
+        self.request = request
+        self.native_create()
+        self.assertEqual(observed[0]['phase'], 'reserved')
+        self.assertEqual(sum(m == 'POST' for m, _, _ in self.calls), 1)
+
+    def test_actual_create_reservation_death_recovers_only_identical_attempt(self):
+        self.setup_native_projects()
+        path = Path(self.directory) / 'create-crash.sqlite'
+        def child():
+            db = sqlite3.connect(path, isolation_level=None)
+            create_session(db, self.config, self, self.authorize, 'create-crashed',
+                title='Bounded crash fixture', project_id='other', authorize_native_projects=lambda: os._exit(74))
+        process = multiprocessing.get_context('fork').Process(target=child)
+        process.start(); process.join(10)
+        if process.is_alive():
+            process.terminate(); process.join(); self.fail('crash fixture did not exit')
+        self.assertEqual(process.exitcode, 74)
+        db = sqlite3.connect(path, isolation_level=None)
+        try:
+            before = db.execute('SELECT digest,identity,phase,reservation_pid FROM managed_operations').fetchone()
+            self.assertEqual(before[1:3], ('{}', 'reserved'))
+            self.assertTrue(reservation_owner_dead(before[3]))
+            with self.assertRaisesRegex(BridgeError, 'operation conflict'):
+                create_session(db, self.config, self, self.authorize, 'create-crashed',
+                    title='Different', project_id='other', authorize_native_projects=self.authorize)
+            self.assertEqual(db.execute('SELECT digest,identity,phase,reservation_pid FROM managed_operations').fetchone(), before)
+            result = create_session(db, self.config, self, self.authorize, 'create-crashed',
+                title='Bounded crash fixture', project_id='other', authorize_native_projects=self.authorize)
+            self.assertEqual(result['phase'], 'created')
+            self.assertEqual(sum(m == 'POST' for m, _, _ in self.calls), 1)
+        finally: db.close()
+
+    def test_malformed_or_unauthorized_request_explicitly_unbound(self):
+        for bad in ({'title': 'x' * 161}, {'directory': 'x' * 4097}, {'project_id': None}):
+            with self.assertRaises(BridgeError): self.create(**bad)
+        self.binding = None
+        with self.assertRaises(BridgeError): self.create()
+        self.assertFalse(self.db.execute("SELECT 1 FROM sqlite_master WHERE name='managed_operations'").fetchone())
+        self.assertEqual(self.calls, [])
+
+    def test_legacy_create_body_digest_inspection_only_no_rebinding(self):
+        result = self.create()
+        self.db.execute("UPDATE managed_operations SET digest=?", ('0' * 64,))
+        before = self.db.execute('SELECT * FROM managed_operations').fetchall()
+        with self.assertRaisesRegex(BridgeError, 'legacy create arguments unavailable'):
+            self.create()
+        self.assertEqual(inspect_operation(self.db, self.config, self, self.authorize, None, 'create1')['phase'], 'created_observed')
+        self.assertEqual(self.db.execute('SELECT * FROM managed_operations').fetchall(), before)
         self.assertEqual(sum(m == 'POST' for m, _, _ in self.calls), 1)
 
 

@@ -1,6 +1,7 @@
 // Private in-process credential handoff from the installed @opencode/client.
 // JSON body arrives via stdin; credentials and request text never enter argv.
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync, statSync, realpathSync } from 'node:fs';
+import { isAbsolute, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { createHash, timingSafeEqual } from 'node:crypto';
@@ -200,11 +201,30 @@ print(json.dumps(r))`;
         if (row[0] === 'create') {
           const body = JSON.parse(row[4]);
           const allowed = config.managed_allowed_directories ?? [config.directory];
+          const projectsResponse = await fetch(new URL('/api/project', endpoint.url), { headers, redirect: 'manual', signal: AbortSignal.timeout(5000) });
+          if (!projectsResponse.ok) return false;
+          const projects = await boundedJSON(projectsResponse);
+          if (!Array.isArray(projects) || projects.length > 10000) return false;
+          const selected = projects.filter(project => project?.id === row[2]);
+          if (selected.length !== 1 || typeof selected[0].canonical !== 'string') return false;
+          const root = selected[0].canonical, directory = body.location?.directory;
+          if (!isAbsolute(root) || realpathSync(root) !== root || !statSync(root).isDirectory() ||
+              typeof directory !== 'string' || !isAbsolute(directory) || realpathSync(directory) !== directory || !statSync(directory).isDirectory()) return false;
+          const within = (parent, child) => { const rel = relative(parent, child); return !isAbsolute(rel) && rel !== '..' && !rel.startsWith('../'); };
+          if (!within(root, directory)) return false;
+          const candidates = projects.filter(project => typeof project?.canonical === 'string' && within(project.canonical, directory));
+          candidates.sort((a, b) => b.canonical.length - a.canonical.length);
+          if (candidates[0]?.id !== row[2]) return false;
+          const rootHash = body.metadata?.workrelayProjectRootHash;
+          const scopedNativeRoot = rootHash !== undefined && root !== '/' && directory === root &&
+            rootHash === createHash('sha256').update(root).digest('hex');
+          const scopedProfile = Array.isArray(allowed) && allowed.includes(directory) &&
+            (rootHash === undefined || rootHash === createHash('sha256').update(root).digest('hex'));
           return request.path === '/api/session' && body.id === sid &&
             isDeepStrictEqual(request.body, body) && isDeepStrictEqual(body.model, config.model) &&
-            body.agent === (config.agent ?? 'quick-builder') && Array.isArray(allowed) && allowed.includes(body.location?.directory) &&
+            body.agent === (config.agent ?? 'quick-builder') && (scopedNativeRoot || scopedProfile) &&
             fields(body, ['id', 'title', 'location', 'model', 'agent', 'metadata']) &&
-            fields(body.location, ['directory']) && fields(body.metadata, ['workrelayBinding', 'workrelayOperation']) &&
+            fields(body.location, ['directory']) && fields(body.metadata, rootHash === undefined ? ['workrelayBinding', 'workrelayOperation'] : ['workrelayBinding', 'workrelayOperation', 'workrelayProjectRootHash']) &&
             body.metadata.workrelayBinding === binding && body.metadata.workrelayOperation === authority.operation_id;
         }
         if (row[0] === 'queue' || row[0] === 'steer') {
@@ -220,7 +240,7 @@ print(json.dumps(r))`;
         return hash === row[4];
       },
     });
-  return reader(input.path === '/__managed/authorize' && input.method === 'GET' && input.body === null ? 'authorize' : 'internal', input, authority.claims);
+  return reader(['/__managed/authorize', '/__managed/authorize-create-project'].includes(input.path) && input.method === 'GET' && input.body === null ? 'authorize' : 'internal', input, authority.claims);
 }
 
 try {

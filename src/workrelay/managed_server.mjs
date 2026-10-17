@@ -1,7 +1,7 @@
 // Explicit managed-registration authority; no session mutation or inference routes.
 import { realpathSync, lstatSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { dirname } from 'node:path';
+import { dirname, relative, isAbsolute } from 'node:path';
 import { createHash } from 'node:crypto';
 
 const sid = /^ses[A-Za-z0-9_-]{1,160}$/;
@@ -88,7 +88,7 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       if (JSON.stringify(readBinding()) !== JSON.stringify(binding)) deny();
       const before = stat(binding.service_registration);
       if (before.dev !== registration.dev || before.ino !== registration.ino || before.mtimeMs !== registration.mtimeMs) deny();
-    } else if (action === 'projects' || action === 'agents' || action === 'resolve_project') {
+    } else if (action === 'projects' || action === 'agents' || action === 'resolve_project' || action === 'creation_target') {
       path = action === 'agents' ? '/api/agent' : '/api/project';
     } else if (action === 'messages') {
       if (!sid.test(input.session_id ?? '') || selectedSession !== input.session_id) deny();
@@ -153,6 +153,20 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       return { server_id: managedServerID(binding), items, next_cursor: next };
     }
     if (action === 'internal') return value;
+    if (action === 'creation_target') {
+      if (!Array.isArray(value) || value.length > 10000 || typeof input.directory !== 'string' || !isAbsolute(input.directory)) deny();
+      const directory = canonical(input.directory);
+      const matches = value.filter(project => {
+        if (typeof project?.id !== 'string' || !project.id.length || project.id.length > 160 || typeof project.canonical !== 'string' || !isAbsolute(project.canonical)) return false;
+        const distance = relative(project.canonical, directory);
+        return distance === '' || distance !== '..' && !distance.startsWith('../') && !isAbsolute(distance);
+      }).sort((a, b) => b.canonical.length - a.canonical.length);
+      if (!matches.length || matches.length > 1 && matches[0].canonical === matches[1].canonical) return { available: false,
+        reason: 'NO_UNAMBIGUOUS_APPROVED_PROJECT', guidance: 'Operator must align the configured creation workspace with a registered project. Discovery is not creation authorization.' };
+      return { available: true, target: 'configured_default_workspace', project_id: 'project_' + createHash('sha256').update(matches[0].id).digest('hex'),
+        label: managedText(matches[0].name, 200).text || 'Configured creation project',
+        guidance: 'Optional default-project helper, not the only allowed project. Omit directory to select this native project canonical root, which may differ from the configured workspace subdirectory. Other discovered native projects remain selectable by the pinned server-wide principal. Never change arguments on a denied operation ID; native checks still apply.' };
+    }
     if (action === 'resolve_project') {
       if (!/^project_[a-f0-9]{64}$/.test(input.project_id ?? '') || !Array.isArray(value) || value.length > 10000) deny();
       const match = value.find(project => typeof project?.id === 'string' && project.id.length <= 160 &&
@@ -169,7 +183,9 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       const items = records.map(record => {
         if (!record || typeof record.id !== 'string' || !record.id.length || record.id.length > 160) deny();
         const id = (action === 'projects' ? 'project_' : 'agent_') + createHash('sha256').update(record.id).digest('hex');
-        return action === 'projects' ? { project_id: id, label: managedText(record.name, 200).text || `Project ${id.slice(-8)}` } :
+        return action === 'projects' ? { project_id: id, label: managedText(record.name, 200).text || `Project ${id.slice(-8)}`,
+          actions: [{ tool: 'workrelay_server_create', arguments: { project_id: id }, requires: ['operation_id', 'title'],
+            guidance: 'Omit directory for the verified native project root. Creation remains subject to current managed authority, financial admission and native permissions.' }] } :
           { agent_id: id, label: managedText(record.name, 200).text || `Agent ${id.slice(-8)}`, description: managedText(record.description, 1000),
             mode: ['primary', 'subagent', 'all'].includes(record.mode) ? record.mode : 'unknown', hidden: record.hidden === true,
             kind: 'agent_definition', execution: false };

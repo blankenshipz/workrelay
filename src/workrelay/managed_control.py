@@ -207,46 +207,87 @@ def creation_session_id(binding, operation_id):
     return 'ses_workrelay_' + hashlib.sha256((binding + '\0create\0' + operation_id).encode()).hexdigest()[:32]
 
 
-def create_body(config, binding, operation_id, directory, title):
+def create_body(config, binding, operation_id, directory, title, *, verified_project_root=None):
     require(isinstance(directory, str) and Path(directory).is_dir() and str(Path(directory).resolve()) == directory,
             'canonical existing workspace required')
     allowed = config.get('managed_allowed_directories', [config.get('directory')])
-    require(isinstance(allowed, list) and directory in allowed, 'workspace not authorized for creation')
+    require(isinstance(allowed, list) and (directory in allowed or directory == verified_project_root), 'workspace not authorized for creation')
     require(isinstance(title, str) and 0 < len(title.strip()) <= 160 and not any(ord(c) < 32 for c in title), 'invalid title')
     require(config.get('agent', 'quick-builder') in ('quick-builder', 'builder') and
             isinstance(config.get('model'), dict) and config['model'].get('providerID') == 'openai', 'invalid attested create route')
+    metadata = {'workrelayOperation': operation_id, 'workrelayBinding': binding}
+    if verified_project_root is not None:
+        metadata['workrelayProjectRootHash'] = hashlib.sha256(verified_project_root.encode()).hexdigest()
     return {'id': creation_session_id(binding, operation_id), 'title': title,
             'location': {'directory': directory}, 'model': config['model'],
             'agent': config.get('agent', 'quick-builder'),
-            'metadata': {'workrelayOperation': operation_id, 'workrelayBinding': binding}}
+            'metadata': metadata}
 
 
-def create_session(db, config, client, authorize, operation_id, *, directory, title, project_id):
-    """Create an isolated root session, never fork/adopt/replace an existing owner.
+def validated_create_target(config, binding, operation_id, directory, title, project_id, authorize_native_projects, get):
+    """Fallible project/path policy runs only AFTER durable argument reservation."""
+    project_root = None
+    if authorize_native_projects is not None:
+        require(callable(authorize_native_projects) and authorize_native_projects() == binding, 'server-wide project authority required')
+        projects = get('/api/project')
+        require(isinstance(projects, list) and len(projects) <= 10000, 'native project inventory unavailable')
+        matches = [p for p in projects if isinstance(p, dict) and p.get('id') == project_id]
+        require(len(matches) == 1, 'selected native project unavailable or ambiguous')
+        project_root = matches[0].get('canonical')
+        require(isinstance(project_root, str) and Path(project_root).is_absolute() and Path(project_root).is_dir() and
+                str(Path(project_root).resolve()) == project_root, 'native project canonical directory unavailable')
+        # A native global project is not a filesystem wildcard. Explicit profile
+        # allowlisted locations still work within it; root itself is not inferred.
+        if directory is None:
+            require(project_root != '/', 'global project requires an explicit profile-authorized workspace')
+            directory = project_root
+        require(Path(directory).is_relative_to(Path(project_root)), 'workspace does not belong to selected discovered project')
+        roots = [p for p in projects if isinstance(p, dict) and isinstance(p.get('canonical'), str) and
+                 Path(directory).is_relative_to(Path(p['canonical']))]
+        require(roots and max(roots, key=lambda p: len(p['canonical'])).get('id') == project_id,
+                'workspace belongs to a different native project')
+    elif directory is None:
+        directory = config.get('directory')
+    body = create_body(config, binding, operation_id, directory, title,
+                       verified_project_root=project_root if project_root != '/' else None)
+    return body, project_root, directory
 
-    Creation does not run inference. A later message/steer uses normal admission.
-    A sending/uncertain POST is reconciled by exact ID, never blindly replayed.
+
+def create_session(db, config, client, authorize, operation_id, *, directory=None, title, project_id, authorize_native_projects=None):
+    """Reserve bounded attempted arguments before fallible semantic validation.
+
+    Malformed/unbounded or unauthenticated requests are unbound rejections. Every
+    safely bounded authenticated attempt is immutable, including pre-POST denial.
+    Legacy rows have only a derived-body digest: inspect remains supported, but
+    create retries fail closed rather than guessing omitted original arguments.
     """
-    binding = authorize()
-    body = create_body(config, binding, operation_id, directory, title)
+    binding = authorize(); sid = creation_session_id(binding, operation_id)
     require(isinstance(project_id, str) and 0 < len(project_id) <= 200, 'explicit discovered project required')
-    sid = body['id']
+    require(isinstance(title, str) and 0 < len(title) <= 160, 'bounded title required')
+    require(directory is None or isinstance(directory, str) and 0 < len(directory) <= 4096, 'bounded directory required')
     def check():
         require(authorize() == binding, 'authority changed')
     def get(path):
         check(); result = client.request('GET', path); check(); return result
     def verified(session):
         require(isinstance(session, dict) and session.get('id') == sid and session.get('projectID') == project_id and
-                all(session.get(k) == body[k] for k in ('location', 'model', 'agent', 'metadata')) and
-                not session.get('parentID'), 'created session identity mismatch')
+                all(session.get(k) == body[k] for k in ('location', 'model', 'agent')) and
+                protected_metadata(session.get('metadata')) == protected_metadata(body['metadata']) and
+                session.get('permissions') == body.get('permissions') and not session.get('parentID'), 'created session identity mismatch')
     require(db.isolation_level is None, 'durable autocommit ledger required')
     db.execute('PRAGMA synchronous=FULL'); initialize(db)
-    digest = hashlib.sha256(json.dumps({'body': body, 'project_id': project_id}, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    attempted = {'directory': directory, 'title': title, 'project_id': project_id,
+                 'model': config.get('model'), 'agent': config.get('agent', 'quick-builder'),
+                 'scope': 'native_projects' if authorize_native_projects is not None else 'profile',
+                 'profile_default': config.get('directory')}
+    digest = 'args-v2:' + hashlib.sha256(json.dumps(attempted, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    check()
     db.execute('BEGIN IMMEDIATE')
     try:
-        row = db.execute('SELECT kind,digest,phase,reservation_pid FROM managed_operations WHERE binding=? AND session=? AND operation=?',
-                         (binding, sid, operation_id)).fetchone()
+        row = db.execute('SELECT kind,digest,phase,reservation_pid,identity FROM managed_operations WHERE binding=? AND session=? AND operation=?',
+                          (binding, sid, operation_id)).fetchone()
         if row:
+            require(row[1].startswith('args-v2:'), 'legacy create arguments unavailable; inspect original operation')
             require(row[0] == 'create' and row[1] == digest, 'operation conflict')
             recover = row[2] == 'reserved' and reservation_owner_dead(row[3])
             if recover:
@@ -257,15 +298,22 @@ def create_session(db, config, client, authorize, operation_id, *, directory, ti
             maximum = config.get('managed_max_pending_creations', 4)
             require(type(maximum) is int and 1 <= maximum <= 20, 'invalid creation capacity')
             pending = db.execute("SELECT COUNT(*) FROM managed_operations WHERE binding=? AND kind='create' AND phase IN ('reserved','sending','uncertain')", (binding,)).fetchone()[0]
-            require(pending < maximum, 'creation capacity reached; reconcile pending operations')
             db.execute('INSERT INTO managed_operations VALUES(?,?,?,?,?,?,?,?,?)',
-                       (binding, sid, operation_id, 'create', digest, project_id, 'reserved', json.dumps(body, sort_keys=True, separators=(',', ':')), os.getpid()))
+                       (binding, sid, operation_id, 'create', digest, project_id,
+                        'reserved' if pending < maximum else 'denied', '{}', os.getpid()))
+            if pending >= maximum:
+                db.execute('COMMIT')
+                raise BridgeError('creation capacity reached; reconcile pending operations')
         db.execute('COMMIT')
     except Exception:
-        db.execute('ROLLBACK'); raise
+        if db.in_transaction:
+            db.execute('ROLLBACK')
+        raise
     phase = row[2] if row else 'reserved'
     if not recover:
         if phase in ('sending', 'uncertain', 'created'):
+            body = json.loads(row[4])
+            require(isinstance(body, dict) and body.get('id') == sid, 'validated creation body unavailable')
             found = get('/api/session/' + sid)
             if found is not None:
                 verified(found.get('data'))
@@ -275,10 +323,22 @@ def create_session(db, config, client, authorize, operation_id, *, directory, ti
                 require(phase != 'created', 'created session disappeared; refusing to recreate')
         return {'operation_id': operation_id, 'session_id': sid, 'phase': phase, 'inference_started': False}
     try:
+        body, project_root, directory = validated_create_target(config, binding, operation_id, directory,
+            title, project_id, authorize_native_projects, get)
+        encoded_body = json.dumps(body, sort_keys=True, separators=(',', ':'))
+        require(not row or row[4] == '{}' or row[4] == encoded_body, 'creation target changed')
+        check()
+        db.execute('UPDATE managed_operations SET identity=? WHERE binding=? AND session=? AND operation=?',
+                   (encoded_body, binding, sid, operation_id))
         projects = get('/api/project')
         require(isinstance(projects, list) and any(isinstance(p, dict) and p.get('id') == project_id and
                 isinstance(p.get('canonical'), str) and Path(directory).is_relative_to(Path(p['canonical'])) for p in projects),
-                'workspace does not belong to selected discovered project')
+                 'workspace does not belong to selected discovered project')
+        if authorize_native_projects is not None:
+            require(authorize_native_projects() == binding and any(isinstance(p, dict) and p.get('id') == project_id and
+                    p.get('canonical') == project_root for p in projects) and
+                    str(Path(project_root).resolve()) == project_root and str(Path(directory).resolve()) == directory,
+                    'native project identity changed')
         require(get('/api/session/' + sid) is None, 'creation identity already exists')
         check()
     except Exception:
@@ -295,18 +355,79 @@ def create_session(db, config, client, authorize, operation_id, *, directory, ti
     return {'operation_id': operation_id, 'session_id': sid, 'phase': 'created', 'inference_started': False}
 
 
+def resolve_operation(db, authorize, operation_id, session_id=None):
+    """Resolve within a freshly verified principal/server binding, never globally.
+
+    An operation ID reused on different sessions is ambiguous without a selected
+    session. No titles, prompt text, digests or other principals are disclosed.
+    """
+    binding = authorize(); creation_session_id(binding, operation_id)
+    initialize(db)
+    if session_id is not None:
+        require(isinstance(session_id, str) and bool(re.fullmatch(r'ses[A-Za-z0-9_-]{1,160}', session_id)), 'invalid session')
+        rows = db.execute('SELECT session,kind,digest,message,phase,identity FROM managed_operations WHERE binding=? AND operation=? AND session=? LIMIT 2',
+                          (binding, operation_id, session_id)).fetchall()
+    else:
+        rows = db.execute('SELECT session,kind,digest,message,phase,identity FROM managed_operations WHERE binding=? AND operation=? LIMIT 2',
+                          (binding, operation_id)).fetchall()
+    require(authorize() == binding, 'authority changed')
+    require(len(rows) == 1, 'unknown or ambiguous operation for this principal; supply original session if ambiguous')
+    sid, *row = rows[0]
+    if row[0] == 'create':
+        require(sid == creation_session_id(binding, operation_id), 'creation ledger identity mismatch')
+    return binding, sid, row
+
+
+class ControlFailure(BridgeError):
+    def __init__(self, details):
+        super().__init__('managed control rejected; inspect original operation ID without retrying a write')
+        self.control_details = details
+
+
+def classified_failure(db, authorize, operation_id, session_id, error):
+    """Safe diagnostics based on durable phase, never upstream exception bodies."""
+    details = {'code': 'CONTROL_AUTHORIZATION_OR_VALIDATION_DENIED', 'effect': 'not_established'}
+    if isinstance(operation_id, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,80}', operation_id):
+        details['operation_id'] = operation_id
+    try:
+        _, sid, row = resolve_operation(db, authorize, operation_id, session_id)
+        phase = row[3]
+        details.update(session_id=sid, phase=phase)
+        if phase in ('reserved', 'denied'):
+            details.update(code='CONTROL_NOT_SENT', effect='no_post_permitted')
+        elif phase in ('sending', 'uncertain'):
+            details.update(code='CONTROL_UNCERTAIN', effect='may_have_been_applied')
+        else:
+            details.update(code='CONTROL_RECONCILE_EXISTING', effect='recorded_existing_operation')
+    except Exception:
+        pass  # No global lookup or guessed session if authority/identity is unknown.
+    if isinstance(error, BridgeError) and str(error) == 'workspace does not belong to selected discovered project':
+        details['reason'] = 'PROJECT_WORKSPACE_MISMATCH'
+    elif isinstance(error, BridgeError) and str(error) == 'operation conflict':
+        details['reason'] = 'OPERATION_ARGUMENT_CONFLICT'
+    return ControlFailure(details)
+
+
 def inspect_operation(db, config, client, authorize, session_id, operation_id):
     """Read/reconcile a known principal-bound operation without prompt text or inference."""
-    binding = authorize(); creation_session_id(binding, operation_id)
-    require(isinstance(session_id, str) and bool(re.fullmatch(r'ses[A-Za-z0-9_-]{1,160}', session_id)), 'invalid session')
-    initialize(db)
-    row = db.execute('SELECT kind,digest,message,phase,identity FROM managed_operations WHERE binding=? AND session=? AND operation=?',
-                     (binding, session_id, operation_id)).fetchone()
-    require(row is not None, 'unknown operation for this principal')
+    binding, session_id, row = resolve_operation(db, authorize, operation_id, session_id)
     phase = row[3]
     def get(path):
         require(authorize() == binding, 'authority changed'); result = client.request('GET', path)
         require(authorize() == binding, 'authority changed'); return result
+    session_exists = None
+    if row[0] == 'create':
+        remote = get('/api/session/' + session_id)
+        session_exists = remote is not None
+        if session_exists:
+            data = remote.get('data') if isinstance(remote, dict) else None
+            body = json.loads(row[4])
+            require(isinstance(data, dict) and data.get('id') == session_id and data.get('projectID') == row[2] and
+                    all(data.get(k) == body.get(k) for k in ('location', 'agent', 'model', 'permissions')) and not data.get('parentID') and
+                    protected_metadata(data.get('metadata')) == protected_metadata(body.get('metadata')),
+                    'created session identity mismatch')
+            require(phase not in ('reserved', 'denied'), 'session exists despite no-POST phase; operator review required')
+            phase = 'created_observed'
     if row[0] in ('queue', 'steer') and phase in ('sending', 'uncertain', 'queued', 'steering', 'queued_observed'):
         remote = get('/api/session/' + session_id)
         require(identity(remote.get('data') if isinstance(remote, dict) else None, session_id) == row[4], 'session identity changed')
@@ -320,6 +441,8 @@ def inspect_operation(db, config, client, authorize, session_id, operation_id):
                 phase = 'queued_observed'
     require(authorize() == binding, 'authority changed')
     return {'operation_id': operation_id, 'session_id': session_id, 'kind': row[0], 'phase': phase,
+            'recorded_phase': row[3], 'exact_session_exists': session_exists,
+            'effect': ('created_observed' if session_exists else 'not_applied' if row[3] in ('reserved', 'denied') else 'unknown') if row[0] == 'create' else 'not_evaluated',
             'message_id': row[2] if row[0] in ('queue', 'steer') else None,
             'task_outcome': 'unverified', 'cancellation_is_rollback': False,
             'queued_inputs_removed': False}
