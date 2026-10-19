@@ -57,3 +57,13 @@ test('current execution kinds carry only scoped native generation before reconci
   const result = await source.consume(); assert.equal(result.scoped_wakes, 2); assert.equal(result.native_kinds['session.execution.succeeded'], 1);
   assert.deepEqual(order, ['reconcile', 'session.execution.started', 'reconcile', 'session.execution.succeeded', 'reconcile', 'reconcile']);
 });
+
+test('subscription readiness follows connection and initial reconciliation, never failed admission', async () => {
+  const order = [];
+  const config = { serverId: server, authorize: async () => true, reconcile: async () => { order.push('reconcile'); }, openStream: async () => { order.push('connected'); return { server_id: server, response: response('') }; } };
+  await createManagedEventSource(config).consume({ onReady: async () => { order.push('ready'); } });
+  assert.deepEqual(order, ['connected', 'reconcile', 'ready', 'reconcile']);
+  let ready = false;
+  await assert.rejects(createManagedEventSource({ ...config, authorize: async () => false }).consume({ onReady: () => { ready = true; } }));
+  assert.equal(ready, false);
+});

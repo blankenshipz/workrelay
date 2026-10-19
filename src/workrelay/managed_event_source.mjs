@@ -21,8 +21,9 @@ export function createManagedEventSource({ serverId, openStream, authorize, reco
   if (!validServer(serverId) || [openStream, authorize, reconcile, isSubscribed].some(fn => typeof fn !== 'function')) throw error('missing_bound_source');
   async function admitted() { try { if (await authorize() === true) return; } catch {} throw error('source_authority_revoked'); }
   return {
-    async consume({ signal, durationMs = 10000 } = {}) {
+    async consume({ signal, durationMs = 10000, onReady } = {}) {
       if (!Number.isInteger(durationMs) || durationMs < 10 || durationMs > 60000) throw error('invalid_source_bounds');
+      if (onReady !== undefined && typeof onReady !== 'function') throw error('invalid_source_bounds');
       const controller = new AbortController(), abort = () => controller.abort();
       const timer = setTimeout(abort, durationMs); signal?.addEventListener('abort', abort, { once: true }); if (signal?.aborted) abort();
       let reader; controller.signal.addEventListener('abort', () => { void reader?.cancel().catch(() => {}); }, { once: true });
@@ -33,6 +34,10 @@ export function createManagedEventSource({ serverId, openStream, authorize, reco
         const opened = await openStream({ signal: controller.signal });
         if (opened?.server_id !== serverId || opened.response?.status !== 200 || !opened.response.headers.get('content-type')?.toLowerCase().startsWith('text/event-stream') || opened.response.redirected) { await opened?.response?.body?.cancel(); throw error('invalid_native_stream'); }
         result.connected = true; await sync(); reader = opened.response.body.getReader();
+        // Per-run readiness for the gateway subscription ACK: connected AND initial
+        // reconciliation completed. The gateway must await real work, not drop a
+        // busy tick and falsely consider that skipped reconciliation ready.
+        await onReady?.();
         const decoder = new TextDecoder('utf-8', { fatal: true }); let pending = '', bytes = 0;
         async function frame(text) {
           if (Buffer.byteLength(text) > maxFrameBytes) throw error('source_frame_too_large');

@@ -165,11 +165,21 @@ export function isPublicAddress(address) {
  * redirects, proxy environment, connection pooling, or second unvalidated DNS resolution.
  */
 // getaddrinfo can hide AAAA-only records when AI_ADDRCONFIG filters unavailable
-// address families. Query the SAME configured DNS resolver only on no-answer OS
-// lookup; never substitute public DNS/proxy or bypass rejected/private answers.
+// address families. Query the SAME configured DNS resolver on no-answer OS
+// lookup, or for A records when OS lookup returns only IPv6. Never substitute
+// public DNS/proxy or bypass rejected/private answers.
 export function createCallbackResolver({ osLookup = lookup, ipv4 = resolve4, ipv6 = resolve6 } = {}) {
   return async (hostname, options) => {
-    try { return await osLookup(hostname, options); }
+    try {
+      const addresses = await osLookup(hostname, options);
+      // Preserve every OS answer for transport validation. Do not supplement an
+      // already unsafe/malformed answer set or hide it behind a public A record.
+      if (Array.isArray(addresses) && addresses.length && addresses.every(x => x.family === 6 && isIP(x.address) === 6 && isPublicAddress(x.address))) {
+        try { return [...addresses, ...(await ipv4(hostname)).map(address => ({ address, family: 4 }))]; }
+        catch { /* AAAA-only destinations remain supported with the original set. */ }
+      }
+      return addresses;
+    }
     catch (cause) {
       if (!['ENOTFOUND', 'EAI_AGAIN'].includes(cause?.code)) throw cause;
       const results = await Promise.allSettled([ipv4(hostname), ipv6(hostname)]);
@@ -195,7 +205,10 @@ export function createPinnedWebhookTransport({ resolve = createCallbackResolver(
         const addresses = await resolve(u.hostname, { all: true, verbatim: true });
         if (expired) throw failure('timeout');
         if (!Array.isArray(addresses) || !addresses.length || addresses.some(x => !isPublicAddress(x.address) || isIP(x.address) !== x.family)) throw failure('non_public_address');
-        const pinned = addresses[0];
+        // Prefer IPv4 on hosts with DNS-visible but unroutable IPv6. Validate ALL
+        // answers above, then make exactly one pinned HTTPS attempt: no second
+        // POST/challenge after an ambiguous timeout or TLS failure.
+        const pinned = addresses.find(x => x.family === 4) ?? addresses[0];
         phase = 'connect';
         return await new Promise((accept, reject) => {
           req = request(u, { method: 'POST', agent: false, servername: u.hostname, rejectUnauthorized: true, minVersion: 'TLSv1.2',
@@ -313,6 +326,62 @@ export function createEventsService({ statePath, principal, authorize, observeMa
       delivered: sub.delivery?.delivered ?? 0, dropped: sub.delivery?.dropped ?? 0, last_attempt_at: sub.delivery?.last_attempt_at ?? null,
       last_ack_at: sub.delivery?.last_ack_at ?? null, last_http_status: sub.delivery?.last_http_status ?? null };
   }
+  async function candidate(state, p, { id, task, filter, url }) {
+    const old = state.subscriptions[id];
+    requireValue(Object.keys(state.subscriptions).length < 256 || old, 'subscription_limit');
+    const sub = { id, principal, task, name: p.name, createdAt: old?.createdAt ?? now(), filter,
+      observations: structuredClone(old?.observations ?? {}), nativeEvents: structuredClone(old?.nativeEvents ?? {}), scanCursor: old?.scanCursor ?? null,
+      ...(old?.delivery ? { delivery: structuredClone(old.delivery) } : {}), url, secret: p.delivery.secret,
+      expires: now() + Math.min(p.ttlMs ?? ttlMs, maxTtlMs), verifiedUntil: old?.verifiedUntil || 0 };
+    if (old && old.secret !== sub.secret) { sub.previousSecret = old.secret; sub.rotationUntil = now() + rotationMs; }
+    else if (old?.rotationUntil > now()) { sub.previousSecret = old.previousSecret; sub.rotationUntil = old.rotationUntil; }
+    if (!old || old.secret !== sub.secret || old.verifiedUntil <= now()) {
+      const challenge = randomBytes(32).toString('base64url');
+      const response = await signed(sub, JSON.stringify({ type: 'verification', challenge }), 'msg_verification_' + randomBytes(16).toString('hex'));
+      let echoed; try { echoed = JSON.parse(response.body).challenge; } catch {}
+      if (!Number.isInteger(response.status) || response.status < 200 || response.status >= 300 || typeof echoed !== 'string' || Buffer.byteLength(echoed) !== Buffer.byteLength(challenge) || !timingSafeEqual(Buffer.from(echoed), Buffer.from(challenge))) throw failure('challenge_failed');
+      sub.verifiedUntil = now() + verificationTtlMs;
+    }
+    return sub;
+  }
+  function validatePage(page, filter, cursor) {
+    requireValue(page?.server_id === filter.server_id && Array.isArray(page.items) && page.items.length <= 10 &&
+      (page.next_cursor === null || typeof page.next_cursor === 'string' && page.next_cursor.length > 0 && page.next_cursor.length <= 4096 && page.next_cursor !== cursor), 'invalid_observation');
+    for (const item of page.items) requireValue(sessionId(item.session_id) && (!filter.session_id || item.session_id === filter.session_id) &&
+      ['succeeded', 'failed', 'interrupted', 'needs_input', 'unknown', 'running', 'retrying', 'idle'].includes(item.state) && Array.isArray(item.decisions) && item.decisions.length <= 1000 && item.decisions.every(id => /^per[A-Za-z0-9_-]{1,160}$/.test(id)), 'invalid_observation');
+  }
+  const resultFor = sub => ({ id: sub.id, refreshBefore: new Date(sub.expires).toISOString(), cursor: null, truncated: false });
+  function recoverPending(state, sub) {
+    if (sub.managedPending?.deadline <= Date.now()) {
+      if (sub.managedPending.isNew) { drop(state, sub.id); return false; }
+      delete sub.managedPending;
+    }
+    return true;
+  }
+  function applyManagedPage(state, sub, page) {
+    for (const item of page.items) {
+      const observed = { ...item, state: item.decisions.length ? 'needs_input' : item.state };
+      const native = sub.nativeEvents?.[item.session_id]?.terminal;
+      const fingerprint = createHash('sha256').update(JSON.stringify([observed.state, observed.state === 'needs_input' ? [...observed.decisions].sort() : [], native?.event_id ?? null])).digest('hex');
+      const previous = sub.observations[item.session_id];
+      if (previous?.fingerprint === fingerprint) continue;
+      requireValue(previous || Object.values(state.subscriptions).reduce((sum, subscription) => sum + Object.keys(subscription.observations ?? {}).length, 0) < 8192, 'observation_limit');
+      const generation = (previous?.generation ?? 0) + 1;
+      const terminal = ['succeeded', 'failed', 'interrupted'].includes(observed.state);
+      const nativeState = { 'session.execution.succeeded': 'succeeded', 'session.execution.failed': 'failed', 'session.execution.interrupted': 'interrupted' }[native?.kind];
+      const freshNative = terminal && nativeState === observed.state && native.event_id !== previous?.terminalEventId && native.created >= (sub.createdAt ?? 0);
+      const changedTerminal = previous && Object.hasOwn(previous, 'lastTerminal') && previous.lastTerminal !== 'unobserved' && previous.lastTerminal !== observed.state;
+      const underlyingTerminal = ['succeeded', 'failed', 'interrupted'].includes(item.state) ? item.state : 'unobserved';
+      const lastTerminal = terminal ? observed.state : ['unknown', 'running', 'retrying'].includes(observed.state) ? null : previous && Object.hasOwn(previous, 'lastTerminal') ? previous.lastTerminal : underlyingTerminal;
+      sub.observations[item.session_id] = { fingerprint, generation, lastTerminal, terminalEventId: native?.event_id ?? previous?.terminalEventId ?? null };
+      if (terminal && !freshNative && !changedTerminal) continue;
+      const name = observed.state === 'needs_input' ? 'session.needs_input' : observed.state === 'failed' ? 'session.failed' : ['succeeded', 'interrupted'].includes(observed.state) ? 'session.completed' : ['running', 'retrying', 'idle'].includes(observed.state) ? 'session.progress' : null;
+      if (name !== sub.name) continue;
+      requireValue(state.queue.length < MAX_QUEUE, 'queue_limit');
+      const eventId = 'evt_' + createHash('sha256').update(JSON.stringify([principal, sub.id, item.session_id, fingerprint, generation])).digest('hex');
+      state.queue.push({ subscriptionId: sub.id, event: { eventId, name, timestamp: new Date(freshNative ? native.created : now()).toISOString(), data: { ...sub.filter, session_id: item.session_id, state: observed.state, summary: `Managed session observed ${observed.state}; inspect workrelay_server_read. Runtime idle is not task completion. Native approvals remain required.` }, cursor: null }, attempts: 0, due: now() });
+    }
+  }
   return {
     principal,
     async list() { return { events: structuredClone(definitions.filter(d => !sessionName(d.name) || typeof observeManaged === 'function')) }; },
@@ -339,6 +408,7 @@ export function createEventsService({ statePath, principal, authorize, observeMa
       requireValue(p.ttlMs == null || (Number.isSafeInteger(p.ttlMs) && p.ttlMs > 0), 'invalid_ttl');
       if (!await allowed(principal, task, p.name, filter)) throw failure('not_authorized', -32001);
       return locked(async state => {
+        if (state.subscriptions[id]?.managedPending) throw failure('subscription_pending', -32000);
         for (const sub of Object.values(state.subscriptions)) if (sub.expires <= now()) drop(state, sub.id);
         requireValue(Object.keys(state.subscriptions).length < 256 || state.subscriptions[id], 'subscription_limit');
         const old = state.subscriptions[id];
@@ -356,6 +426,90 @@ export function createEventsService({ statePath, principal, authorize, observeMa
         state.subscriptions[id] = sub;
         return { id, refreshBefore: new Date(sub.expires).toISOString(), cursor: null, truncated: false };
       });
+    },
+    /** MGR-EVT-READY-01: ready({subscription_id,attempt_id,signal}) must await
+     * connection only; no Events lock is held while it or the fresh scan runs.
+     * A complete empty scan is valid. Old observations never prove readiness. */
+    async subscribeManagedReady(p, { attemptId, ready, timeoutMs = 8000 } = {}) {
+      const details = params(p, true), { id, task, filter } = details;
+      requireValue(filter && typeof ready === 'function' && typeof attemptId === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(attemptId) && Number.isInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= 60000 && (p.ttlMs == null || Number.isSafeInteger(p.ttlMs) && p.ttlMs > 0), 'invalid_readiness_attempt');
+      const digest = createHash('sha256').update(JSON.stringify([p.name, p.arguments, p.delivery.secret, p.ttlMs ?? ttlMs])).digest('hex');
+      const token = randomBytes(16).toString('hex'), deadline = Date.now() + timeoutMs, controller = new AbortController();
+      let timer, staged = false;
+      const expired = new Promise((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(failure('source_not_ready', -32000)); }, timeoutMs); });
+      const within = promise => Promise.race([promise, expired]);
+      const check = async () => {
+        if (controller.signal.aborted || Date.now() >= deadline) throw failure('source_not_ready', -32000);
+        if (!await within(allowed(principal, task, p.name, filter))) throw failure('not_authorized', -32001);
+      };
+      try {
+        let proposed;
+        for (;;) {
+          await check();
+          const admission = await within(locked(async state => {
+            if (controller.signal.aborted) throw failure('source_not_ready', -32000);
+            let old = state.subscriptions[id];
+            if (old?.managedPending?.deadline <= Date.now()) {
+              if (old.managedPending.isNew) { drop(state, id); old = undefined; }
+              else delete old.managedPending;
+            }
+            if (old?.managedPending) return { busy: true };
+            if (old?.managedReady?.attempt_id === attemptId) {
+              requireValue(old.managedReady.digest === digest, 'readiness_attempt_conflict');
+              if (old.expires > now()) return { done: { result: resultFor(old), observation: old.managedReady.observation } };
+            }
+            const sub = await candidate(state, p, details);
+            await check();
+            // New staging is source-visible but cannot be polled/delivered yet.
+            // Renewal staging does not change any existing renewal fields.
+            const target = old ?? sub;
+            target.managedPending = { token, attempt_id: attemptId, deadline, isNew: !old };
+            state.subscriptions[id] = target; staged = true;
+            return { sub };
+          }));
+          if (admission.done) return admission.done;
+          if (!admission.busy) { proposed = admission.sub; break; }
+          await within(new Promise(resolve => setTimeout(resolve, 10)));
+        }
+        await within(Promise.resolve().then(() => ready({ subscription_id: id, attempt_id: attemptId, signal: controller.signal })));
+        await check();
+        const pages = [], cursors = new Set(); let cursor = null, items = 0;
+        do {
+          await check();
+          const page = await within(Promise.resolve().then(() => observeManaged(filter, cursor, { signal: controller.signal })));
+          validatePage(page, filter, cursor); await check();
+          pages.push(structuredClone(page)); items += page.items.length;
+          requireValue(pages.length <= 128 && items <= 1000 && !cursors.has(page.next_cursor), 'observation_limit');
+          cursor = page.next_cursor; if (cursor !== null) cursors.add(cursor);
+        } while (cursor !== null);
+        const observation = { attempt_id: attemptId, subscription_id: id, complete: true, pages: pages.length, items };
+        return await locked(async state => {
+          await check();
+          const current = state.subscriptions[id];
+          if (current?.managedPending?.token !== token) throw failure('source_not_ready', -32000);
+          // Commit linearizes here before the deadline; never race a durable
+          // commit against timeout and report failure after renewal was saved.
+          clearTimeout(timer);
+          // Retain native markers and concurrent ordinary observation/outbox work.
+          proposed.observations = current.observations ?? {};
+          proposed.nativeEvents = current.nativeEvents ?? {};
+          if (current.delivery) proposed.delivery = current.delivery;
+          for (const page of pages) applyManagedPage(state, proposed, page);
+          proposed.scanCursor = null;
+          proposed.managedReady = { attempt_id: attemptId, digest, observation };
+          delete proposed.managedPending;
+          state.subscriptions[id] = proposed;
+          return { result: resultFor(proposed), observation };
+        });
+      } finally {
+        clearTimeout(timer); controller.abort();
+        if (staged) await locked(state => {
+          const sub = state.subscriptions[id];
+          if (sub?.managedPending?.token === token) {
+            if (sub.managedPending.isNew) drop(state, id); else delete sub.managedPending;
+          }
+        });
+      }
     },
     async unsubscribe(p) { const { id } = params(p, false); return stop(sub => sub.id === id); },
     async revoke(taskId) { return stop(sub => sub.principal === principal && (!taskId || sub.task === taskId)); },
@@ -383,6 +537,8 @@ export function createEventsService({ statePath, principal, authorize, observeMa
         for (let index = 0; index < subscriptions.length; index++) {
           const sub = subscriptions[(offset + index) % subscriptions.length];
           if (sub.principal !== principal || !sessionName(sub.name)) continue;
+          if (!recoverPending(state, sub)) continue;
+          if (sub.managedPending) continue;
           if (sub.expires <= now() || !await allowed(principal, sub.task, sub.name, sub.filter)) { drop(state, sub.id); continue; }
           if (pages++ >= 8 || state.queue.length > MAX_QUEUE - 10) { state.managedScanOffset = (offset + index) % subscriptions.length; break; }
           let page; try { page = await observeManaged(sub.filter, sub.scanCursor); } catch { continue; }
@@ -434,12 +590,16 @@ export function createEventsService({ statePath, principal, authorize, observeMa
     async deliverDue() {
       return locked(async (state, persist, owner, live) => {
         const counts = { delivered: 0, retried: 0, dropped: 0 };
-        for (const sub of Object.values(state.subscriptions)) if (sub.principal === principal && (sub.expires <= now() || !await allowed(sub.principal, sub.task, sub.name, sub.filter))) drop(state, sub.id);
+        for (const sub of Object.values(state.subscriptions)) if (sub.principal === principal) {
+          if (!recoverPending(state, sub)) continue;
+          if (sub.expires <= now() || !await allowed(sub.principal, sub.task, sub.name, sub.filter)) drop(state, sub.id);
+        }
         let sent = 0;
         const remove = item => { state.queue = state.queue.filter(x => x !== item); };
         for (const item of [...state.queue]) {
           const sub = state.subscriptions[item.subscriptionId];
           if (!sub) { remove(item); counts.dropped++; continue; }
+          if (sub.managedPending?.isNew) continue;
           if (item.claim) {
             if (live.has(item.claim.token)) continue;
             delete item.claim; // only a proven dead/changed owner may be recovered

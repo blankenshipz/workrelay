@@ -160,6 +160,9 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
     model: { providerID: 'openai', id: 'fixture' }, metadata: { intent: 'unchanged' }, time: {} };
   const posts = [], inbox = []; let dropAck = false, sourceConnections = 0, activeSources = 0, maxSources = 0;
   let nativeHint = { type: 'session.updated', id: 'evt_old_fixture', created: Date.now() - 1000 };
+  const nativeResponses = new Set();
+  let permissionBarrier, permissionEntered, gateOnlyProgress = false;
+  let permissionFailure = false, listMode = 'normal', secondPages = 0;
   const guardEntry = join(dir, 'runtime', 'plugins', 'subscription-guard', 'index.mjs');
   const backend = createServer(async (req, res) => {
     res.setHeader('content-type', 'application/json');
@@ -168,8 +171,9 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
       assert.equal(req.method, 'GET'); assert.equal(req.headers['last-event-id'], undefined);
       res.setHeader('content-type', 'text/event-stream');
       for (let index = 0; index < 3; index++) res.write(`data: ${JSON.stringify({ ...nativeHint, data: { sessionID: root, text: 'PRIVATE_NATIVE_PAYLOAD' } })}\n\n`);
-      const end = setTimeout(() => res.end(), 150);
-      res.on('close', () => { clearTimeout(end); activeSources--; }); return;
+      nativeResponses.add(res);
+      const end = setTimeout(() => res.end(), 15000);
+      res.on('close', () => { clearTimeout(end); activeSources--; nativeResponses.delete(res); }); return;
     }
     if (req.url === '/jwks') return res.end(JSON.stringify({ keys: [jwk] }));
     if (req.method === 'POST') {
@@ -197,8 +201,22 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
     if (req.url === `/api/session/${root}`) return res.end(JSON.stringify({ data: session }));
     if (req.url.startsWith(`/api/session/${root}/message?`)) return res.end(JSON.stringify({ data: [{ id: 'msg_visible', time: { created: 1 }, type: 'user', text: 'Review the release documentation.' }], cursor: {} }));
     if (req.url === `/api/session/${root}/inbox`) return res.end(JSON.stringify({ data: inbox }));
-    if (req.url === `/api/session/${root}/permission`) return res.end(JSON.stringify({ data: [] }));
+    if (req.url === `/api/session/${root}/permission`) {
+      if (permissionFailure) { res.statusCode = 503; return res.end('{}'); }
+      const shouldGate = !gateOnlyProgress || Object.values(JSON.parse(await fs.readFile(join(dir, 'events.sqlite'), 'utf8')).subscriptions ?? {}).some(sub => sub.name === 'session.progress');
+      if (shouldGate) { permissionEntered?.(); await permissionBarrier; }
+      return res.end(JSON.stringify({ data: [] }));
+    }
     if (req.url.includes('/message/')) { res.statusCode = 404; return res.end('{}'); }
+    if (req.url.startsWith('/api/session?')) {
+      if (listMode === 'empty') return res.end(JSON.stringify({ data: [], cursor: {} }));
+      if (listMode === 'partial') {
+        if (new URL(req.url, 'http://fixture').searchParams.has('cursor')) {
+          secondPages++; res.statusCode = 503; return res.end('{}');
+        }
+        return res.end(JSON.stringify({ data: [session], cursor: { next: 'fixture-page-two' } }));
+      }
+    }
     reads++;
     res.end(JSON.stringify({ data: [{ id: root, projectID: 'project', time: {} }], cursor: {} }));
   });
@@ -310,7 +328,7 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
   const integratedPort = integratedReserve.address().port; await close(integratedReserve);
   const delivered = [];
   const integrated = createGateway({ ...config, port: integratedPort, events_enabled: true, events_state_path: join(dir, 'events.sqlite'), revocation_file: revocation }, {
-    testIssuer: true, eventIntervalMs: 50, eventTransport: async (_url, request) => {
+    testIssuer: true, eventIntervalMs: 50, eventReadinessTimeoutMs: 1500, eventTransport: async (_url, request) => {
       const body = JSON.parse(request.body); delivered.push(body); return { status: 200, body: JSON.stringify({ challenge: body.challenge }) };
     }, invoke: async (_config, command, payload) => {
       handed.push({ command, payload });
@@ -375,16 +393,21 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
   const subscription = { name: 'session.failed', arguments: { server_id: full.result.structuredContent.server_id, session_id: root },
     delivery: { mode: 'webhook', url: 'https://receiver.example/callback', secret: 'whsec_' + Buffer.alloc(32, 9).toString('base64') } };
   session.outcome = 'failed';
-  const subscribed = await eventCall('events/subscribe', subscription); assert.ok(subscribed.result.id);
-  await until(() => sourceConnections >= 2);
+  const subscribed = await eventCall('events/subscribe', subscription); assert.ok(subscribed.result?.id, 'subscription ACK must await live source and baseline');
+  const acknowledgedState = JSON.parse(await fs.readFile(join(dir, 'events.sqlite'), 'utf8'));
+  assert.ok(acknowledgedState.subscriptions[subscribed.result.id].observations[root], 'actual session baseline exists at ACK');
+  assert.equal(activeSources, 1, 'source is connected at ACK');
   assert.equal(delivered.filter(event => event.name === 'session.failed').length, 0, 'stale terminal baseline is not a fresh completion');
   nativeHint = { type: 'session.execution.failed', id: 'evt_current_generation_one', created: Date.now() };
+  for (const response of nativeResponses) response.end();
   await until(() => delivered.some(event => event.name === 'session.failed'));
   const firstGenerationConnections = sourceConnections;
+  for (const response of nativeResponses) response.end();
   await until(() => sourceConnections > firstGenerationConnections);
   assert.equal(maxSources, 1, 'normal gateway owns only one bounded native stream');
   assert.equal(delivered.filter(event => event.name === 'session.failed').length, 1, 'duplicate native wakes reconcile the same durable observation');
   nativeHint = { type: 'session.execution.failed', id: 'evt_current_generation_two', created: Date.now() };
+  for (const response of nativeResponses) response.end();
   await until(() => delivered.filter(event => event.name === 'session.failed').length === 2);
   const generations = delivered.filter(event => event.name === 'session.failed');
   assert.notEqual(generations[0].eventId, generations[1].eventId, 'same terminal state in a new native generation is a distinct durable event');
@@ -393,9 +416,64 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
   await until(() => activeSources === 0);
   const afterUnsubscribe = sourceConnections;
   await new Promise(resolve => setTimeout(resolve, 1100)); assert.equal(sourceConnections, afterUnsubscribe);
+  let releaseBaseline, enteredBaseline;
+  permissionBarrier = new Promise(resolve => { releaseBaseline = resolve; });
+  const baselineEntered = new Promise(resolve => { enteredBaseline = resolve; }); permissionEntered = enteredBaseline;
+  let acknowledged = false;
+  const slowSubscribe = eventCall('events/subscribe', subscription).then(value => { acknowledged = true; return value; });
+  await baselineEntered;
+  assert.equal(acknowledged, false, 'slow actual baseline cannot ACK early');
+  releaseBaseline(); permissionBarrier = undefined; permissionEntered = undefined;
+  assert.ok((await slowSubscribe).result.id);
+  const concurrent = await Promise.all([eventCall('events/subscribe', subscription), eventCall('events/subscribe', { ...subscription, name: 'session.completed' })]);
+  assert.ok(concurrent.every(value => value.result?.id)); assert.equal(maxSources, 1);
+  const stateBeforeTimeout = JSON.parse(await fs.readFile(join(dir, 'events.sqlite'), 'utf8'));
+  gateOnlyProgress = true;
+  permissionBarrier = new Promise(resolve => { releaseBaseline = resolve; });
+  let releaseTimedOutBackend;
+  permissionEntered = () => { if (!releaseTimedOutBackend) releaseTimedOutBackend = setTimeout(() => releaseBaseline(), 2000); };
+  const timedOut = await eventCall('events/subscribe', { ...subscription, name: 'session.progress' });
+  assert.ok(timedOut.error, 'bounded timeout must not acknowledge subscription success');
+  clearTimeout(releaseTimedOutBackend); releaseBaseline(); permissionBarrier = undefined; permissionEntered = undefined; gateOnlyProgress = false;
+  const stateAfterTimeout = JSON.parse(await fs.readFile(join(dir, 'events.sqlite'), 'utf8'));
+  assert.deepEqual(Object.keys(stateAfterTimeout.subscriptions).sort(), Object.keys(stateBeforeTimeout.subscriptions).sort(), 'timeout removes only new subscription, preserving existing subscribers');
+  const stateFile = join(dir, 'events.sqlite');
+  const readSubscriptions = async () => JSON.parse(await fs.readFile(stateFile, 'utf8')).subscriptions;
+  const serverwide = { ...subscription, name: 'session.progress', arguments: { server_id: subscription.arguments.server_id } };
+  permissionFailure = true;
+  assert.ok((await eventCall('events/subscribe', serverwide)).error, 'thrown server-wide observation cannot ACK');
+  assert.deepEqual(Object.keys(await readSubscriptions()).sort(), Object.keys(stateBeforeTimeout.subscriptions).sort());
+  const beforeRenewal = (await readSubscriptions())[subscribed.result.id];
+  assert.ok(beforeRenewal.observations[root], 'renewal starts with stale stored observations');
+  const failedRenewal = await eventCall('events/subscribe', { ...subscription, ttlMs: 60000,
+    delivery: { ...subscription.delivery, secret: 'whsec_' + Buffer.alloc(32, 7).toString('base64') } });
+  assert.ok(failedRenewal.error, 'stale observations cannot satisfy a fresh renewal');
+  const afterRenewal = (await readSubscriptions())[subscribed.result.id];
+  for (const field of ['expires', 'secret', 'verifiedUntil', 'previousSecret', 'rotationUntil', 'managedReady']) {
+    assert.deepEqual(afterRenewal[field], beforeRenewal[field], `failed renewal preserves ${field}`);
+  }
+  permissionFailure = false; listMode = 'partial';
+  assert.ok((await eventCall('events/subscribe', serverwide)).error, 'failure after first page cannot ACK');
+  assert.ok(secondPages > 0, 'readiness follows pagination to the failing second page');
+  assert.deepEqual(Object.keys(await readSubscriptions()).sort(), Object.keys(stateBeforeTimeout.subscriptions).sort());
+  listMode = 'empty';
+  const empty = await eventCall('events/subscribe', serverwide);
+  assert.ok(empty.result?.id, 'valid complete empty server-wide scan is ready');
+  const emptyProof = (await readSubscriptions())[empty.result.id].managedReady.observation;
+  assert.equal(emptyProof.complete, true); assert.equal(emptyProof.pages, 1); assert.equal(emptyProof.items, 0);
+  assert.equal(empty.result.observation, undefined, 'internal proof is not added to protocol result');
+  await eventCall('events/unsubscribe', serverwide); listMode = 'normal';
+  await eventCall('events/unsubscribe', subscription);
+  await eventCall('events/unsubscribe', { ...subscription, name: 'session.completed' });
   await eventCall('events/subscribe', subscription);
   await until(() => sourceConnections > afterUnsubscribe);
+  permissionBarrier = new Promise(resolve => { releaseBaseline = resolve; });
+  const revokeEntered = new Promise(resolve => { permissionEntered = resolve; });
+  const revokedAdmission = eventCall('events/subscribe', serverwide);
+  await revokeEntered;
   await fs.writeFile(capability, JSON.stringify({ ...binding, revoked: true }));
+  releaseBaseline(); permissionBarrier = undefined; permissionEntered = undefined;
+  assert.ok((await revokedAdmission).error, 'revocation during observation cannot acknowledge a new subscription');
   await until(() => activeSources === 0);
   const afterRevocation = sourceConnections;
   await new Promise(resolve => setTimeout(resolve, 1100)); assert.equal(sourceConnections, afterRevocation);

@@ -591,7 +591,20 @@ export function createGateway(rawConfig, options = {}) {
       await managedReader(scope.session_id ? 'read' : 'authorize', scope.session_id ? { session_id: scope.session_id } : {}, claims);
       return true;
     } }) : null;
-  const handler = options.sdkHandler ?? createMcpHandler(() => mcp(config, invoke, events, managedReader, eventTools));
+  let ensureManagedReady;
+  const servedEvents = events ? { ...events, subscribe: async params => {
+    if (!params.name?.startsWith('session.')) return events.subscribe(params);
+    const attemptId = randomBytes(16).toString('hex');
+    const { result, observation } = await events.subscribeManagedReady(params, {
+      attemptId, ready: context => ensureManagedReady(context), timeoutMs: options.eventReadinessTimeoutMs ?? 8000,
+    });
+    if (observation?.attempt_id !== attemptId || observation.subscription_id !== result?.id || observation.complete !== true ||
+        !Number.isInteger(observation.pages) || observation.pages < 1 || !Number.isInteger(observation.items) || observation.items < 0) {
+      throw new ProtocolError(-32000, 'Managed event source not ready', { reason: 'source_not_ready', retryable: true });
+    }
+    return result;
+  } } : null;
+  const handler = options.sdkHandler ?? createMcpHandler(() => mcp(config, invoke, servedEvents, managedReader, eventTools));
   const jwks = localJwks ?? createRemoteJWKSet(new URL(config.jwks_uri), { timeoutDuration: 3000, cooldownDuration: 1000 });
   const metadataUrl = `${config.public_origin}/.well-known/oauth-protected-resource/mcp`;
   const resource = `${config.public_origin}/mcp`;
@@ -879,6 +892,14 @@ export function createGateway(rawConfig, options = {}) {
     let busy = false;
     let activeTick = Promise.resolve();
     let stopped = false, sourceRun = null, reconnectAfter = 0;
+    let reconciliation = Promise.resolve();
+    const reconcileManaged = () => {
+      const work = reconciliation.then(async () => {
+        if (!await sourceAuthorized()) throw Error('source unavailable');
+        await events.pollManaged(); await events.deliverDue();
+      });
+      reconciliation = work.catch(() => {}); return work;
+    };
     const subscriptions = () => {
       try {
         const file = lstatSync(config.events_state_path);
@@ -894,18 +915,47 @@ export function createGateway(rawConfig, options = {}) {
     };
     const source = managedReader ? createManagedEventSource({ serverId: managedServerID(config.managed_server),
       authorize: sourceAuthorized,
-      openStream: ({ signal }) => managedReader('open_events', { signal }, managedClaims),
+      openStream: async ({ signal }) => {
+        const run = sourceRun;
+        const opened = await managedReader('open_events', { signal }, managedClaims);
+        // Connection proof only. The Events transaction owns the complete fresh
+        // scan; source reconciliation is independent and cannot prove admission.
+        if (!run || sourceRun !== run || signal.aborted || opened?.server_id !== managedServerID(config.managed_server) ||
+            opened.response?.status !== 200 || opened.response.redirected ||
+            !opened.response.headers.get('content-type')?.toLowerCase().startsWith('text/event-stream') || !await sourceAuthorized()) {
+          await opened?.response?.body?.cancel(); throw Error('source unavailable');
+        }
+        run.connected();
+        return opened;
+      },
       onNativeEvent: event => events.noteNativeEvent(event),
       isSubscribed: sessionID => subscriptions().some(sub => !sub.filter.session_id || sub.filter.session_id === sessionID),
-      reconcile: async () => { await tick(); },
+      reconcile: reconcileManaged,
     }) : null;
-    const maintainSource = async () => {
+    const maintainSource = async (force = false) => {
       if (!source || !await sourceAuthorized()) { sourceRun?.controller.abort(); return; }
-      if (sourceRun || Date.now() < reconnectAfter) return;
-      const run = { controller: new AbortController(), promise: null }; sourceRun = run;
+      if (sourceRun || !force && Date.now() < reconnectAfter) return;
+      let ready, failed;
+      const readiness = new Promise((resolve, reject) => { ready = resolve; failed = reject; });
+      void readiness.catch(() => {});
+      const run = { controller: new AbortController(), promise: null, readiness, connected: ready }; sourceRun = run;
       run.promise = source.consume({ signal: run.controller.signal, durationMs: 10000 }).catch(() => {
         // Native source is only a wake-up hint. Durable polling/delivery remains active.
-      }).finally(() => { if (sourceRun === run) sourceRun = null; reconnectAfter = Date.now() + 1000; });
+      }).finally(() => { failed(Error('source ended')); if (sourceRun === run) sourceRun = null; reconnectAfter = Date.now() + 1000; });
+    };
+    ensureManagedReady = async ({ signal }) => {
+      let abort;
+      try {
+        if (signal.aborted) throw Error('readiness aborted');
+        await maintainSource(true);
+        const run = sourceRun; if (!run) throw Error('source unavailable');
+        await Promise.race([run.readiness, new Promise((_, reject) => {
+          abort = () => reject(Error('readiness aborted'));
+          signal.addEventListener('abort', abort, { once: true });
+          if (signal.aborted) abort();
+        })]);
+        if (sourceRun !== run || run.controller.signal.aborted || signal.aborted || !await sourceAuthorized()) throw Error('source changed');
+      } finally { if (abort) signal.removeEventListener('abort', abort); }
     };
     const tick = async () => {
       if (busy || stopped) return;
@@ -942,7 +992,7 @@ export function createGateway(rawConfig, options = {}) {
               ['succeeded', 'failed', 'interrupted'].includes(result.phase))
             await emit('task.completed', result.phase, 'Owned task reached a terminal OpenCode outcome; inspect read-only result.');
         }
-        try { await events.pollManaged(); } catch { /* keep ordinary delivery alive during managed reconciliation failure */ }
+        try { if (managedReader && subscriptions().length) await reconcileManaged(); else await events.pollManaged(); } catch { /* keep ordinary delivery alive during managed reconciliation failure */ }
         await events.deliverDue();
       } catch { /* private state or OpenCode unavailable: do not fabricate events */ }
       finally { busy = false; }

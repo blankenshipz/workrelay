@@ -38,3 +38,35 @@ test('configured DNS fallback handles AAAA-only names but never bypasses private
   const mixed = createCallbackResolver({ osLookup: absent, ipv4: async () => ['8.8.8.8'], ipv6: async () => ['::1'] });
   await assert.rejects(createPinnedWebhookTransport({ resolve: mixed, request: () => assert.fail('must reject mixed answers') })(destination, wire), e => e.data.reason === 'non_public_address');
 });
+
+test('IPv6-first DNS with a routable IPv4 answer makes one pinned IPv4 POST, never the hanging IPv6 attempt', async () => {
+  let calls = 0;
+  const transport = createPinnedWebhookTransport({ timeoutMs: 50,
+    resolve: async () => [{ address: '2606:4700:4700::1111', family: 6 }, { address: '8.8.8.8', family: 4 }],
+    request: (_url, options, respond) => {
+      calls++;
+      assert.equal(options.servername, 'receiver.example'); assert.equal(options.rejectUnauthorized, true); assert.equal(options.agent, false);
+      const req = new EventEmitter(); req.destroy = () => {};
+      options.lookup('receiver.example', { all: true }, (_err, addresses) => {
+        assert.deepEqual(addresses, [{ address: '8.8.8.8', family: 4 }]);
+      });
+      req.end = body => { assert.equal(body, wire.body); queueMicrotask(() => { const res = new EventEmitter(); res.statusCode = 200; respond(res); res.emit('data', Buffer.from('{}')); res.emit('end'); }); };
+      return req;
+    } });
+  assert.equal((await transport(destination, wire)).status, 200); assert.equal(calls, 1);
+});
+
+test('IPv6-only OS result supplements A through same resolver, preserving all answers and private rejection', async () => {
+  const os = async () => [{ address: '2606:4700:4700::1111', family: 6 }]; let queries = 0;
+  const resolver = createCallbackResolver({ osLookup: os, ipv4: async hostname => { assert.equal(hostname, 'receiver.example'); queries++; return ['8.8.8.8']; } });
+  assert.deepEqual(await resolver('receiver.example', { all: true }), [...await os(), { address: '8.8.8.8', family: 4 }]); assert.equal(queries, 1);
+  for (const [osLookup, ipv4] of [[os, async () => ['127.0.0.1']], [async () => [{ address: '::1', family: 6 }], async () => assert.fail('must not supplement private answer')]]) {
+    await assert.rejects(createPinnedWebhookTransport({ resolve: createCallbackResolver({ osLookup, ipv4 }), request: () => assert.fail('must validate every answer before connection') })(destination, wire), error => error.data.reason === 'non_public_address');
+  }
+});
+
+test('AAAA-only endpoint retains bounded timeout without duplicate POST', async () => {
+  let calls = 0, destroyed = 0;
+  const transport = createPinnedWebhookTransport({ timeoutMs: 10, resolve: async () => [{ address: '2606:4700:4700::1111', family: 6 }], request: () => { calls++; const req = new EventEmitter(); req.end = () => {}; req.destroy = () => { destroyed++; }; return req; } });
+  await assert.rejects(transport(destination, wire), error => error.data.reason === 'timeout'); assert.equal(calls, 1); assert.equal(destroyed, 1);
+});

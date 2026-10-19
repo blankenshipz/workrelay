@@ -103,6 +103,12 @@ test('actual authenticated MCP facade: pinned ChatGPT server/session subscriptio
   const backend = createServer((req, res) => { res.setHeader('content-type', 'application/json');
     if (req.url === '/jwks') return res.end(JSON.stringify({ keys: [jwk] }));
     assert.equal(req.method, 'GET');
+    if (req.url === '/api/event') {
+      res.setHeader('content-type', 'text/event-stream');
+      res.write('data: {"type":"server.connected"}\n\n');
+      const timer = setTimeout(() => res.end(), 15000);
+      res.on('close', () => clearTimeout(timer)); return;
+    }
     if (req.url === `/api/session/${session}/permission`) return res.end(JSON.stringify({ data: permissions.map(id => ({ id, sessionID: session, text: 'SECRET' })) }));
     const item = { id: session, projectID: 'private/path', title: 'SECRET', outcome, time: idle ? { idle: 1 } : {} };
     res.end(JSON.stringify(req.url.startsWith('/api/session?') ? { data: [item], cursor: {} } : { data: item }));
