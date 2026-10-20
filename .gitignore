@@ -10,3 +10,4 @@ node_modules/
 tests/.workrelay-issuer-mcp-*/
 tests/.workrelay-head-*/
 tests/.workrelay-managed-events-*/
+tests/.workrelay-token-error-*/

@@ -5,12 +5,17 @@ import tempfile
 import os
 import hashlib
 import json
+import contextlib
+import io
+import runpy
+import sys
+import warnings
 import multiprocessing
 from pathlib import Path
 from unittest.mock import patch
 
-from workrelay.cli import BridgeError
-from workrelay.managed_control import control, reservation_owner_dead, create_session, creation_session_id, inspect_operation, identity, resolve_operation, classified_failure, native_waits
+from workrelay.cli import BridgeError, GuardFailure, CONTROL_DENIAL_CODES
+from workrelay.managed_control import control, reservation_owner_dead, create_session, creation_session_id, inspect_operation, identity, resolve_operation, classified_failure, native_waits, record_denial
 
 
 class ManagedControlTests(unittest.TestCase):
@@ -293,11 +298,132 @@ class ManagedControlTests(unittest.TestCase):
         self.binding = 'b' * 64
         with self.assertRaises(BridgeError): resolve_operation(self.db, self.authorize, 'operation')
         self.binding = 'a' * 64
-        self.db.execute("INSERT INTO managed_operations SELECT binding,'ses_other',operation,kind,digest,message,phase,identity,reservation_pid FROM managed_operations")
+        self.db.execute("INSERT INTO managed_operations(binding,session,operation,kind,digest,message,phase,identity,reservation_pid) SELECT binding,'ses_other',operation,kind,digest,message,phase,identity,reservation_pid FROM managed_operations")
         with self.assertRaises(BridgeError): resolve_operation(self.db, self.authorize, 'operation')
         self.assertEqual(resolve_operation(self.db, self.authorize, 'operation', self.sid)[1], self.sid)
         self.binding = None
         with self.assertRaises(BridgeError): resolve_operation(self.db, self.authorize, 'operation', self.sid)
+
+
+    def test_denial_codes_persist_atomically_and_retry_is_read_only(self):
+        original_session = copy.deepcopy(self.session)
+        original_request = self.request
+        for expected in ('QUOTA_DENIED', 'QUOTA_UNAVAILABLE', 'ATTESTATION_FAILED',
+                         'AUTHORITY_UNAVAILABLE_OR_CHANGED', 'SESSION_READ_FAILED',
+                         'MODEL_MISMATCH', 'IDENTITY_CHANGED', 'UNEXPECTED_PREPOST'):
+            with self.subTest(code=expected):
+                self.db.execute('DROP TABLE IF EXISTS managed_operations')
+                self.session = copy.deepcopy(original_session); self.binding = 'a' * 64
+                self.request = original_request; self.calls = []
+                def fail(*args):
+                    if expected in ('QUOTA_DENIED', 'QUOTA_UNAVAILABLE', 'ATTESTATION_FAILED'):
+                        raise GuardFailure(expected)
+                    if expected == 'AUTHORITY_UNAVAILABLE_OR_CHANGED': self.binding = None
+                    elif expected == 'SESSION_READ_FAILED':
+                        self.request = lambda *args, **kwargs: (_ for _ in ()).throw(BridgeError('sensitive native body'))
+                    elif expected == 'MODEL_MISMATCH': self.session['model'] = {'providerID': 'other', 'id': 'bad'}
+                    elif expected == 'IDENTITY_CHANGED': self.session['agent'] = 'replacement'
+                    else:
+                        error = RuntimeError('Bearer do-not-persist-sensitive-token')
+                        error.denial_code = 'QUOTA_DENIED'  # Untrusted attributes are ignored.
+                        raise error
+                with patch('workrelay.managed_control.admission', side_effect=fail), patch('workrelay.managed_control.time.time', return_value=123.456):
+                    with self.assertRaises(Exception): self.run_control(text='hello')
+                phase, code, timestamp = self.db.execute('SELECT phase,denial_code,denied_at_ms FROM managed_operations').fetchone()
+                self.assertEqual((phase, code, timestamp), ('denied', expected, 123456))
+                self.assertFalse(self.posts())
+                self.binding = 'a' * 64; self.request = original_request; self.session = copy.deepcopy(original_session)
+                before = self.db.execute('SELECT * FROM managed_operations').fetchall()
+                with patch('workrelay.managed_control.admission') as admit:
+                    retry = self.run_control(text='hello')
+                    admit.assert_not_called()
+                self.assertEqual(retry['denial_code'], expected)
+                self.assertEqual(retry['denied_at_ms'], 123456)
+                recovered = inspect_operation(self.db, self.config, self, self.authorize, None, 'operation')
+                self.assertEqual(recovered['denial_code'], expected)
+                classified = classified_failure(self.db, self.authorize, 'operation', self.sid, RuntimeError('native secret'))
+                self.assertEqual(classified.control_details['denial_code'], expected)
+                self.assertNotIn('sensitive', str(self.db.execute('SELECT * FROM managed_operations').fetchall()))
+                self.assertEqual(self.db.execute('SELECT * FROM managed_operations').fetchall(), before)
+
+    def test_legacy_denied_migration_no_backfill_or_current_admission(self):
+        self.db.execute('CREATE TABLE managed_operations(binding TEXT,session TEXT,operation TEXT,kind TEXT,digest TEXT,message TEXT,phase TEXT,identity TEXT,reservation_pid INTEGER,PRIMARY KEY(binding,session,operation))')
+        digest = hashlib.sha256(b'queue\0hello').hexdigest()
+        old = (self.binding, self.sid, 'operation', 'queue', digest, 'msg_legacy', 'denied', identity(self.session, self.sid), None)
+        self.db.execute('INSERT INTO managed_operations VALUES(?,?,?,?,?,?,?,?,?)', old)
+        with patch('workrelay.managed_control.admission') as admit:
+            retry = self.run_control(text='hello')
+            self.assertEqual(retry['denial_code'], 'DENIAL_REASON_NOT_RECORDED')
+            self.assertIsNone(retry['denied_at_ms']); admit.assert_not_called()
+        recovered = inspect_operation(self.db, self.config, self, self.authorize, None, 'operation')
+        self.assertEqual(recovered['denial_code'], 'DENIAL_REASON_NOT_RECORDED')
+        self.assertEqual(self.db.execute('SELECT binding,session,operation,kind,digest,message,phase,identity,reservation_pid FROM managed_operations').fetchone(), old)
+        self.assertEqual(self.db.execute('SELECT denial_code,denied_at_ms FROM managed_operations').fetchone(), (None, None))
+        self.assertEqual(self.posts(), [])
+
+    def test_atomic_denial_update_cannot_store_phase_without_code_time(self):
+        self.reserve_without_send()
+        self.db.execute("CREATE TRIGGER reject_diagnostic BEFORE UPDATE OF denial_code ON managed_operations BEGIN SELECT RAISE(ABORT,'fixture'); END")
+        with self.assertRaises(sqlite3.IntegrityError):
+            record_denial(self.db, self.binding, self.sid, 'operation', GuardFailure('QUOTA_DENIED'))
+        self.assertEqual(self.db.execute('SELECT phase,denial_code,denied_at_ms FROM managed_operations').fetchone(), ('reserved', None, None))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute("UPDATE managed_operations SET denial_code='malicious-non-enum'")
+        self.assertEqual(self.posts(), [])
+
+    @patch('workrelay.managed_control.admission')
+    def test_post_timeout_is_uncertain_not_prepost_denied(self, admit):
+        self.timeout = True
+        with self.assertRaises(BridgeError): self.run_control(text='hello')
+        self.assertEqual(self.db.execute('SELECT phase,denial_code,denied_at_ms FROM managed_operations').fetchone(), ('uncertain', None, None))
+        recovered = inspect_operation(self.db, self.config, self, self.authorize, None, 'operation')
+        self.assertNotIn('denial_code', recovered)
+        self.assertEqual(len(self.posts()), 1)
+
+    @patch('workrelay.cli.subprocess.run')
+    def test_admission_explicit_quota_and_attestation_codes(self, run):
+        self.config['quota_command'] = '/synthetic/quota'
+        for returncode, expected in ((1, 'QUOTA_DENIED'), (2, 'QUOTA_UNAVAILABLE')):
+            self.db.execute('DROP TABLE IF EXISTS managed_operations')
+            run.return_value.returncode = returncode
+            with self.assertRaises(GuardFailure): self.run_control(text='hello')
+            self.assertEqual(self.db.execute('SELECT denial_code FROM managed_operations').fetchone()[0], expected)
+        self.db.execute('DROP TABLE IF EXISTS managed_operations')
+        run.return_value.returncode = 0
+        from workrelay.attestor import AttestationError
+        with patch('workrelay.attestor.verify', side_effect=AttestationError('private details')):
+            with self.assertRaises(GuardFailure): self.run_control(text='hello')
+        self.assertEqual(self.db.execute('SELECT denial_code FROM managed_operations').fetchone()[0], 'ATTESTATION_FAILED')
+        self.assertEqual(self.posts(), [])
+
+    def test_module_entrypoint_returns_persisted_safe_denial_json(self):
+        from workrelay import cli
+        with tempfile.TemporaryDirectory() as directory:
+            config = {'transport': 'installed-client', 'authorized_owner': 'fixture', 'model': self.config['model']}
+            original_request = self.request
+            def request(method, path, body=None):
+                if path == '/__managed/authorize': return {'binding_id': self.binding}
+                return original_request(method, path, body)
+            self.request = request
+            payload = {'action': 'message', 'session_id': self.sid, 'operation_id': 'module-denial', 'text': 'hello', 'claims': {}}
+            out, err = io.StringIO(), io.StringIO()
+            with patch.object(cli, 'load_config', return_value=(config, None, Path(directory), Path(directory))), \
+                 patch.object(cli, 'InstalledClient', return_value=self), \
+                 patch('workrelay.managed_control.admission', side_effect=GuardFailure('QUOTA_DENIED')), \
+                 patch('sys.argv', ['workrelay', '--config', 'synthetic-private-reference', 'managed-control', '--owner', 'fixture']), \
+                 patch('sys.stdin', io.StringIO(json.dumps(payload))), \
+                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)
+                with self.assertRaises(SystemExit) as exit:
+                    runpy.run_module('workrelay.cli', run_name='__main__')
+            self.assertEqual(exit.exception.code, 2)
+            self.assertEqual(out.getvalue(), '')
+            failure = json.loads(err.getvalue())
+            self.assertEqual(failure['denial_code'], 'QUOTA_DENIED')
+            self.assertEqual(failure['effect'], 'no_post_permitted')
+            self.assertIsInstance(failure['denied_at_ms'], int)
+            self.assertNotIn('Traceback', err.getvalue())
+            self.assertEqual(self.posts(), [])
 
 
 class CreationTests(unittest.TestCase):

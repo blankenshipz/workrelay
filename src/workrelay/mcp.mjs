@@ -17,7 +17,7 @@ import { createManagedEventTools, managedEventToolDefinitions } from './managed_
 import { createManagedEventSource } from './managed_event_source.mjs';
 import { createManagedReader, managedServerID } from './managed_server.mjs';
 import { createIssuerAdapter } from './oidc_adapter.mjs';
-import { createUnexposedIssuerPolicy, createPreapprovalDiagnostic, createAuthorizationOutcomeDiagnostic } from './issuer_policy.mjs';
+import { createUnexposedIssuerPolicy, createPreapprovalDiagnostic, createAuthorizationOutcomeDiagnostic, createTokenErrorDiagnostic } from './issuer_policy.mjs';
 import { createLocalInteractions, createOriginDiagnostic } from './issuer_interactions.mjs';
 const loopback = new Set(['127.0.0.1', '::1']);
 const key = z.string().regex(/^[A-Za-z0-9_-]{1,80}$/);
@@ -135,6 +135,10 @@ export function validateConfig(config, { testIssuer = false } = {}) {
       (!publicProxy || config.issuer_authorization_observation?.enabled !== true ||
         config.issuer_authorization_observation.arm_file !== join(config.issuer_state_dir, 'authorization-outcome.arm')))
     throw Error('authorization observation requires exact private public-proxy opt-in');
+  if (config.issuer_token_error_observation !== undefined &&
+      (!publicProxy || config.issuer_token_error_observation?.enabled !== true ||
+        config.issuer_token_error_observation.arm_file !== join(config.issuer_state_dir, 'token-error.arm')))
+    throw Error('token error observation requires exact private public-proxy opt-in');
   if (config.mcp_observation !== undefined && (config.mcp_observation?.enabled !== true ||
       typeof config.mcp_observation.directory !== 'string' || !config.mcp_observation.directory.startsWith('/') ||
       config.mcp_observation.arm_file !== join(config.mcp_observation.directory, 'mcp-observation.arm')))
@@ -222,12 +226,32 @@ export function readManagedCapability(path) {
   return privateIssuerFile(dirname(path), basename(path));
 }
 
+// Kept in parity with cli.CONTROL_DENIAL_CODES; never classify exception text.
+export const CONTROL_DENIAL_CODES = Object.freeze([
+  'QUOTA_DENIED', 'QUOTA_UNAVAILABLE', 'ATTESTATION_FAILED',
+  'AUTHORITY_UNAVAILABLE_OR_CHANGED', 'SESSION_READ_FAILED',
+  'MODEL_MISMATCH', 'IDENTITY_CHANGED', 'UNEXPECTED_PREPOST',
+  'CREATE_CAPACITY_DENIED', 'CREATE_PROJECT_WORKSPACE_MISMATCH', 'OPERATION_ARGUMENT_CONFLICT',
+]);
+function controlDenialFields(value) {
+  const known = CONTROL_DENIAL_CODES.includes(value?.denial_code);
+  return { denial_code: known ? value.denial_code : 'DENIAL_REASON_NOT_RECORDED',
+    denied_at_ms: known && Number.isSafeInteger(value?.denied_at_ms) && value.denied_at_ms >= 0 ? value.denied_at_ms : null };
+}
+export function safeControlResult(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const { denial_code, denied_at_ms, ...rest } = value;
+  return value.phase === 'denied' || value.recorded_phase === 'denied' || denial_code !== undefined || denied_at_ms !== undefined ?
+    { ...rest, ...controlDenialFields(value) } : rest;
+}
 export function safeControlFailure(value) {
   const output = { error: 'Managed control denied or uncertain; inspect the original operation ID.' };
   const allowed = { code: ['CONTROL_AUTHORIZATION_OR_VALIDATION_DENIED', 'CONTROL_NOT_SENT', 'CONTROL_UNCERTAIN', 'CONTROL_RECONCILE_EXISTING'],
     effect: ['not_established', 'no_post_permitted', 'may_have_been_applied', 'recorded_existing_operation'],
     reason: ['PROJECT_WORKSPACE_MISMATCH', 'OPERATION_ARGUMENT_CONFLICT'] };
   for (const [key, values] of Object.entries(allowed)) if (values.includes(value?.[key])) output[key] = value[key];
+  if (value?.code === 'CONTROL_NOT_SENT' || value?.phase === 'denied' || value?.recorded_phase === 'denied' ||
+      value?.denial_code !== undefined || value?.denied_at_ms !== undefined) Object.assign(output, controlDenialFields(value));
   return output;
 }
 function bridge(config, command, input) {
@@ -356,7 +380,7 @@ function mcp(config, invoke, events, managedReader, eventTools) {
         const resolved = action === 'inspect' ? (await managedReader('authorize', {}, claims), {}) : action === 'create' ? await managedReader('resolve_project', { project_id: input.project_id }, claims) :
           (await managedReader('read', { session_id: input.session_id }, claims), {});
         const result = await invoke(config, 'managed-control', { ...input, ...resolved, action, claims });
-        const output = result?.error ? safeControlFailure(result) : result;
+        const output = result?.error ? safeControlFailure(result) : safeControlResult(result);
         return { content: [{ type: 'text', text: JSON.stringify(output) }], structuredContent: output, isError: Boolean(output.error) };
       } catch { return { isError: true, content: [{ type: 'text', text: 'Managed control unavailable or denied.' }] }; }
     });
@@ -413,6 +437,7 @@ export function createGateway(rawConfig, options = {}) {
       fetchClientDocument: options.fetchClientDocument,
       preapproveChatGPT: config.issuer_preapprove_chatgpt ?? false,
       onAuthorizationOutcome: config.issuer_authorization_observation?.enabled === true ? createAuthorizationOutcomeDiagnostic(config.issuer_state_dir) : undefined,
+      onTokenError: config.issuer_token_error_observation?.enabled === true ? createTokenErrorDiagnostic(config.issuer_state_dir) : undefined,
       onPreapprovalDenied: config.issuer_preapproval_observation?.enabled === true ?
         createPreapprovalDiagnostic(config.issuer_state_dir, { nextDenial: true }) :
         config.issuer_origin_diagnostic?.enabled === true ? createPreapprovalDiagnostic(config.issuer_state_dir) : undefined,

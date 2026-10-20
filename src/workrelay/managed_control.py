@@ -9,9 +9,10 @@ import re
 import sqlite3
 import os
 import math
+import time
 from pathlib import Path
 
-from .cli import admission, BridgeError, require
+from .cli import admission, BridgeError, require, GuardFailure, CONTROL_DENIAL_CODES
 from .supervision import redact_text
 
 
@@ -23,12 +24,39 @@ def initialize(db):
       PRIMARY KEY(binding,session,operation))""")
     db.execute('BEGIN IMMEDIATE')
     try:
-        if 'reservation_pid' not in {row[1] for row in db.execute('PRAGMA table_info(managed_operations)')}:
+        columns = {row[1] for row in db.execute('PRAGMA table_info(managed_operations)')}
+        if 'reservation_pid' not in columns:
             db.execute('ALTER TABLE managed_operations ADD COLUMN reservation_pid INTEGER')
+        if 'denial_code' not in columns:
+            choices = ','.join("'" + code + "'" for code in sorted(CONTROL_DENIAL_CODES))
+            db.execute('ALTER TABLE managed_operations ADD COLUMN denial_code TEXT CHECK(denial_code IS NULL OR denial_code IN (' + choices + '))')
+        if 'denied_at_ms' not in columns:
+            db.execute('ALTER TABLE managed_operations ADD COLUMN denied_at_ms INTEGER CHECK(denied_at_ms IS NULL OR denied_at_ms >= 0)')
         db.execute('COMMIT')
     except Exception:
         db.execute('ROLLBACK')
         raise
+
+
+def record_denial(db, binding, session_id, operation_id, error):
+    """One atomic phase/code/time fact, only before POST. Never infer from text."""
+    code = error.denial_code if isinstance(error, GuardFailure) and error.denial_code in CONTROL_DENIAL_CODES else 'UNEXPECTED_PREPOST'
+    db.execute("UPDATE managed_operations SET phase='denied',denial_code=?,denied_at_ms=? WHERE binding=? AND session=? AND operation=? AND phase='reserved'",
+               (code, int(time.time() * 1000), binding, session_id, operation_id))
+
+
+def denial_fields(phase, code, timestamp):
+    if phase != 'denied':
+        return {}
+    known = code in CONTROL_DENIAL_CODES
+    return {'denial_code': code if known else 'DENIAL_REASON_NOT_RECORDED',
+            'denied_at_ms': timestamp if known and type(timestamp) is int and timestamp >= 0 else None}
+
+
+def stored_denial_fields(db, binding, session_id, operation_id):
+    row = db.execute('SELECT phase,denial_code,denied_at_ms FROM managed_operations WHERE binding=? AND session=? AND operation=?',
+                     (binding, session_id, operation_id)).fetchone()
+    return denial_fields(*row) if row else {}
 
 
 def reservation_owner_dead(pid):
@@ -137,11 +165,12 @@ def native_waits(client, authorize, session_id, *, limit=20):
             'task_outcome': 'unverified'}
 
 
-def control_result(operation_id, session_id, message_id, phase, interrupt):
+def control_result(operation_id, session_id, message_id, phase, interrupt, *, denial_code=None, denied_at_ms=None):
     value = {'operation_id': operation_id, 'session_id': session_id, 'message_id': message_id, 'phase': phase}
     if interrupt:
         value.update(cancellation_is_rollback=False, queued_inputs_removed=False,
                      guidance='Only this session active execution is interrupted with resume=false. Queued inputs are preserved and may run on later resume. No file edits are rolled back; idle_noop is not active-cancel proof.')
+    value.update(denial_fields(phase, denial_code, denied_at_ms))
     return value
 
 
@@ -161,19 +190,30 @@ def control(db, config, client, authorize, session_id, operation_id, *, text=Non
     binding = authorize()
     require(isinstance(binding, str) and bool(re.fullmatch(r'[0-9a-f]{64}', binding)), 'bound authorization required')
     def check():
-        require(authorize() == binding, 'authority changed')
+        try:
+            current_binding = authorize()
+        except (BridgeError, OSError, TimeoutError):
+            raise GuardFailure('AUTHORITY_UNAVAILABLE_OR_CHANGED') from None
+        if current_binding != binding:
+            raise GuardFailure('AUTHORITY_UNAVAILABLE_OR_CHANGED')
     def get(path):
         check()
-        result = client.request('GET', path)
+        try:
+            result = client.request('GET', path)
+        except (BridgeError, OSError, TimeoutError):
+            raise GuardFailure('SESSION_READ_FAILED') from None
         check()
         return result
     def snapshot():
         result = get('/api/session/' + session_id)
         session = result.get('data') if isinstance(result, dict) else None
+        if not isinstance(session, dict):
+            raise GuardFailure('SESSION_READ_FAILED')
         if not interrupt:
-            require(isinstance(session, dict) and session.get('model') == config.get('model') and
-                    isinstance(config.get('model'), dict) and config['model'].get('providerID') == 'openai',
-                    'existing model is not the financially attested route')
+            if not (session.get('model') == config.get('model') and isinstance(config.get('model'), dict) and config['model'].get('providerID') == 'openai'):
+                raise GuardFailure('MODEL_MISMATCH')
+        if session.get('id') != session_id:
+            raise GuardFailure('IDENTITY_CHANGED')
         return identity(session, session_id)
     kind = 'interrupt' if interrupt else 'steer' if steer else 'queue'
     digest = hashlib.sha256((kind + '\0' + (text or '')).encode()).hexdigest()
@@ -181,11 +221,12 @@ def control(db, config, client, authorize, session_id, operation_id, *, text=Non
     initialize(db)
     db.execute('BEGIN IMMEDIATE')
     try:
-        row = db.execute('SELECT kind,digest,message,phase,identity,reservation_pid FROM managed_operations WHERE binding=? AND session=? AND operation=?',
+        row = db.execute('SELECT kind,digest,message,phase,identity,reservation_pid,denial_code,denied_at_ms FROM managed_operations WHERE binding=? AND session=? AND operation=?',
                           (binding, session_id, operation_id)).fetchone()
         recovering = False
         if row:
-            require(row[0] == kind and row[1] == digest, 'operation conflict')
+            if not (row[0] == kind and row[1] == digest):
+                raise GuardFailure('OPERATION_ARGUMENT_CONFLICT')
             if row[3] == 'reserved' and reservation_owner_dead(row[5]):
                 # BEGIN IMMEDIATE serializes takeover. Before 'sending' no POST
                 # was permitted. Keep the original ID/hash/identity and repeat
@@ -212,7 +253,7 @@ def control(db, config, client, authorize, session_id, operation_id, *, text=Non
                     phase = 'queued_observed'
                     db.execute('UPDATE managed_operations SET phase=? WHERE binding=? AND session=? AND operation=?',
                                (phase, binding, session_id, operation_id))
-            return control_result(operation_id, session_id, row[2], phase, interrupt)
+            return control_result(operation_id, session_id, row[2], phase, interrupt, denial_code=row[6], denied_at_ms=row[7])
         if not recovering:
             busy = db.execute("SELECT 1 FROM managed_operations WHERE session=? AND phase IN ('reserved','sending','uncertain') LIMIT 1",
                               (session_id,)).fetchone()
@@ -229,10 +270,10 @@ def control(db, config, client, authorize, session_id, operation_id, *, text=Non
         if not interrupt:
             admission(config, client)  # Existing quota + installed OAuth/guard attestation, no fallback.
         check()
-        require(snapshot() == current, 'session identity changed')
-    except Exception:
-        db.execute("UPDATE managed_operations SET phase='denied' WHERE binding=? AND session=? AND operation=?",
-                   (binding, session_id, operation_id))
+        if snapshot() != current:
+            raise GuardFailure('IDENTITY_CHANGED')
+    except Exception as exc:
+        record_denial(db, binding, session_id, operation_id, exc)
         raise
     db.execute("UPDATE managed_operations SET phase='sending' WHERE binding=? AND session=? AND operation=?",
                (binding, session_id, operation_id))
@@ -298,7 +339,8 @@ def validated_create_target(config, binding, operation_id, directory, title, pro
         if directory is None:
             require(project_root != '/', 'global project requires an explicit profile-authorized workspace')
             directory = project_root
-        require(Path(directory).is_relative_to(Path(project_root)), 'workspace does not belong to selected discovered project')
+        if not Path(directory).is_relative_to(Path(project_root)):
+            raise GuardFailure('CREATE_PROJECT_WORKSPACE_MISMATCH')
         roots = [p for p in projects if isinstance(p, dict) and isinstance(p.get('canonical'), str) and
                  Path(directory).is_relative_to(Path(p['canonical']))]
         require(roots and max(roots, key=lambda p: len(p['canonical'])).get('id') == project_id,
@@ -345,7 +387,8 @@ def create_session(db, config, client, authorize, operation_id, *, directory=Non
                           (binding, sid, operation_id)).fetchone()
         if row:
             require(row[1].startswith('args-v2:'), 'legacy create arguments unavailable; inspect original operation')
-            require(row[0] == 'create' and row[1] == digest, 'operation conflict')
+            if not (row[0] == 'create' and row[1] == digest):
+                raise GuardFailure('OPERATION_ARGUMENT_CONFLICT')
             recover = row[2] == 'reserved' and reservation_owner_dead(row[3])
             if recover:
                 db.execute('UPDATE managed_operations SET reservation_pid=? WHERE binding=? AND session=? AND operation=?',
@@ -355,12 +398,13 @@ def create_session(db, config, client, authorize, operation_id, *, directory=Non
             maximum = config.get('managed_max_pending_creations', 4)
             require(type(maximum) is int and 1 <= maximum <= 20, 'invalid creation capacity')
             pending = db.execute("SELECT COUNT(*) FROM managed_operations WHERE binding=? AND kind='create' AND phase IN ('reserved','sending','uncertain')", (binding,)).fetchone()[0]
-            db.execute('INSERT INTO managed_operations VALUES(?,?,?,?,?,?,?,?,?)',
-                       (binding, sid, operation_id, 'create', digest, project_id,
-                        'reserved' if pending < maximum else 'denied', '{}', os.getpid()))
+            db.execute('INSERT INTO managed_operations(binding,session,operation,kind,digest,message,phase,identity,reservation_pid) VALUES(?,?,?,?,?,?,?,?,?)',
+                       (binding, sid, operation_id, 'create', digest, project_id, 'reserved', '{}', os.getpid()))
             if pending >= maximum:
+                error = GuardFailure('CREATE_CAPACITY_DENIED')
+                record_denial(db, binding, sid, operation_id, error)
                 db.execute('COMMIT')
-                raise BridgeError('creation capacity reached; reconcile pending operations')
+                raise error
         db.execute('COMMIT')
     except Exception:
         if db.in_transaction:
@@ -378,7 +422,8 @@ def create_session(db, config, client, authorize, operation_id, *, directory=Non
                 db.execute("UPDATE managed_operations SET phase='created' WHERE binding=? AND session=? AND operation=?", (binding, sid, operation_id))
             else:
                 require(phase != 'created', 'created session disappeared; refusing to recreate')
-        return {'operation_id': operation_id, 'session_id': sid, 'phase': phase, 'inference_started': False}
+        return {'operation_id': operation_id, 'session_id': sid, 'phase': phase, 'inference_started': False,
+                **stored_denial_fields(db, binding, sid, operation_id)}
     try:
         body, project_root, directory = validated_create_target(config, binding, operation_id, directory,
             title, project_id, authorize_native_projects, get)
@@ -388,9 +433,9 @@ def create_session(db, config, client, authorize, operation_id, *, directory=Non
         db.execute('UPDATE managed_operations SET identity=? WHERE binding=? AND session=? AND operation=?',
                    (encoded_body, binding, sid, operation_id))
         projects = get('/api/project')
-        require(isinstance(projects, list) and any(isinstance(p, dict) and p.get('id') == project_id and
-                isinstance(p.get('canonical'), str) and Path(directory).is_relative_to(Path(p['canonical'])) for p in projects),
-                 'workspace does not belong to selected discovered project')
+        if not (isinstance(projects, list) and any(isinstance(p, dict) and p.get('id') == project_id and
+                isinstance(p.get('canonical'), str) and Path(directory).is_relative_to(Path(p['canonical'])) for p in projects)):
+            raise GuardFailure('CREATE_PROJECT_WORKSPACE_MISMATCH')
         if authorize_native_projects is not None:
             require(authorize_native_projects() == binding and any(isinstance(p, dict) and p.get('id') == project_id and
                     p.get('canonical') == project_root for p in projects) and
@@ -398,8 +443,9 @@ def create_session(db, config, client, authorize, operation_id, *, directory=Non
                     'native project identity changed')
         require(get('/api/session/' + sid) is None, 'creation identity already exists')
         check()
-    except Exception:
-        db.execute("UPDATE managed_operations SET phase='denied' WHERE binding=? AND session=? AND operation=?", (binding, sid, operation_id)); raise
+    except Exception as exc:
+        record_denial(db, binding, sid, operation_id, exc)
+        raise
     db.execute("UPDATE managed_operations SET phase='sending' WHERE binding=? AND session=? AND operation=?", (binding, sid, operation_id))
     try:
         check(); reply = client.request('POST', '/api/session', body); check()
@@ -422,10 +468,10 @@ def resolve_operation(db, authorize, operation_id, session_id=None):
     initialize(db)
     if session_id is not None:
         require(isinstance(session_id, str) and bool(re.fullmatch(r'ses[A-Za-z0-9_-]{1,160}', session_id)), 'invalid session')
-        rows = db.execute('SELECT session,kind,digest,message,phase,identity FROM managed_operations WHERE binding=? AND operation=? AND session=? LIMIT 2',
+        rows = db.execute('SELECT session,kind,digest,message,phase,identity,denial_code,denied_at_ms FROM managed_operations WHERE binding=? AND operation=? AND session=? LIMIT 2',
                           (binding, operation_id, session_id)).fetchall()
     else:
-        rows = db.execute('SELECT session,kind,digest,message,phase,identity FROM managed_operations WHERE binding=? AND operation=? LIMIT 2',
+        rows = db.execute('SELECT session,kind,digest,message,phase,identity,denial_code,denied_at_ms FROM managed_operations WHERE binding=? AND operation=? LIMIT 2',
                           (binding, operation_id)).fetchall()
     require(authorize() == binding, 'authority changed')
     require(len(rows) == 1, 'unknown or ambiguous operation for this principal; supply original session if ambiguous')
@@ -452,15 +498,16 @@ def classified_failure(db, authorize, operation_id, session_id, error):
         details.update(session_id=sid, phase=phase)
         if phase in ('reserved', 'denied'):
             details.update(code='CONTROL_NOT_SENT', effect='no_post_permitted')
+            details.update(denial_fields(phase, row[5], row[6]))
         elif phase in ('sending', 'uncertain'):
             details.update(code='CONTROL_UNCERTAIN', effect='may_have_been_applied')
         else:
             details.update(code='CONTROL_RECONCILE_EXISTING', effect='recorded_existing_operation')
     except Exception:
         pass  # No global lookup or guessed session if authority/identity is unknown.
-    if isinstance(error, BridgeError) and str(error) == 'workspace does not belong to selected discovered project':
+    if isinstance(error, GuardFailure) and error.denial_code == 'CREATE_PROJECT_WORKSPACE_MISMATCH':
         details['reason'] = 'PROJECT_WORKSPACE_MISMATCH'
-    elif isinstance(error, BridgeError) and str(error) == 'operation conflict':
+    elif isinstance(error, GuardFailure) and error.denial_code == 'OPERATION_ARGUMENT_CONFLICT':
         details['reason'] = 'OPERATION_ARGUMENT_CONFLICT'
     return ControlFailure(details)
 
@@ -498,6 +545,7 @@ def inspect_operation(db, config, client, authorize, session_id, operation_id):
                 phase = 'queued_observed'
     require(authorize() == binding, 'authority changed')
     return {'operation_id': operation_id, 'session_id': session_id, 'kind': row[0], 'phase': phase,
+            **denial_fields(row[3], row[5], row[6]),
             'recorded_phase': row[3], 'exact_session_exists': session_exists,
             'effect': ('created_observed' if session_exists else 'not_applied' if row[3] in ('reserved', 'denied') else 'unknown') if row[0] == 'create' else 'not_evaluated',
             'message_id': row[2] if row[0] in ('queue', 'steer') else None,

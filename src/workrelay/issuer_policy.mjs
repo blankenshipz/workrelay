@@ -39,13 +39,22 @@ const authorizationOutcomes = new Set(['success_response_prepared', 'invalid_req
 export function createAuthorizationOutcomeDiagnostic(directory, { now = Date.now } = {}) {
   return createFiniteDiagnostic(directory, { nextDenial: true, authorizationOutcome: true, now });
 }
+const tokenErrorClasses = new Set(['invalid_grant', 'invalid_client', 'invalid_request']);
+const grantKinds = new Set(['authcode', 'refresh', 'other', 'unknown']);
+export function createTokenErrorDiagnostic(directory, { now = Date.now } = {}) {
+  const record = createFiniteDiagnostic(directory, { nextDenial: true, tokenError: true, now });
+  return value => {
+    try { record(tokenErrorClasses.has(value?.errorClass) ? value.errorClass : 'other',
+      grantKinds.has(value?.grantKind) ? value.grantKind : 'other'); } catch { /* diagnostic only */ }
+  };
+}
 
-function createFiniteDiagnostic(directory, { nextDenial = false, authorizationOutcome = false, now = Date.now } = {}) {
-  const prefix = authorizationOutcome ? 'authorization-outcome' : nextDenial === true ? 'preapproval-next' : 'origin-post';
+function createFiniteDiagnostic(directory, { nextDenial = false, authorizationOutcome = false, tokenError = false, now = Date.now } = {}) {
+  const prefix = tokenError ? 'token-error' : authorizationOutcome ? 'authorization-outcome' : nextDenial === true ? 'preapproval-next' : 'origin-post';
   return (reason, classification) => {
     let fd, temporary;
     try {
-      if (!(authorizationOutcome ? authorizationOutcomes : preapprovalReasons).has(reason)) return;
+      if (!(tokenError ? reason === 'other' || tokenErrorClasses.has(reason) : (authorizationOutcome ? authorizationOutcomes : preapprovalReasons).has(reason))) return;
       privateDirectory(directory);
       const arm = join(directory, `${prefix}.arm`), used = join(directory, `${prefix}.used`);
       const receipt = join(directory, `${prefix}.receipt.json`);
@@ -58,7 +67,7 @@ function createFiniteDiagnostic(directory, { nextDenial = false, authorizationOu
       const { target, attemptId, issuedAt, expiresAt } = data;
       closeSync(fd); fd = undefined;
       const instant = now();
-      if (target !== (authorizationOutcome ? 'authorization-outcome' : 'preapproval') || typeof attemptId !== 'string' || !/^[a-f0-9]{32}$/.test(attemptId) ||
+      if (target !== (tokenError ? 'token-error' : authorizationOutcome ? 'authorization-outcome' : 'preapproval') || typeof attemptId !== 'string' || !/^[a-f0-9]{32}$/.test(attemptId) ||
           !Number.isSafeInteger(expiresAt) || expiresAt <= instant) return;
       if (nextDenial === true) {
         if (Object.keys(data).sort().join(',') !== 'attemptId,expiresAt,issuedAt,target' ||
@@ -70,7 +79,8 @@ function createFiniteDiagnostic(directory, { nextDenial = false, authorizationOu
       unlinkSync(arm);
       temporary = join(directory, `${prefix}.${randomBytes(16).toString('hex')}.tmp`);
       fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-      writeFileSync(fd, JSON.stringify(authorizationOutcome ? { attemptId, stage: 'authorization',
+      writeFileSync(fd, JSON.stringify(tokenError ? { attemptId, stage: 'token', outcome: 'grant_error',
+        grantKind: grantKinds.has(classification) ? classification : 'other', errorClass: reason } : authorizationOutcome ? { attemptId, stage: 'authorization',
         outcome: reason === 'success_response_prepared' ? 'success_response_prepared' : 'authorization_error',
         ...(reason === 'success_response_prepared' ? {} : { errorClass: reason }) } : { attemptId, stage: 'preapproval', rejectionClass: reason,
         ...(reason === 'scope_other' && typeof classification === 'string' && safeScopeClass.test(classification) ?
@@ -213,7 +223,7 @@ export async function loadPreapprovedChatGPTGrant(ctx, { principal, resource, on
 
 export function createUnexposedIssuerPolicy({ origin, principal, jwks, cookieKeys, clientId,
   redirectUris, adapter, findAccount, clientRegistration = 'static', fetchClientDocument, preapproveChatGPT = false,
-  onPreapprovalDenied, onAuthorizationOutcome }) {
+  onPreapprovalDenied, onAuthorizationOutcome, onTokenError }) {
   const issuer = exactHttps(origin, true);
   if (issuer.pathname !== '/' || issuer.search || !principal || typeof principal !== 'string' ||
       !Array.isArray(jwks?.keys) || !jwks.keys.length ||
@@ -298,6 +308,20 @@ export function createUnexposedIssuerPolicy({ origin, principal, jwks, cookieKey
     provider.on('authorization.error', (_ctx, error) => {
       try { record(authorizationOutcomes.has(error?.error) && error.error !== 'success_response_prepared' ? error.error : 'other'); }
       catch { record('other'); }
+    });
+  }
+  if (typeof onTokenError === 'function') {
+    // Maintained token route: error_handler.js emits grant.error(ctx, err).
+    // Only assembled grant_type and native structured error code are inspected;
+    // descriptions/messages, bodies, credentials and finer causes are not read.
+    provider.on('grant.error', (ctx, error) => {
+      let grantKind = 'unknown', errorClass = 'other';
+      try {
+        const type = ctx?.oidc?.params?.grant_type;
+        grantKind = type === undefined ? 'unknown' : type === 'authorization_code' ? 'authcode' : type === 'refresh_token' ? 'refresh' : 'other';
+        if (error instanceof errors.OIDCProviderError && tokenErrorClasses.has(error.error)) errorClass = error.error;
+      } catch { grantKind = 'other'; errorClass = 'other'; }
+      try { onTokenError(Object.freeze({ grantKind, errorClass })); } catch { /* cannot alter token response */ }
     });
   }
   return provider;

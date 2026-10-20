@@ -23,6 +23,26 @@ class BridgeError(Exception):
     pass
 
 
+CONTROL_DENIAL_CODES = frozenset({
+    'QUOTA_DENIED', 'QUOTA_UNAVAILABLE', 'ATTESTATION_FAILED',
+    'AUTHORITY_UNAVAILABLE_OR_CHANGED', 'SESSION_READ_FAILED',
+    'MODEL_MISMATCH', 'IDENTITY_CHANGED', 'UNEXPECTED_PREPOST',
+    'CREATE_CAPACITY_DENIED',
+    'CREATE_PROJECT_WORKSPACE_MISMATCH', 'OPERATION_ARGUMENT_CONFLICT',
+})
+
+
+class GuardFailure(BridgeError):
+    """Closed diagnostic at an explicit guard branch; no native error text."""
+    def __init__(self, code):
+        self.denial_code = code if code in CONTROL_DENIAL_CODES else 'UNEXPECTED_PREPOST'
+        super().__init__({'QUOTA_DENIED': 'included OAuth quota admission denied; no paid fallback',
+                          'QUOTA_UNAVAILABLE': 'quota unavailable; no task started',
+                          'ATTESTATION_FAILED': 'guarded OAuth route unverified; execution disabled',
+                          'OPERATION_ARGUMENT_CONFLICT': 'operation conflict'}.get(
+                              self.denial_code, 'control admission guard rejected the operation'))
+
+
 def require(condition, message):
     if not condition:
         raise BridgeError(message)
@@ -126,15 +146,16 @@ def admission(config, client):
         result = subprocess.run([config["quota_command"], "--check"],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
     except (OSError, subprocess.TimeoutExpired):
-        raise BridgeError("quota unavailable; no task started") from None
+        raise GuardFailure('QUOTA_UNAVAILABLE') from None
     if result.returncode == 1:
-        raise BridgeError("included OAuth quota admission denied; no paid fallback")
-    require(result.returncode == 0, "quota unavailable; no task started")
+        raise GuardFailure('QUOTA_DENIED')
+    if result.returncode != 0:
+        raise GuardFailure('QUOTA_UNAVAILABLE')
     from .attestor import AttestationError, verify
     try:
         verify(config, client)
-    except AttestationError:
-        raise BridgeError("guarded OAuth route unverified; execution disabled") from None
+    except (AttestationError, BridgeError):
+        raise GuardFailure('ATTESTATION_FAILED') from None
 
 
 def database(state):
@@ -567,4 +588,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # Control imports this canonical module for its typed errors. Running main
+    # in __main__ would create distinct exception classes and bypass JSON errors.
+    from . import cli
+    raise SystemExit(cli.main())

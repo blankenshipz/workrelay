@@ -18,7 +18,7 @@ const close = s => new Promise(resolve => { s.close(resolve); s.closeAllConnecti
 
 test('control errors expose only finite code/effect/reason, never upstream text', () => {
   assert.deepEqual(safeControlFailure({ error: 'PRIVATE', code: 'CONTROL_NOT_SENT', effect: 'no_post_permitted', reason: 'PROJECT_WORKSPACE_MISMATCH', stack: 'PRIVATE' }), {
-    error: 'Managed control denied or uncertain; inspect the original operation ID.', code: 'CONTROL_NOT_SENT', effect: 'no_post_permitted', reason: 'PROJECT_WORKSPACE_MISMATCH' });
+    error: 'Managed control denied or uncertain; inspect the original operation ID.', code: 'CONTROL_NOT_SENT', effect: 'no_post_permitted', reason: 'PROJECT_WORKSPACE_MISMATCH', denial_code: 'DENIAL_REASON_NOT_RECORDED', denied_at_ms: null });
   assert.doesNotMatch(JSON.stringify(safeControlFailure({ error: 'PRIVATE', code: 'PRIVATE', reason: 'PRIVATE', effect: 'PRIVATE' })), /PRIVATE/);
 });
 
@@ -338,6 +338,12 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
         native_permission_reply_exposed: false, native_question_reply_exposed: false };
       if (payload.action === 'inspect' && payload.operation_id === 'dot-acceptance-create-20261017-0220') return {
         phase: 'denied', recorded_phase: 'denied', kind: 'create', exact_session_exists: false, effect: 'not_applied', task_outcome: 'unverified' };
+      if (payload.operation_id === 'finite-denial-error') return { error: 'PRIVATE exception', code: 'CONTROL_NOT_SENT',
+        denial_code: 'QUOTA_DENIED', denied_at_ms: 123456, stack: 'PRIVATE', token: 'PRIVATE' };
+      if (payload.action === 'inspect' && payload.operation_id === 'finite-denial-status') return { phase: 'denied',
+        denial_code: 'AUTHORITY_UNAVAILABLE_OR_CHANGED', denied_at_ms: Number.MAX_SAFE_INTEGER };
+      if (payload.action === 'inspect' && payload.operation_id === 'malicious-denial-status') return { phase: 'denied',
+        denial_code: 'PRIVATE exception token=PRIVATE', denied_at_ms: 'PRIVATE' };
       if (payload.action === 'inspect' && ['ambiguous', 'missing'].includes(payload.operation_id)) return { error: 'PRIVATE', code: 'CONTROL_AUTHORIZATION_OR_VALIDATION_DENIED', effect: 'not_established' };
       if (payload.action === 'create' && payload.project_id === 'empty-project' && Object.hasOwn(payload, 'directory')) return { error: 'PRIVATE workspace does not belong to selected discovered project', code: 'CONTROL_NOT_SENT', effect: 'no_post_permitted', reason: 'PROJECT_WORKSPACE_MISMATCH' };
       return { phase: 'fixture_dispatch', inference_started: false };
@@ -349,7 +355,18 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
   const recovered = (await integratedCall('workrelay_server_operation_status', recovery)).result;
   assert.equal(recovered.structuredContent.effect, 'not_applied');
   assert.equal(recovered.structuredContent.exact_session_exists, false);
+  assert.equal(recovered.structuredContent.denial_code, 'DENIAL_REASON_NOT_RECORDED');
+  assert.equal(recovered.structuredContent.denied_at_ms, null, 'legacy reason/time not backfilled');
   assert.equal(handed.at(-1).payload.session_id, undefined);
+  const diagnosticError = (await integratedCall('workrelay_server_resume', { session_id: root, operation_id: 'finite-denial-error', text: 'synthetic bounded fixture' })).result;
+  assert.equal(diagnosticError.isError, true); assert.equal(diagnosticError.structuredContent.denial_code, 'QUOTA_DENIED');
+  assert.equal(diagnosticError.structuredContent.denied_at_ms, 123456); assert.doesNotMatch(JSON.stringify(diagnosticError), /PRIVATE/);
+  const diagnosticStatus = (await integratedCall('workrelay_server_operation_status', { operation_id: 'finite-denial-status' })).result;
+  assert.equal(diagnosticStatus.structuredContent.denial_code, 'AUTHORITY_UNAVAILABLE_OR_CHANGED');
+  assert.equal(diagnosticStatus.structuredContent.denied_at_ms, Number.MAX_SAFE_INTEGER);
+  const maliciousStatus = (await integratedCall('workrelay_server_operation_status', { operation_id: 'malicious-denial-status' })).result;
+  assert.equal(maliciousStatus.structuredContent.denial_code, 'DENIAL_REASON_NOT_RECORDED');
+  assert.equal(maliciousStatus.structuredContent.denied_at_ms, null); assert.doesNotMatch(JSON.stringify(maliciousStatus), /PRIVATE/);
   const recoveryCount = handed.length;
   assert.equal((await integratedCall('workrelay_server_operation_status', recovery, 'other')).result.isError, true);
   assert.equal(handed.length, recoveryCount);
