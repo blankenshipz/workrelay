@@ -4,6 +4,8 @@
 
 Workrelay is open source and early-stage. It is not a hosted relay, OpenAI Dot API, or Meta Muse integration. Dot/mobile connectivity and end-to-end remote event delivery have **not** been verified. The goal is to make safe, inspectable handoffs between agents and local development environments useful across more clients and execution setups, without pretending those integrations already exist.
 
+See the [0.1.0 reviewed checkpoint notes](CHANGELOG.md) for bounded evidence and remaining acceptance gaps.
+
 ## How it works
 
 The usual remote task journey is:
