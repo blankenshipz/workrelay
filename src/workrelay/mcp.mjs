@@ -238,18 +238,32 @@ function controlDenialFields(value) {
   return { denial_code: known ? value.denial_code : 'DENIAL_REASON_NOT_RECORDED',
     denied_at_ms: known && Number.isSafeInteger(value?.denied_at_ms) && value.denied_at_ms >= 0 ? value.denied_at_ms : null };
 }
+export const CONTROL_LOOKUP_CODES = Object.freeze([
+  'CONTROL_OPERATION_NOT_FOUND_CURRENT_BINDING', 'CONTROL_OPERATION_AMBIGUOUS_CURRENT_BINDING',
+]);
+function scopedLookupFields(value) {
+  return { ...(typeof value.operation_id === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(value.operation_id) ? { operation_id: value.operation_id } : {}),
+    ...(value.session_id === null ? { session_id: null } : typeof value.session_id === 'string' && /^ses[A-Za-z0-9_-]{1,160}$/.test(value.session_id) ? { session_id: value.session_id } : {}),
+    code: value.code, phase: 'unknown', effect: 'not_established',
+    lookup_scope: 'current_authenticated_binding', native_observation: 'not_run', task_outcome: 'unverified', replay_permitted: false,
+    guidance: value.code === 'CONTROL_OPERATION_AMBIGUOUS_CURRENT_BINDING' ?
+      'Multiple receipts match within the current authenticated binding. Use the exact original session reference only if retained; otherwise ask the operator to reconcile retained receipts. Do not guess a session, change binding, or replay.' :
+      'No matching receipt was found within the current authenticated binding. This is not global absence or proof of no effect. Ask the operator to compare retained original operation/session and binding references; do not change binding or replay.' };
+}
 export function safeControlResult(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  if (CONTROL_LOOKUP_CODES.includes(value.code)) return scopedLookupFields(value);
   const { denial_code, denied_at_ms, ...rest } = value;
   return value.phase === 'denied' || value.recorded_phase === 'denied' || denial_code !== undefined || denied_at_ms !== undefined ?
     { ...rest, ...controlDenialFields(value) } : rest;
 }
 export function safeControlFailure(value) {
   const output = { error: 'Managed control denied or uncertain; inspect the original operation ID.' };
-  const allowed = { code: ['CONTROL_AUTHORIZATION_OR_VALIDATION_DENIED', 'CONTROL_NOT_SENT', 'CONTROL_UNCERTAIN', 'CONTROL_RECONCILE_EXISTING'],
+  const allowed = { code: ['CONTROL_AUTHORIZATION_OR_VALIDATION_DENIED', 'CONTROL_NOT_SENT', 'CONTROL_UNCERTAIN', 'CONTROL_RECONCILE_EXISTING', ...CONTROL_LOOKUP_CODES],
     effect: ['not_established', 'no_post_permitted', 'may_have_been_applied', 'recorded_existing_operation'],
     reason: ['PROJECT_WORKSPACE_MISMATCH', 'OPERATION_ARGUMENT_CONFLICT'] };
   for (const [key, values] of Object.entries(allowed)) if (values.includes(value?.[key])) output[key] = value[key];
+  if (CONTROL_LOOKUP_CODES.includes(value?.code)) return { error: 'Operation receipt lookup is unresolved within the current authenticated binding.', ...scopedLookupFields(value) };
   if (value?.code === 'CONTROL_NOT_SENT' || value?.phase === 'denied' || value?.recorded_phase === 'denied' ||
       value?.denial_code !== undefined || value?.denied_at_ms !== undefined) Object.assign(output, controlDenialFields(value));
   return output;
@@ -365,7 +379,7 @@ function mcp(config, invoke, events, managedReader, eventTools) {
     register(`workrelay_server_${action === 'inspect' ? 'operation_status' : action}`, {
       description: action === 'create' ? 'For the pinned server-wide principal, select project_id from workrelay_server_projects and omit directory to create an idle session at that verified native project canonical root. Optional creation_target selects the default project only. Explicit directory must be the selected root or an operator-allowlisted location within it; no arbitrary filesystem access. Supply operation_id/title. Inspect original operations before retry; never change arguments on an existing operation ID. Native model/permission/financial checks remain.' :
         action === 'waits' ? 'Read bounded redacted native permission waits for an exact session; no operation_id, inference, permission reply or approval. Decide in the native OpenCode/OpenChamber UI, then read waits again. Native question list/reply/reject routes are unsupported; messages are not approval replies.' :
-        action === 'inspect' ? 'Inspect a durable managed operation by operation_id; session_id is optional when unknown after failed creation. No continuation or interruption. Ambiguous/missing operations fail closed. Unknown is not permission to replay.' :
+        action === 'inspect' ? 'Read a historical durable receipt under the current authenticated principal/server binding; no current execution-model guard, native observation, continuation or interruption. session_id is optional when unknown. Not-found/ambiguous is scoped to this binding, never global absence or proof of no effect. Use retained original references or operator receipt reconciliation, not repeated identical failed lookups, guessed sessions, binding changes or replay. Writes retain native model/permission/financial guards.' :
         action === 'steer' ? 'Steer bounded text to the existing native owner at its supported boundary. No agent transfer or permission approval. Reuse operation_id and identical inputs.' :
         ['message', 'resume'].includes(action) ? 'Queue a bounded continuation to the existing session owner; preserves agent/model/permissions. Native approval gates and financial admission apply. Reuse operation_id with identical text to reconcile uncertainty; never blindly replay.' :
         'Interrupt only this existing session, not descendants. Not rollback; queued inputs remain and may run on later resume. Idle no-op is not active-cancel proof. Native permissions remain. Reuse operation_id to inspect the same attempt.',

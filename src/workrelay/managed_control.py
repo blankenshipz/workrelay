@@ -458,6 +458,12 @@ def create_session(db, config, client, authorize, operation_id, *, directory=Non
     return {'operation_id': operation_id, 'session_id': sid, 'phase': 'created', 'inference_started': False}
 
 
+class OperationLookupError(BridgeError):
+    def __init__(self, code):
+        self.code = code
+        super().__init__('operation lookup unavailable within current authenticated binding')
+
+
 def resolve_operation(db, authorize, operation_id, session_id=None):
     """Resolve within a freshly verified principal/server binding, never globally.
 
@@ -474,7 +480,10 @@ def resolve_operation(db, authorize, operation_id, session_id=None):
         rows = db.execute('SELECT session,kind,digest,message,phase,identity,denial_code,denied_at_ms FROM managed_operations WHERE binding=? AND operation=? LIMIT 2',
                           (binding, operation_id)).fetchall()
     require(authorize() == binding, 'authority changed')
-    require(len(rows) == 1, 'unknown or ambiguous operation for this principal; supply original session if ambiguous')
+    if not rows:
+        raise OperationLookupError('CONTROL_OPERATION_NOT_FOUND_CURRENT_BINDING')
+    if len(rows) != 1:
+        raise OperationLookupError('CONTROL_OPERATION_AMBIGUOUS_CURRENT_BINDING')
     sid, *row = rows[0]
     if row[0] == 'create':
         require(sid == creation_session_id(binding, operation_id), 'creation ledger identity mismatch')
@@ -512,10 +521,30 @@ def classified_failure(db, authorize, operation_id, session_id, error):
     return ControlFailure(details)
 
 
-def inspect_operation(db, config, client, authorize, session_id, operation_id):
+def inspect_operation(db, config, client, authorize, session_id, operation_id, *, receipt_only=False):
     """Read/reconcile a known principal-bound operation without prompt text or inference."""
-    binding, session_id, row = resolve_operation(db, authorize, operation_id, session_id)
+    try:
+        binding, session_id, row = resolve_operation(db, authorize, operation_id, session_id)
+    except OperationLookupError as error:
+        # These facts are established only after successful authorization before
+        # and after the scoped query. Never convert an auth failure to absence.
+        return {'operation_id': operation_id, 'session_id': session_id, 'code': error.code,
+                'phase': 'unknown', 'effect': 'not_established',
+                'lookup_scope': 'current_authenticated_binding', 'task_outcome': 'unverified',
+                'native_observation': 'not_run', 'replay_permitted': False}
     phase = row[3]
+    if receipt_only:
+        require(authorize() == binding, 'authority changed')
+        code, effect = ('CONTROL_NOT_SENT', 'no_post_permitted') if phase in ('reserved', 'denied') else (
+            ('CONTROL_UNCERTAIN', 'may_have_been_applied') if phase in ('sending', 'uncertain') else
+            ('CONTROL_RECONCILE_EXISTING', 'recorded_existing_operation'))
+        return {'operation_id': operation_id, 'session_id': session_id, 'kind': row[0],
+                'phase': phase, 'recorded_phase': phase, 'code': code, 'effect': effect,
+                **denial_fields(phase, row[5], row[6]),
+                'lookup_scope': 'current_authenticated_binding', 'native_observation': 'not_run',
+                'message_id': row[2] if row[0] in ('queue', 'steer') else None,
+                'task_outcome': 'unverified', 'replay_permitted': False,
+                'cancellation_is_rollback': False, 'queued_inputs_removed': False}
     def get(path):
         require(authorize() == binding, 'authority changed'); result = client.request('GET', path)
         require(authorize() == binding, 'authority changed'); return result

@@ -389,9 +389,10 @@ def main(argv=None):
                         directory=envelope.get('directory'), title=envelope.get('title'), project_id=envelope.get('project_id'),
                         authorize_native_projects=lambda: client.request('GET', '/__managed/authorize-create-project').get('binding_id'))
                 elif envelope['action'] == 'inspect':
-                    _, selected_sid, _ = resolve_operation(db, authorize, envelope.get('operation_id'), envelope.get('session_id'))
-                    config['_supervision_authority']['managed']['session_id'] = selected_sid
-                    result = inspect_operation(db, config, client, authorize, selected_sid, envelope.get('operation_id'))
+                    # Historical receipt lookup needs the same authenticated
+                    # binding, not today's execution model or native session.
+                    result = inspect_operation(db, config, client, authorize, envelope.get('session_id'),
+                                               envelope.get('operation_id'), receipt_only=True)
                 else:
                     # Resume is a bounded continuation message through the same
                     # native owner, not a new agent or approval reply.

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { CONTROL_DENIAL_CODES, safeControlFailure, safeControlResult } from '../src/workrelay/mcp.mjs';
+import { CONTROL_DENIAL_CODES, CONTROL_LOOKUP_CODES, safeControlFailure, safeControlResult } from '../src/workrelay/mcp.mjs';
 
 test('MCP control denial enum matches actual Python constant, not exception descriptions', () => {
   const path = fileURLToPath(new URL('../src/workrelay/cli.py', import.meta.url));
@@ -42,4 +42,20 @@ test('legacy denied operation stays unknown/null without backfill; unaffected st
   const unchanged = { phase: 'accepted', effect: 'recorded', operation_id: 'fixture' };
   assert.deepEqual(safeControlResult(unchanged), unchanged);
   assert.deepEqual(safeControlResult({ denial_code: 'QUOTA_DENIED', denied_at_ms: 0 }), { denial_code: 'QUOTA_DENIED', denied_at_ms: 0 });
+});
+
+test('scoped receipt lookup codes match control source and never claim global absence/no-effect or echo raw advice', () => {
+  const path = fileURLToPath(new URL('../src/workrelay/managed_control.py', import.meta.url));
+  const script = 'import ast,json,sys; t=ast.parse(open(sys.argv[1]).read()); print(json.dumps(sorted({n.args[0].value for n in ast.walk(t) if isinstance(n,ast.Call) and isinstance(n.func,ast.Name) and n.func.id=="OperationLookupError" and n.args and isinstance(n.args[0],ast.Constant)})))';
+  assert.deepEqual([...CONTROL_LOOKUP_CODES].sort(), JSON.parse(execFileSync('/usr/bin/python3', ['-c', script, path], { encoding: 'utf8' })));
+  for (const code of CONTROL_LOOKUP_CODES) for (const project of [safeControlResult, safeControlFailure]) {
+    const result = project({ code, error: 'PRIVATE', guidance: 'PRIVATE replay now', phase: 'denied', effect: 'no_post_permitted',
+      lookup_scope: 'PRIVATE', native_observation: 'PRIVATE', task_outcome: 'PRIVATE', replay_permitted: true,
+      operation_id: 'fixture', session_id: 'PRIVATE/../../session', stack: 'PRIVATE' });
+    assert.equal(result.code, code); assert.equal(result.phase, 'unknown'); assert.equal(result.effect, 'not_established');
+    assert.equal(result.lookup_scope, 'current_authenticated_binding'); assert.equal(result.native_observation, 'not_run');
+    assert.equal(result.replay_permitted, false); assert.equal(result.task_outcome, 'unverified');
+    assert.equal(result.session_id, undefined); assert.equal(result.operation_id, 'fixture');
+    assert.match(result.guidance, /operator/i); assert.match(result.guidance, /replay/); assert.doesNotMatch(JSON.stringify(result), /PRIVATE/);
+  }
 });

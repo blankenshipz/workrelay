@@ -344,7 +344,13 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
         denial_code: 'AUTHORITY_UNAVAILABLE_OR_CHANGED', denied_at_ms: Number.MAX_SAFE_INTEGER };
       if (payload.action === 'inspect' && payload.operation_id === 'malicious-denial-status') return { phase: 'denied',
         denial_code: 'PRIVATE exception token=PRIVATE', denied_at_ms: 'PRIVATE' };
-      if (payload.action === 'inspect' && ['ambiguous', 'missing'].includes(payload.operation_id)) return { error: 'PRIVATE', code: 'CONTROL_AUTHORIZATION_OR_VALIDATION_DENIED', effect: 'not_established' };
+      if (payload.action === 'inspect' && ['ambiguous', 'missing'].includes(payload.operation_id)) return {
+        code: payload.operation_id === 'missing' ? 'CONTROL_OPERATION_NOT_FOUND_CURRENT_BINDING' : 'CONTROL_OPERATION_AMBIGUOUS_CURRENT_BINDING',
+        operation_id: payload.operation_id, session_id: payload.session_id ?? null, phase: 'unknown', effect: 'not_established',
+        lookup_scope: 'current_authenticated_binding', native_observation: 'not_run', replay_permitted: false, task_outcome: 'unverified' };
+      if (payload.action === 'inspect' && payload.operation_id === 'known-uncertain') return { phase: 'uncertain', recorded_phase: 'uncertain',
+        code: 'CONTROL_UNCERTAIN', effect: 'may_have_been_applied', lookup_scope: 'current_authenticated_binding',
+        native_observation: 'not_run', replay_permitted: false, task_outcome: 'unverified' };
       if (payload.action === 'create' && payload.project_id === 'empty-project' && Object.hasOwn(payload, 'directory')) return { error: 'PRIVATE workspace does not belong to selected discovered project', code: 'CONTROL_NOT_SENT', effect: 'no_post_permitted', reason: 'PROJECT_WORKSPACE_MISMATCH' };
       return { phase: 'fixture_dispatch', inference_started: false };
     }
@@ -372,8 +378,31 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
   assert.equal(handed.length, recoveryCount);
   for (const operation_id of ['missing', 'ambiguous']) {
     const rejected = (await integratedCall('workrelay_server_operation_status', { operation_id })).result;
-    assert.equal(rejected.isError, true); assert.doesNotMatch(JSON.stringify(rejected), /PRIVATE/);
+    assert.notEqual(rejected.isError, true); assert.doesNotMatch(JSON.stringify(rejected), /PRIVATE/);
+    assert.equal(rejected.structuredContent.code, operation_id === 'missing' ? 'CONTROL_OPERATION_NOT_FOUND_CURRENT_BINDING' : 'CONTROL_OPERATION_AMBIGUOUS_CURRENT_BINDING');
+    assert.equal(rejected.structuredContent.lookup_scope, 'current_authenticated_binding');
+    assert.equal(rejected.structuredContent.effect, 'not_established'); assert.equal(rejected.structuredContent.replay_permitted, false);
+    assert.match(rejected.structuredContent.guidance, /operator/i);
   }
+  const originalModel = session.model;
+  session.model = { providerID: 'fixture-other', id: 'fixture-changed' };
+  const unchangedPosts = posts.length;
+  const historical = (await integratedCall('workrelay_server_operation_status', { operation_id: 'finite-denial-status', session_id: root })).result;
+  assert.notEqual(historical.isError, true); assert.equal(historical.structuredContent.phase, 'denied');
+  assert.equal(historical.structuredContent.denial_code, 'AUTHORITY_UNAVAILABLE_OR_CHANGED');
+  const uncertainReceipt = (await integratedCall('workrelay_server_operation_status', { operation_id: 'known-uncertain', session_id: root })).result;
+  assert.equal(uncertainReceipt.structuredContent.code, 'CONTROL_UNCERTAIN'); assert.equal(uncertainReceipt.structuredContent.effect, 'may_have_been_applied');
+  assert.equal(uncertainReceipt.structuredContent.replay_permitted, false); assert.equal(uncertainReceipt.structuredContent.native_observation, 'not_run');
+  assert.equal(uncertainReceipt.structuredContent.denial_code, undefined, 'uncertain is not resolved denied');
+  assert.equal(posts.length, unchangedPosts, 'historical receipt reads never POST'); session.model = originalModel;
+  const isolatedCount = handed.length;
+  await assert.rejects(call(client, 'workrelay_server_operation_status', recovery, { subject: 'other' }, integrated));
+  for (const changed of [{ ...binding, revoked: true }, { ...binding, server: 'http://127.0.0.1:1' }]) {
+    await fs.writeFile(capability, JSON.stringify(changed));
+    assert.equal((await integratedCall('workrelay_server_operation_status', recovery)).result.isError, true);
+    assert.equal(handed.length, isolatedCount, 'revoked/wrong-server binding cannot reach receipt lookup');
+  }
+  await fs.writeFile(capability, JSON.stringify(binding));
   const nondefault = { operation_id: 'nondefault-native-project', project_id: 'project_' + createHash('sha256').update('empty-project').digest('hex'), title: 'Native project idle session' };
   const nativeCreate = (await integratedCall('workrelay_server_create', nondefault)).result;
   assert.notEqual(nativeCreate.isError, true);

@@ -235,8 +235,9 @@ class ManagedControlTests(unittest.TestCase):
         self.assertFalse(observed['cancellation_is_rollback'])
         self.assertEqual(self.session, original)
         self.binding = 'b' * 64
-        with self.assertRaises(BridgeError):
-            inspect_operation(self.db, self.config, self, self.authorize, self.sid, 'operation')
+        missing = inspect_operation(self.db, self.config, self, self.authorize, self.sid, 'operation')
+        self.assertEqual(missing['code'], 'CONTROL_OPERATION_NOT_FOUND_CURRENT_BINDING')
+        self.assertEqual(missing['effect'], 'not_established')
 
     def test_exact_full_model_and_raw_input_bound(self):
         self.session['model'] = {**self.config['model'], 'variant': 'different'}
@@ -424,6 +425,91 @@ class ManagedControlTests(unittest.TestCase):
             self.assertIsInstance(failure['denied_at_ms'], int)
             self.assertNotIn('Traceback', err.getvalue())
             self.assertEqual(self.posts(), [])
+
+
+    @patch('workrelay.managed_control.admission')
+    def test_receipt_only_status_survives_current_execution_model_change(self, admit):
+        self.run_control(text='hello')
+        before = self.db.execute('SELECT * FROM managed_operations').fetchall()
+        self.session['model'] = {**self.config['model'], 'variant': 'changed'}
+        self.session['agent'] = 'changed-owner'
+        self.calls = []
+        result = inspect_operation(self.db, self.config, self, self.authorize, self.sid, 'operation', receipt_only=True)
+        self.assertEqual(result['recorded_phase'], 'queued')
+        self.assertEqual(result['code'], 'CONTROL_RECONCILE_EXISTING')
+        self.assertEqual(result['native_observation'], 'not_run')
+        self.assertFalse(result['replay_permitted'])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.db.execute('SELECT * FROM managed_operations').fetchall(), before)
+        # Receipt visibility does not relax write admission or reconciliation.
+        with self.assertRaises(BridgeError):
+            self.run_control('different', text='new message')
+        self.assertFalse(self.posts())
+
+    def test_receipt_unknown_is_scoped_not_authorization_or_global_absence(self):
+        self.reserve_without_send()
+        self.calls = []
+        before = self.db.execute('SELECT * FROM managed_operations').fetchall()
+        for binding in ('b' * 64, 'c' * 64):
+            self.binding = binding  # Other principal/server bindings see no old receipt.
+            result = inspect_operation(self.db, self.config, self, self.authorize, self.sid, 'operation', receipt_only=True)
+            self.assertEqual(result['code'], 'CONTROL_OPERATION_NOT_FOUND_CURRENT_BINDING')
+            self.assertEqual(result['effect'], 'not_established')
+            self.assertEqual(result['lookup_scope'], 'current_authenticated_binding')
+            self.assertNotIn('message_id', result)
+        self.binding = None
+        with self.assertRaises(BridgeError):
+            inspect_operation(self.db, self.config, self, self.authorize, self.sid, 'operation', receipt_only=True)
+        self.binding = 'a' * 64
+        with self.assertRaises(BridgeError):
+            inspect_operation(self.db, self.config, self, self.authorize, '../invalid', 'operation', receipt_only=True)
+        self.assertEqual(self.db.execute('SELECT * FROM managed_operations').fetchall(), before)
+        self.assertEqual(self.calls, [])
+
+    def test_receipt_ambiguity_authority_change_and_stored_phases(self):
+        self.reserve_without_send()
+        for phase, code, effect in (
+                ('reserved', 'CONTROL_NOT_SENT', 'no_post_permitted'),
+                ('denied', 'CONTROL_NOT_SENT', 'no_post_permitted'),
+                ('sending', 'CONTROL_UNCERTAIN', 'may_have_been_applied'),
+                ('uncertain', 'CONTROL_UNCERTAIN', 'may_have_been_applied'),
+                ('queued', 'CONTROL_RECONCILE_EXISTING', 'recorded_existing_operation')):
+            self.db.execute('UPDATE managed_operations SET phase=?', (phase,))
+            result = inspect_operation(self.db, self.config, self, self.authorize, self.sid, 'operation', receipt_only=True)
+            self.assertEqual((result['code'], result['effect']), (code, effect))
+            if phase == 'denied':
+                self.assertEqual(result['denial_code'], 'DENIAL_REASON_NOT_RECORDED')
+                self.assertIsNone(result['denied_at_ms'])
+        self.db.execute("INSERT INTO managed_operations(binding,session,operation,kind,digest,message,phase,identity,reservation_pid) SELECT binding,'ses_other',operation,kind,digest,message,phase,identity,reservation_pid FROM managed_operations")
+        result = inspect_operation(self.db, self.config, self, self.authorize, None, 'operation', receipt_only=True)
+        self.assertEqual(result['code'], 'CONTROL_OPERATION_AMBIGUOUS_CURRENT_BINDING')
+        self.assertIsNone(result['session_id'])
+        self.assertNotIn('message_id', result)
+        with self.assertRaises(BridgeError):
+            inspect_operation(self.db, self.config, self, unittest.mock.Mock(side_effect=['a' * 64, None]),
+                              self.sid, 'missing', receipt_only=True)
+        self.assertFalse(self.posts())
+
+    def test_module_status_unknown_returns_finite_success_without_native_session_read(self):
+        from workrelay import cli
+        with tempfile.TemporaryDirectory() as directory:
+            config = {'transport': 'installed-client', 'authorized_owner': 'fixture', 'model': self.config['model']}
+            def request(method, path, body=None):
+                self.assertEqual((method, path, body), ('GET', '/__managed/authorize', None))
+                return {'binding_id': self.binding}
+            self.request = request
+            payload = {'action': 'inspect', 'session_id': self.sid, 'operation_id': 'missing', 'claims': {}}
+            out, err = io.StringIO(), io.StringIO()
+            with patch.object(cli, 'load_config', return_value=(config, None, Path(directory), Path(directory))), \
+                 patch.object(cli, 'InstalledClient', return_value=self), \
+                 patch('sys.argv', ['workrelay', '--config', 'fixture-reference', 'managed-control', '--owner', 'fixture']), \
+                 patch('sys.stdin', io.StringIO(json.dumps(payload))), \
+                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                self.assertEqual(cli.main(), 0)
+            result = json.loads(out.getvalue())
+            self.assertEqual(result['code'], 'CONTROL_OPERATION_NOT_FOUND_CURRENT_BINDING')
+            self.assertEqual(result['effect'], 'not_established')
+            self.assertEqual(err.getvalue(), '')
 
 
 class CreationTests(unittest.TestCase):
