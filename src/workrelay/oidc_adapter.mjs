@@ -3,6 +3,7 @@
 import { spawn } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { errors } from 'oidc-provider';
 
 export function createIssuerAdapter(stateDir, python = '/usr/bin/python3') {
   if (typeof stateDir !== 'string' || !stateDir.startsWith('/') || typeof python !== 'string')
@@ -39,7 +40,12 @@ export function createIssuerAdapter(stateDir, python = '/usr/bin/python3') {
     find(id) { return call({ model: this.model, action: 'find', id }); }
     findByUid(id) { return call({ model: this.model, action: 'findByUid', id }); }
     findByUserCode(id) { return call({ model: this.model, action: 'findByUserCode', id }); }
-    consume(id) { return call({ model: this.model, action: 'consume', id }); }
+    async consume(id) {
+      const result = await call({ model: this.model, action: 'consume', id });
+      if (this.model === 'RefreshToken' && result?.error === 'refresh_token_unavailable')
+        throw new errors.InvalidGrant('refresh token no longer available');
+      return result;
+    }
     destroy(id) { return call({ model: this.model, action: 'destroy', id }); }
     revokeByGrantId(grantId) { return call({ model: this.model, action: 'revokeByGrantId', grantId }); }
   };

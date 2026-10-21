@@ -186,13 +186,28 @@ def execute(db, command, now=None):
             require(isinstance(identifier, str) and 0 < len(identifier) <= 256)
             row = db.execute("SELECT payload FROM records WHERE model=? AND id=? AND (expires IS NULL OR expires>?)",
                              (model, identifier, now)).fetchone()
-            require(row is not None)
-            value = json.loads(row[0])
-            require(isinstance(value, dict) and "consumed" not in value)
-            value["consumed"] = now
-            db.execute("UPDATE records SET payload=? WHERE model=? AND id=?",
-                       (json.dumps(value, separators=(",", ":")), model, identifier))
-            answer = None
+            value = json.loads(row[0]) if row else None
+            if model == "RefreshToken" and (value is None or "consumed" in value):
+                # Concurrent requests can both find an unused token before either
+                # consumes it. This is a protocol replay, not a storage outage.
+                # Match the provider's replay revocation in this same transaction.
+                # Deleting Grant also invalidates any late-saved successor; never
+                # revive the old grant or permit two successful consumers.
+                if value is not None:
+                    grant = value.get("grantId")
+                    require(isinstance(grant, str) and 0 < len(grant) <= 256)
+                    db.execute("DELETE FROM records WHERE model='Grant' AND id=?", (grant,))
+                    for record_model, record_id, content in db.execute(
+                            "SELECT model,id,payload FROM records").fetchall():
+                        if json.loads(content).get("grantId") == grant:
+                            db.execute("DELETE FROM records WHERE model=? AND id=?", (record_model, record_id))
+                answer = {"error": "refresh_token_unavailable"}
+            else:
+                require(isinstance(value, dict) and "consumed" not in value)
+                value["consumed"] = now
+                db.execute("UPDATE records SET payload=? WHERE model=? AND id=?",
+                           (json.dumps(value, separators=(",", ":")), model, identifier))
+                answer = None
         elif action == "destroy":
             db.execute("DELETE FROM records WHERE model=? AND id=?", (model, command.get("id")))
             answer = None

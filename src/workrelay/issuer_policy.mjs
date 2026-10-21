@@ -187,6 +187,26 @@ function exactResource(value, resource) {
   return true;
 }
 
+// Called by the supported findAccount hook before refresh consumption AND replay
+// revocation. Consumed records retain accountId/clientId/resource/scope; never
+// let an invalid binding turn a stale token into a family-revocation primitive.
+export function validateRefreshBinding(ctx, accountId, source, { principal, clientId, resource }) {
+  if (ctx.oidc?.route !== 'token' || ctx.oidc.params.grant_type !== 'refresh_token') return;
+  if (accountId !== principal || source?.accountId !== principal ||
+      source?.clientId !== clientId || ctx.oidc.client?.clientId !== clientId)
+    throw new errors.InvalidGrant('refresh binding unavailable');
+  // The provider resolves arrays through our denying defaultResource after
+  // rotation, so even repeated identical request indicators must fail early.
+  if (!exactResource(source.resource, resource) || Array.isArray(ctx.oidc.params.resource) ||
+      !exactResource(ctx.oidc.params.resource, resource)) throw new errors.InvalidTarget();
+  const granted = typeof source.scope === 'string' ? source.scope.split(' ') : [];
+  const requested = ctx.oidc.params.scope === undefined ? granted :
+    typeof ctx.oidc.params.scope === 'string' ? ctx.oidc.params.scope.split(' ') : [];
+  if (!granted.length || !requested.length ||
+      granted.some(scope => !['workrelay:tasks', 'openid'].includes(scope)) ||
+      requested.some(scope => !granted.includes(scope))) throw new errors.InvalidScope();
+}
+
 export async function loadPreapprovedChatGPTGrant(ctx, { principal, resource, onDenied }) {
   const { account, session, client, params, provider } = ctx.oidc;
   const scopes = typeof params.scope === 'string' ? params.scope.split(' ') : [];
@@ -206,7 +226,12 @@ export async function loadPreapprovedChatGPTGrant(ctx, { principal, resource, on
   const grantId = ctx.oidc.result?.consent?.grantId || session.grantIdFor(client.clientId);
   if (grantId) {
     const existing = await provider.Grant.find(grantId);
-    if (!existing || existing.accountId !== principal || existing.clientId !== client.clientId)
+    // A browser session may retain a revoked/expired grant reference. Returning
+    // no grant invokes the provider's ordinary fresh-consent interaction; do
+    // not preapprove a replacement or revive the old grant. The authenticated
+    // human must explicitly authorize the new grant through the CSRF form.
+    if (!existing) return undefined;
+    if (existing.accountId !== principal || existing.clientId !== client.clientId)
       throw new errors.AccessDenied('existing grant unavailable');
     if (scopes.includes('openid') && !existing.getOIDCScope().split(' ').includes('openid')) {
       existing.addOIDCScope('openid');
@@ -254,6 +279,7 @@ export function createUnexposedIssuerPolicy({ origin, principal, jwks, cookieKey
       token_endpoint_auth_method: 'none', response_types: ['code'],
       grant_types: ['authorization_code', 'refresh_token'] }],
     findAccount: async (ctx, accountId, source) => {
+      validateRefreshBinding(ctx, accountId, source, { principal, clientId, resource });
       if (accountId !== principal) return undefined;
       const account = await findAccount(ctx, accountId, source);
       if (account?.accountId !== principal) return undefined;

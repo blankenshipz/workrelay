@@ -8,6 +8,7 @@ import { join, resolve, dirname, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import argon2 from 'argon2';
+import { CHATGPT_CIMD_ID } from './issuer_policy.mjs';
 
 const COOKIE = '__Host-workrelay-flow';
 const WINDOW_MS = 300000;
@@ -366,12 +367,18 @@ export function createLocalInteractions({ provider, directory, origin, clientId,
         await provider.interactionFinished(req, res, { error: 'access_denied' }, { mergeWithLastSubmission: false }); return true;
       }
       const missing = details.prompt.details;
-      if (missing.missingOIDCScope?.length || missing.missingOIDCClaims?.length || missing.rar?.length ||
+       // Only the pinned ChatGPT client may explicitly re-consent to minimal
+       // OIDC identity. Never accept profile/email/offline scopes or claims.
+       const oidcScopes = missing.missingOIDCScope ?? [];
+       const allowOpenid = clientId === CHATGPT_CIMD_ID &&
+         details.params?.scope?.split(' ').includes('openid');
+       if (oidcScopes.some(scope => scope !== 'openid' || !allowOpenid) || missing.missingOIDCClaims?.length || missing.rar?.length ||
           Object.keys(missing.missingResourceScopes ?? {}).some(key => key !== resource) ||
           (missing.missingResourceScopes?.[resource] ?? []).some(scope => scope !== 'workrelay:tasks')) return deny('scope');
       const grant = details.grantId ? await provider.Grant.find(details.grantId) :
         new provider.Grant({ accountId: human.accountId, clientId });
-      if (!grant || grant.accountId !== human.accountId || grant.clientId !== clientId) return deny('grant');
+       if (!grant || grant.accountId !== human.accountId || grant.clientId !== clientId) return deny('grant');
+       if (oidcScopes.includes('openid')) grant.addOIDCScope('openid');
       if (missing.missingResourceScopes?.[resource]?.length) grant.addResourceScope(resource, 'workrelay:tasks');
       const grantId = await grant.save();
       await provider.interactionFinished(req, res, { consent: details.grantId ? {} : { grantId } }, { mergeWithLastSubmission: true });

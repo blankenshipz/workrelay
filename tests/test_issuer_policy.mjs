@@ -6,8 +6,28 @@ import { promises as fs } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createIssuerAdapter } from '../src/workrelay/oidc_adapter.mjs';
-import { createUnexposedIssuerPolicy, restrictedClientDocument, CHATGPT_CIMD_ID,
+import { createUnexposedIssuerPolicy, validateRefreshBinding, restrictedClientDocument, CHATGPT_CIMD_ID,
   CHATGPT_CIMD_REDIRECT } from '../src/workrelay/issuer_policy.mjs';
+
+test('refresh binding helper fails closed for fresh and consumed malformed source/subject/client/scope', () => {
+  const config = { principal: 'person', clientId: 'client', resource: 'https://issuer.test/mcp' };
+  for (const consumed of [undefined, 1]) {
+    const source = { accountId: 'person', clientId: 'client', resource: [config.resource], scope: 'workrelay:tasks openid', consumed };
+    const ctx = { oidc: { route: 'token', client: { clientId: 'client' },
+      params: { grant_type: 'refresh_token', resource: config.resource } } };
+    assert.doesNotThrow(() => validateRefreshBinding(ctx, 'person', source, config));
+    for (const patch of [{ accountId: 'other' }, { clientId: 'other' }, { resource: undefined },
+      { resource: ['https://other.test/mcp'] }, { scope: undefined }, { scope: 'profile' }]) {
+      assert.throws(() => validateRefreshBinding(ctx, 'person', { ...source, ...patch }, config));
+    }
+    assert.throws(() => validateRefreshBinding(ctx, 'other', source, config));
+    assert.throws(() => validateRefreshBinding(ctx, 'person', undefined, config));
+    ctx.oidc.client.clientId = 'other';
+    assert.throws(() => validateRefreshBinding(ctx, 'person', source, config));
+    ctx.oidc.client.clientId = 'client'; ctx.oidc.params.scope = 'profile';
+    assert.throws(() => validateRefreshBinding(ctx, 'person', source, config));
+  }
+});
 
 test('CIMD transport caps streamed bytes, rejects redirects, wrong content and dangerous metadata', async () => {
   const doc = { client_id: CHATGPT_CIMD_ID, redirect_uris: [CHATGPT_CIMD_REDIRECT],

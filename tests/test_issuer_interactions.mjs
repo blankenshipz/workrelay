@@ -206,13 +206,15 @@ test('preapproval hook rejects account and capability escalation and cannot resu
     c => { c.params.redirect_uri = 'https://wrong.example.test'; },
     c => { c.params.scope += ' profile'; }, c => { c.params.scope = ''; },
     c => { c.params.resource = [resource, 'https://wrong.example.test']; },
-    c => { c.session.grantIdFor = () => 'synthetic-revoked'; },
   ]) {
     const ctx = context(); mutate(ctx.oidc);
     await assert.rejects(loadPreapprovedChatGPTGrant(ctx, { principal, resource }),
       error => error.error === 'access_denied');
   }
   assert.equal(created, 0, 'denied requests never create a grant');
+  const revokedContext = context(); revokedContext.oidc.session.grantIdFor = () => 'synthetic-revoked';
+  assert.equal(await loadPreapprovedChatGPTGrant(revokedContext, { principal, resource }), undefined);
+  assert.equal(created, 0, 'missing revoked grant requires provider consent, not automatic replacement');
   const cases = [
     ['account', c => { c.account = undefined; }],
     ['session', c => { c.session.accountId = 'wrong'; }],
@@ -491,8 +493,8 @@ for (const registration of ['static', 'chatgpt-cimd', 'chatgpt-preapproved']) te
     const wrong = context(); wrong.oidc.account.accountId = 'other';
     await assert.rejects(loadPreapprovedChatGPTGrant(wrong, { principal: 'person1', resource: origin + '/mcp' }));
     await upgraded.destroy();
-    await assert.rejects(loadPreapprovedChatGPTGrant(context(), { principal: 'person1', resource: origin + '/mcp' }),
-      error => error.error === 'access_denied');
+    assert.equal(await loadPreapprovedChatGPTGrant(context(), { principal: 'person1', resource: origin + '/mcp' }), undefined,
+      'revoked reference requires ordinary fresh consent');
     assert.equal(await provider.Grant.find(id), undefined, 'revoked grant not recreated');
   }
   provider.use(async (ctx, next) => {

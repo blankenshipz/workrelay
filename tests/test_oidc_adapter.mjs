@@ -81,6 +81,25 @@ test('two OS processes race to consume one code: only one transaction claims it'
   assert.ok((await code.find('single-use')).consumed);
 });
 
+test('refresh consume conflict is invalid_grant and atomically revokes only its family', async t => {
+  const root = await fs.mkdtemp(join(tmpdir(), 'workrelay-refresh-race-'));
+  await fs.chmod(root, 0o700);
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const Adapter = createIssuerAdapter(root), grants = new Adapter('Grant'), tokens = new Adapter('RefreshToken');
+  await grants.upsert('family', { accountId: 'one' }, 120);
+  await grants.upsert('unrelated', { accountId: 'two' }, 120);
+  await tokens.upsert('input', { grantId: 'family' }, 120);
+  await tokens.upsert('other', { grantId: 'unrelated' }, 120);
+  const results = await Promise.allSettled([tokens.consume('input'), tokens.consume('input')]);
+  assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
+  assert.equal(results.find(r => r.status === 'rejected').reason.error, 'invalid_grant');
+  assert.equal(await grants.find('family'), null);
+  assert.equal(await tokens.find('input'), null);
+  assert.equal((await grants.find('unrelated')).accountId, 'two');
+  assert.equal((await tokens.find('other')).grantId, 'unrelated');
+  await assert.rejects(tokens.consume('input'), error => error.error === 'invalid_grant');
+});
+
 test('two OS processes enforce persistent admission quota while pruning only expired rows', async t => {
   const root = await fs.mkdtemp(join(tmpdir(), 'workrelay-store-quota-'));
   await fs.chmod(root, 0o700);
