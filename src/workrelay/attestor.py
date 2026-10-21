@@ -65,6 +65,12 @@ def payload(client, path):
 
 def verify(config, client):
     """Check route metadata and pinned local guard files; never return raw metadata."""
+    ref = config.get('model')
+    check(isinstance(ref, dict) and set(ref) <= {'providerID', 'id', 'variant'} and
+          ref.get('providerID') == 'openai' and isinstance(ref.get('id'), str) and
+          0 < len(ref['id']) <= 200 and ref['id'].isprintable() and
+          ('variant' not in ref or isinstance(ref['variant'], str) and
+           0 < len(ref['variant']) <= 200 and ref['variant'].isprintable()))
     guard = payload(client, "/api/plugin")
     check(isinstance(guard, list) and all(isinstance(plugin, dict) for plugin in guard))
     matches = [plugin for plugin in guard if plugin.get("id") == "subscription.guard"]
@@ -93,14 +99,18 @@ def verify(config, client):
         except OSError:
             raise AttestationError("guarded OAuth route unverified") from None
 
+    provider = payload(client, "/api/provider/openai")
+    check(isinstance(provider, dict))
+    # Native ModelResolver.load resolves credentials from
+    # provider.integrationID ?? selected.providerID. Attesting another active
+    # OAuth integration would not attest this request's actual credential source.
+    check(provider.get('integrationID', 'openai') == 'openai')
     integration = payload(client, "/api/integration/openai")
     check(isinstance(integration, dict))
     connections = integration.get("connections")
     check(integration.get("id") == "openai" and isinstance(connections, list) and len(connections) == 1 and
           isinstance(connections[0], dict) and
           connections[0].get("type") == "credential" and connections[0].get("method") == "oauth")
-    provider = payload(client, "/api/provider/openai")
-    check(isinstance(provider, dict))
     settings = provider.get("settings") or {}
     headers = provider.get("headers") or {}
     check(isinstance(settings, dict) and isinstance(headers, dict))
@@ -122,6 +132,28 @@ def verify(config, client):
     selected = [m for m in models if m.get("id") == config["model"]["id"]]
     check(len(selected) == 1 and selected[0].get("package") in
           ("@opencode/ai/providers/openai", "@opencode/ai/providers/openai/responses"))
+    model = selected[0]
+    variants = model.get('variants', [])
+    check(isinstance(variants, list) and len(variants) <= 1000 and all(isinstance(v, dict) for v in variants))
+    # Native ModelResolver.withVariant treats only "default" as omitted. Every
+    # other variant must exist exactly once; never invent an alias/effort level.
+    if ref.get('variant') not in (None, 'default'):
+        check(sum(v.get('id') == ref['variant'] for v in variants) == 1)
+    for overlay in [model, *variants]:
+        check(overlay.get('package', provider['package']) in
+              ('@opencode/ai/providers/openai', '@opencode/ai/providers/openai/responses'))
+        options, extra_headers = overlay.get('settings') or {}, overlay.get('headers') or {}
+        check(isinstance(options, dict) and isinstance(extra_headers, dict) and 'apiKey' not in options and
+              not any(name.lower() in ('authorization', 'api-key', 'x-api-key') for name in extra_headers))
+        if 'baseURL' in options:
+            endpoint = urlsplit(options['baseURL'])
+            check(endpoint.scheme == 'https' and endpoint.netloc == 'chatgpt.com' and
+                  (endpoint.path == '/backend-api/codex' or endpoint.path.startswith('/backend-api/codex/')) and
+                  not endpoint.username and not endpoint.password and not endpoint.query and not endpoint.fragment)
+    # No cached source attestation. A source/connection change during metadata
+    # reads invalidates this preflight; native request authorization still wins.
+    check(payload(client, '/api/provider/openai') == provider)
+    check(payload(client, '/api/integration/openai') == integration)
     return True
 
 

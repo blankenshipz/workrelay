@@ -240,7 +240,7 @@ class ManagedControlTests(unittest.TestCase):
         self.assertEqual(missing['effect'], 'not_established')
 
     def test_exact_full_model_and_raw_input_bound(self):
-        self.session['model'] = {**self.config['model'], 'variant': 'different'}
+        self.session['model'] = {**self.config['model'], 'unrecognizedRouteOverride': 'different'}
         with self.assertRaises(BridgeError): self.run_control(text='hello')
         with self.assertRaises(BridgeError): self.run_control(text='hello' + ' ' * 16000)
         self.assertEqual(self.posts(), [])
@@ -442,6 +442,7 @@ class ManagedControlTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         self.assertEqual(self.db.execute('SELECT * FROM managed_operations').fetchall(), before)
         # Receipt visibility does not relax write admission or reconciliation.
+        admit.side_effect = GuardFailure('ATTESTATION_FAILED')
         with self.assertRaises(BridgeError):
             self.run_control('different', text='new message')
         self.assertFalse(self.posts())
@@ -510,6 +511,123 @@ class ManagedControlTests(unittest.TestCase):
             self.assertEqual(result['code'], 'CONTROL_OPERATION_NOT_FOUND_CURRENT_BINDING')
             self.assertEqual(result['effect'], 'not_established')
             self.assertEqual(err.getvalue(), '')
+
+
+    def configure_catalog_route_fixture(self):
+        # Reuse the existing isolated native-metadata/guard-files fixture, not
+        # a live service or a provider credential. No transport script executes.
+        from test_bridge import BridgeTests, FakeClient
+        fixture = BridgeTests(); fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        self.config = copy.deepcopy(fixture.data)
+        self.session['model'] = {'providerID': 'openai', 'id': 'fixture-other-model', 'variant': 'medium'}
+        model = {'providerID': 'openai', 'id': 'fixture-other-model', 'modelID': 'fixture-native-model',
+                 'package': '@opencode/ai/providers/openai', 'variants': [{'id': 'medium'}]}
+        FakeClient.metadata['/api/model'].append(model)
+        original = self.request
+        def request(method, path, body=None):
+            if method == 'GET' and path in FakeClient.metadata:
+                return {'data': copy.deepcopy(FakeClient.metadata[path])}
+            return original(method, path, body)
+        self.request = request
+        return FakeClient.metadata, model
+
+    def test_exact_catalog_other_model_attests_and_retries_without_replay(self):
+        metadata, model = self.configure_catalog_route_fixture()
+        original = copy.deepcopy(self.session)
+        result = self.run_control(text='hello')
+        self.assertEqual(result['phase'], 'queued')
+        self.assertEqual(self.session, original)
+        self.assertNotEqual(self.session['model'], self.config['model'])
+        self.assertEqual(self.run_control(text='hello'), result)
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_catalog_variant_credentials_quota_and_authority_fail_closed(self):
+        metadata, model = self.configure_catalog_route_fixture()
+        for mode in ('variant', 'variant_key', 'model_endpoint', 'provider_key', 'quota', 'native_read'):
+            with self.subTest(mode=mode):
+                self.db.execute('DROP TABLE IF EXISTS managed_operations')
+                model['variants'] = [{'id': 'medium'}]; model.pop('settings', None)
+                metadata['/api/provider/openai'].pop('settings', None)
+                self.session['model']['variant'] = 'medium'
+                if mode == 'variant': self.session['model']['variant'] = 'unsupported-fixture-variant'
+                if mode == 'variant_key': model['variants'][0]['settings'] = {'apiKey': 'synthetic-do-not-use'}
+                if mode == 'model_endpoint': model['settings'] = {'baseURL': 'https://api.openai.com/v1'}
+                if mode == 'provider_key': metadata['/api/provider/openai']['settings'] = {'apiKey': 'synthetic-do-not-use'}
+                original = self.request
+                if mode == 'native_read':
+                    def denied(method, path, body=None):
+                        if path == '/api/model': raise BridgeError('native access denied')
+                        return original(method, path, body)
+                    self.request = denied
+                try:
+                    if mode == 'quota':
+                        with patch('workrelay.cli.subprocess.run', return_value=type('Result', (), {'returncode': 1})()):
+                            with self.assertRaises(GuardFailure): self.run_control(text='hello')
+                    else:
+                        with self.assertRaises(GuardFailure): self.run_control(text='hello')
+                    code = self.db.execute('SELECT denial_code FROM managed_operations').fetchone()[0]
+                    self.assertEqual(code, 'QUOTA_DENIED' if mode == 'quota' else 'ATTESTATION_FAILED')
+                    self.assertEqual(self.posts(), [])
+                finally:
+                    self.request = original
+
+    def test_catalog_model_change_during_attestation_is_denied_before_post(self):
+        self.configure_catalog_route_fixture()
+        original = self.request
+        def change(method, path, body=None):
+            result = original(method, path, body)
+            if path == '/api/model': self.session['model']['variant'] = 'other'
+            return result
+        self.request = change
+        with self.assertRaises(GuardFailure): self.run_control(text='hello')
+        self.assertEqual(self.db.execute('SELECT phase,denial_code FROM managed_operations').fetchone(), ('denied', 'IDENTITY_CHANGED'))
+        self.assertEqual(self.posts(), [])
+
+    def test_attestation_resolved_integration_source_is_exact_openai_oauth(self):
+        metadata, _ = self.configure_catalog_route_fixture()
+        provider = metadata['/api/provider/openai']
+        for source in ('foreign-oauth', 'api-key-source', '', None, {'malicious': 'source'}):
+            with self.subTest(source_type=type(source).__name__):
+                self.db.execute('DROP TABLE IF EXISTS managed_operations')
+                provider['integrationID'] = source
+                reads = []; original = self.request
+                def read(method, path, body=None):
+                    reads.append(path)
+                    return original(method, path, body)
+                self.request = read
+                try:
+                    with self.assertRaises(GuardFailure) as failure:
+                        self.run_control(text='hello')
+                    self.assertEqual(failure.exception.denial_code, 'ATTESTATION_FAILED')
+                    self.assertEqual(self.db.execute('SELECT phase,denial_code FROM managed_operations').fetchone(),
+                                     ('denied', 'ATTESTATION_FAILED'))
+                    self.assertNotIn('/api/integration/openai', reads)
+                    self.assertFalse(self.posts())
+                finally:
+                    self.request = original
+        provider['integrationID'] = 'openai'
+        self.db.execute('DROP TABLE IF EXISTS managed_operations')
+        metadata['/api/integration/openai']['connections'][0]['method'] = 'api-key'
+        with self.assertRaises(GuardFailure): self.run_control(text='hello')
+        self.assertEqual(self.db.execute('SELECT denial_code FROM managed_operations').fetchone()[0], 'ATTESTATION_FAILED')
+        self.assertFalse(self.posts())
+
+    def test_attestation_explicit_openai_source_passes_and_source_race_fails(self):
+        metadata, _ = self.configure_catalog_route_fixture()
+        metadata['/api/provider/openai']['integrationID'] = 'openai'
+        self.assertEqual(self.run_control(text='hello')['phase'], 'queued')
+        self.assertEqual(len(self.posts()), 1)
+        self.calls = []; self.db.execute('DROP TABLE managed_operations')
+        original = self.request
+        def change_source(method, path, body=None):
+            response = original(method, path, body)
+            if path == '/api/model': metadata['/api/provider/openai']['integrationID'] = 'foreign-oauth'
+            return response
+        self.request = change_source
+        with self.assertRaises(GuardFailure): self.run_control(text='hello')
+        self.assertEqual(self.db.execute('SELECT phase,denial_code FROM managed_operations').fetchone(),
+                         ('denied', 'ATTESTATION_FAILED'))
+        self.assertFalse(self.posts())
 
 
 class CreationTests(unittest.TestCase):

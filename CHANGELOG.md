@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Clarify guarded inference routing: new managed sessions use the configured creation-model default; existing sessions are evaluated against their current native catalog resolution and actual pinned OpenAI OAuth integration, with credentials, quota, guard and identity rechecked. This documentation reflects reviewed source behavior but does not claim the current deployed installation or ChatGPT journey accepted the route clarification. Unsupported/ambiguous routes remain fail-closed; no universal model ID, API-key path or fallback is promised.
+
 ## 0.1.0 — reviewed checkpoint
 
 This is an initial reviewed checkpoint, not a claim that the full remote acceptance journey is complete. The checkpoint is based on reviewed source at `41f492326a08021cb521f9f815f8dfa6d46e4dd0`; these notes do not change runtime behavior or represent a new installation.

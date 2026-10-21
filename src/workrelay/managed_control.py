@@ -204,14 +204,22 @@ def control(db, config, client, authorize, session_id, operation_id, *, text=Non
             raise GuardFailure('SESSION_READ_FAILED') from None
         check()
         return result
+    route_model = None
     def snapshot():
+        nonlocal route_model
         result = get('/api/session/' + session_id)
         session = result.get('data') if isinstance(result, dict) else None
         if not isinstance(session, dict):
             raise GuardFailure('SESSION_READ_FAILED')
         if not interrupt:
-            if not (session.get('model') == config.get('model') and isinstance(config.get('model'), dict) and config['model'].get('providerID') == 'openai'):
+            model = session.get('model')
+            if not (isinstance(model, dict) and model.get('providerID') == 'openai' and
+                    set(model) <= {'providerID', 'id', 'variant'} and isinstance(model.get('id'), str) and model['id']):
                 raise GuardFailure('MODEL_MISMATCH')
+            if route_model is None:
+                route_model = json.loads(json.dumps(model))
+            elif route_model != model:
+                raise GuardFailure('IDENTITY_CHANGED')
         if session.get('id') != session_id:
             raise GuardFailure('IDENTITY_CHANGED')
         return identity(session, session_id)
@@ -267,8 +275,12 @@ def control(db, config, client, authorize, session_id, operation_id, *, text=Non
             db.execute('ROLLBACK')
         raise
     try:
+        if snapshot() != current:
+            raise GuardFailure('IDENTITY_CHANGED')
         if not interrupt:
-            admission(config, client)  # Existing quota + installed OAuth/guard attestation, no fallback.
+            # Existing-session model is authoritative. Creation keeps its configured
+            # default; every write freshly attests this exact full native reference.
+            admission({**config, 'model': route_model}, client)
         check()
         if snapshot() != current:
             raise GuardFailure('IDENTITY_CHANGED')
