@@ -13,8 +13,22 @@ import sys
 from urllib.parse import urlsplit, unquote
 
 
+ATTESTATION_CHECK_IDS = frozenset({
+    'UNCLASSIFIED', 'MODEL_REF', 'PLUGIN_READ_UNAVAILABLE', 'PLUGIN_RESPONSE',
+    'GUARD_PLUGIN_STATE', 'GUARD_SOURCE', 'GUARD_PIN_CONFIG',
+    'GUARD_ENTRY_PIN', 'GUARD_IMPLEMENTATION_PIN', 'GUARD_FINANCIAL_PIN',
+    'GUARD_FILE_UNAVAILABLE', 'PROVIDER_READ_UNAVAILABLE', 'PROVIDER_RESPONSE',
+    'PROVIDER_INTEGRATION_SOURCE', 'INTEGRATION_READ_UNAVAILABLE', 'INTEGRATION_RESPONSE',
+    'OAUTH_CONNECTION', 'PROVIDER_OVERLAY', 'MODEL_CATALOG_READ_UNAVAILABLE',
+    'MODEL_CATALOG_RESPONSE', 'MODEL_CATALOG', 'VARIANT', 'MODEL_OVERLAY',
+    'PROVIDER_SOURCE_CHANGED', 'INTEGRATION_SOURCE_CHANGED',
+})
+
+
 class AttestationError(Exception):
-    pass
+    def __init__(self, message=None, *, check_id=None):
+        self.check_id = check_id if isinstance(check_id, str) and check_id in ATTESTATION_CHECK_IDS else 'UNCLASSIFIED'
+        super().__init__('guarded OAuth route unverified')
 
 
 class InstalledServiceReadOnlyClient:
@@ -52,14 +66,20 @@ class InstalledServiceReadOnlyClient:
             raise AttestationError("installed service response invalid") from None
 
 
-def check(condition):
+def check(condition, check_id='UNCLASSIFIED'):
     if not condition:
-        raise AttestationError("guarded OAuth route unverified")
+        raise AttestationError(check_id=check_id)
 
 
 def payload(client, path):
-    response = client.request("GET", path)
-    check(isinstance(response, dict) and isinstance(response.get("data"), (dict, list)))
+    from .cli import BridgeError
+    stage = {'/api/plugin': 'PLUGIN', '/api/provider/openai': 'PROVIDER',
+             '/api/integration/openai': 'INTEGRATION', '/api/model': 'MODEL_CATALOG'}[path]
+    try:
+        response = client.request("GET", path)
+    except (BridgeError, AttestationError, OSError, TimeoutError):
+        raise AttestationError(check_id=stage + '_READ_UNAVAILABLE') from None
+    check(isinstance(response, dict) and isinstance(response.get("data"), (dict, list)), stage + '_RESPONSE')
     return response["data"]
 
 
@@ -70,90 +90,92 @@ def verify(config, client):
           ref.get('providerID') == 'openai' and isinstance(ref.get('id'), str) and
           0 < len(ref['id']) <= 200 and ref['id'].isprintable() and
           ('variant' not in ref or isinstance(ref['variant'], str) and
-           0 < len(ref['variant']) <= 200 and ref['variant'].isprintable()))
+            0 < len(ref['variant']) <= 200 and ref['variant'].isprintable()), 'MODEL_REF')
     guard = payload(client, "/api/plugin")
-    check(isinstance(guard, list) and all(isinstance(plugin, dict) for plugin in guard))
+    check(isinstance(guard, list) and all(isinstance(plugin, dict) for plugin in guard), 'GUARD_PLUGIN_STATE')
     matches = [plugin for plugin in guard if plugin.get("id") == "subscription.guard"]
     check(len(matches) == 1 and isinstance(matches[0].get("state"), dict) and
-          matches[0]["state"].get("status") == "active")
+          matches[0]["state"].get("status") == "active", 'GUARD_PLUGIN_STATE')
     source = matches[0].get("source")
-    check(isinstance(source, dict))
-    check(source.get("type") == "local" and isinstance(source.get("path"), str))
+    check(isinstance(source, dict), 'GUARD_SOURCE')
+    check(source.get("type") == "local" and isinstance(source.get("path"), str), 'GUARD_SOURCE')
     raw = source["path"]
     parsed = urlsplit(raw)
-    check(parsed.scheme in ("", "file") and not parsed.netloc and not parsed.query and not parsed.fragment)
+    check(parsed.scheme in ("", "file") and not parsed.netloc and not parsed.query and not parsed.fragment, 'GUARD_SOURCE')
     entry = Path(unquote(parsed.path)).resolve()
     expected = Path(config["guard_entry"]).expanduser().resolve()
-    check(entry == expected and entry.name == "index.mjs" and entry.parent.name == "subscription-guard")
+    check(entry == expected and entry.name == "index.mjs" and entry.parent.name == "subscription-guard", 'GUARD_SOURCE')
     root = entry.parent.parent.parent.parent
     files = {"entry": entry, "implementation": entry.parent.parent / "subscription-guard.mjs",
              "financial": root / "config" / "guard-validation.mjs"}
     hashes = config["guard_file_hashes"]
-    check(set(hashes) == set(files))
+    check(set(hashes) == set(files), 'GUARD_PIN_CONFIG')
     for name, path in files.items():
         expected_hash = hashes[name]
-        check(isinstance(expected_hash, str) and bool(re.fullmatch(r"[0-9a-f]{64}", expected_hash)))
+        check(isinstance(expected_hash, str) and bool(re.fullmatch(r"[0-9a-f]{64}", expected_hash)), 'GUARD_PIN_CONFIG')
         try:
             check(path.is_file() and path.stat().st_uid == os.getuid() and
-                  hashlib.sha256(path.read_bytes()).hexdigest() == expected_hash)
+                   hashlib.sha256(path.read_bytes()).hexdigest() == expected_hash,
+                  {'entry': 'GUARD_ENTRY_PIN', 'implementation': 'GUARD_IMPLEMENTATION_PIN',
+                   'financial': 'GUARD_FINANCIAL_PIN'}[name])
         except OSError:
-            raise AttestationError("guarded OAuth route unverified") from None
+            raise AttestationError(check_id='GUARD_FILE_UNAVAILABLE') from None
 
     provider = payload(client, "/api/provider/openai")
-    check(isinstance(provider, dict))
+    check(isinstance(provider, dict), 'PROVIDER_RESPONSE')
     # Native ModelResolver.load resolves credentials from
     # provider.integrationID ?? selected.providerID. Attesting another active
     # OAuth integration would not attest this request's actual credential source.
-    check(provider.get('integrationID', 'openai') == 'openai')
+    check(provider.get('integrationID', 'openai') == 'openai', 'PROVIDER_INTEGRATION_SOURCE')
     integration = payload(client, "/api/integration/openai")
-    check(isinstance(integration, dict))
+    check(isinstance(integration, dict), 'INTEGRATION_RESPONSE')
     connections = integration.get("connections")
     check(integration.get("id") == "openai" and isinstance(connections, list) and len(connections) == 1 and
           isinstance(connections[0], dict) and
-          connections[0].get("type") == "credential" and connections[0].get("method") == "oauth")
+          connections[0].get("type") == "credential" and connections[0].get("method") == "oauth", 'OAUTH_CONNECTION')
     settings = provider.get("settings") or {}
     headers = provider.get("headers") or {}
-    check(isinstance(settings, dict) and isinstance(headers, dict))
+    check(isinstance(settings, dict) and isinstance(headers, dict), 'PROVIDER_OVERLAY')
     check(provider.get("id") == "openai" and provider.get("package") in
           ("@opencode/ai/providers/openai", "@opencode/ai/providers/openai/responses") and
           "apiKey" not in settings and
           not any(name.lower() in ("authorization", "api-key", "x-api-key")
-                  for name in headers))
+                  for name in headers), 'PROVIDER_OVERLAY')
     base = settings.get("baseURL")
     if base is not None:
-        check(isinstance(base, str))
+        check(isinstance(base, str), 'PROVIDER_OVERLAY')
         u = urlsplit(base)
         check(u.scheme == "https" and u.netloc == "chatgpt.com" and
               (u.path == "/backend-api/codex" or u.path.startswith("/backend-api/codex/")) and
-              not u.username and not u.password and not u.query and not u.fragment)
+              not u.username and not u.password and not u.query and not u.fragment, 'PROVIDER_OVERLAY')
     models = payload(client, "/api/model")
     check(isinstance(models, list) and models and all(isinstance(m, dict) and
-          m.get("providerID") == "openai" for m in models))
+          m.get("providerID") == "openai" for m in models), 'MODEL_CATALOG')
     selected = [m for m in models if m.get("id") == config["model"]["id"]]
     check(len(selected) == 1 and selected[0].get("package") in
-          ("@opencode/ai/providers/openai", "@opencode/ai/providers/openai/responses"))
+          ("@opencode/ai/providers/openai", "@opencode/ai/providers/openai/responses"), 'MODEL_CATALOG')
     model = selected[0]
     variants = model.get('variants', [])
-    check(isinstance(variants, list) and len(variants) <= 1000 and all(isinstance(v, dict) for v in variants))
+    check(isinstance(variants, list) and len(variants) <= 1000 and all(isinstance(v, dict) for v in variants), 'VARIANT')
     # Native ModelResolver.withVariant treats only "default" as omitted. Every
     # other variant must exist exactly once; never invent an alias/effort level.
     if ref.get('variant') not in (None, 'default'):
-        check(sum(v.get('id') == ref['variant'] for v in variants) == 1)
+        check(sum(v.get('id') == ref['variant'] for v in variants) == 1, 'VARIANT')
     for overlay in [model, *variants]:
         check(overlay.get('package', provider['package']) in
-              ('@opencode/ai/providers/openai', '@opencode/ai/providers/openai/responses'))
+              ('@opencode/ai/providers/openai', '@opencode/ai/providers/openai/responses'), 'MODEL_OVERLAY')
         options, extra_headers = overlay.get('settings') or {}, overlay.get('headers') or {}
         check(isinstance(options, dict) and isinstance(extra_headers, dict) and 'apiKey' not in options and
-              not any(name.lower() in ('authorization', 'api-key', 'x-api-key') for name in extra_headers))
+              not any(name.lower() in ('authorization', 'api-key', 'x-api-key') for name in extra_headers), 'MODEL_OVERLAY')
         if 'baseURL' in options:
             endpoint = urlsplit(options['baseURL'])
             check(endpoint.scheme == 'https' and endpoint.netloc == 'chatgpt.com' and
                   (endpoint.path == '/backend-api/codex' or endpoint.path.startswith('/backend-api/codex/')) and
-                  not endpoint.username and not endpoint.password and not endpoint.query and not endpoint.fragment)
+                  not endpoint.username and not endpoint.password and not endpoint.query and not endpoint.fragment, 'MODEL_OVERLAY')
     # No cached source attestation. A source/connection change during metadata
     # reads invalidates this preflight; native request authorization still wins.
-    check(payload(client, '/api/provider/openai') == provider)
-    check(payload(client, '/api/integration/openai') == integration)
+    check(payload(client, '/api/provider/openai') == provider, 'PROVIDER_SOURCE_CHANGED')
+    check(payload(client, '/api/integration/openai') == integration, 'INTEGRATION_SOURCE_CHANGED')
     return True
 
 

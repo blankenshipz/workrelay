@@ -629,6 +629,127 @@ class ManagedControlTests(unittest.TestCase):
                          ('denied', 'ATTESTATION_FAILED'))
         self.assertFalse(self.posts())
 
+    def test_finite_attestation_predicates_are_atomic_durable_and_recoverable(self):
+        cases = [
+            ('MODEL_REF', lambda c,m,k: self.session['model'].update(variant=7)),
+            ('PLUGIN_RESPONSE', lambda c,m,k: m.update({'/api/plugin': None})),
+            ('GUARD_PLUGIN_STATE', lambda c,m,k: m['/api/plugin'][0]['state'].update(status='inactive')),
+            ('GUARD_SOURCE', lambda c,m,k: m['/api/plugin'][0]['source'].update(type='remote')),
+            ('GUARD_PIN_CONFIG', lambda c,m,k: c['guard_file_hashes'].update(entry='invalid')),
+            ('GUARD_ENTRY_PIN', lambda c,m,k: c['guard_file_hashes'].update(entry='0'*64)),
+            ('GUARD_IMPLEMENTATION_PIN', lambda c,m,k: c['guard_file_hashes'].update(implementation='0'*64)),
+            ('GUARD_FINANCIAL_PIN', lambda c,m,k: c['guard_file_hashes'].update(financial='0'*64)),
+            ('PROVIDER_RESPONSE', lambda c,m,k: m.update({'/api/provider/openai': []})),
+            ('PROVIDER_INTEGRATION_SOURCE', lambda c,m,k: m['/api/provider/openai'].update(integrationID='foreign')),
+            ('INTEGRATION_RESPONSE', lambda c,m,k: m.update({'/api/integration/openai': []})),
+            ('OAUTH_CONNECTION', lambda c,m,k: m['/api/integration/openai']['connections'][0].update(method='api-key')),
+            ('PROVIDER_OVERLAY', lambda c,m,k: m['/api/provider/openai'].update(settings={'apiKey':'synthetic-private'})),
+            ('MODEL_CATALOG_RESPONSE', lambda c,m,k: m.update({'/api/model': None})),
+            ('MODEL_CATALOG', lambda c,m,k: m.update({'/api/model': []})),
+            ('VARIANT', lambda c,m,k: k.update(variants=[])),
+            ('MODEL_OVERLAY', lambda c,m,k: k.update(headers={'authorization':'synthetic-private'})),
+        ]
+        for expected, mutate in cases:
+            with self.subTest(check_id=expected):
+                self.db.execute('DROP TABLE IF EXISTS managed_operations')
+                metadata, model = self.configure_catalog_route_fixture()
+                mutate(self.config, metadata, model)
+                with patch('workrelay.managed_control.time.time', return_value=123.456):
+                    with self.assertRaises(GuardFailure): self.run_control(text='hello')
+                self.assertEqual(self.db.execute('SELECT phase,denial_code,denied_at_ms,attestation_check_id FROM managed_operations').fetchone(),
+                                 ('denied', 'ATTESTATION_FAILED', 123456, expected))
+                before = self.db.execute('SELECT * FROM managed_operations').fetchall()
+                result = inspect_operation(self.db, self.config, self, self.authorize, self.sid, 'operation', receipt_only=True)
+                self.assertEqual(result['attestation_check_id'], expected)
+                failure = classified_failure(self.db, self.authorize, 'operation', self.sid, RuntimeError('secret-native-error'))
+                self.assertEqual(failure.control_details['attestation_check_id'], expected)
+                # Return the stored failure without re-attesting or rewriting it.
+                with patch('workrelay.managed_control.admission') as admit:
+                    self.assertEqual(self.run_control(text='hello')['attestation_check_id'], expected)
+                    admit.assert_not_called()
+                self.assertEqual(self.db.execute('SELECT * FROM managed_operations').fetchall(), before)
+                self.assertNotIn('synthetic-private', str(before)); self.assertFalse(self.posts())
+
+    def test_native_read_stage_not_mislabeled_as_pin_or_session_failure(self):
+        for path, expected in [('/api/plugin','PLUGIN_READ_UNAVAILABLE'),
+                               ('/api/provider/openai','PROVIDER_READ_UNAVAILABLE'),
+                               ('/api/integration/openai','INTEGRATION_READ_UNAVAILABLE'),
+                               ('/api/model','MODEL_CATALOG_READ_UNAVAILABLE')]:
+            with self.subTest(path=path):
+                self.db.execute('DROP TABLE IF EXISTS managed_operations')
+                self.configure_catalog_route_fixture(); original = self.request
+                def fail(method, target, body=None):
+                    if target == path: raise BridgeError('Bearer private-native-message')
+                    return original(method, target, body)
+                self.request = fail
+                try:
+                    with self.assertRaises(GuardFailure): self.run_control(text='hello')
+                    self.assertEqual(self.db.execute('SELECT denial_code,attestation_check_id FROM managed_operations').fetchone(),
+                                     ('ATTESTATION_FAILED', expected))
+                    self.assertFalse(self.posts())
+                finally: self.request = original
+
+    def test_attestation_file_unavailable_races_and_unclassified_are_safe(self):
+        self.configure_catalog_route_fixture()
+        with patch('workrelay.attestor.Path.read_bytes', side_effect=PermissionError('private-path')):
+            with self.assertRaises(GuardFailure): self.run_control(text='hello')
+        self.assertEqual(self.db.execute('SELECT attestation_check_id FROM managed_operations').fetchone()[0], 'GUARD_FILE_UNAVAILABLE')
+        for path, expected in [('/api/provider/openai','PROVIDER_SOURCE_CHANGED'),
+                               ('/api/integration/openai','INTEGRATION_SOURCE_CHANGED')]:
+            self.db.execute('DROP TABLE managed_operations')
+            metadata, _ = self.configure_catalog_route_fixture(); original = self.request; count = [0]
+            def race(method, target, body=None):
+                response = original(method, target, body)
+                if target == path:
+                    count[0] += 1
+                    if count[0] == 2: response['data']['changed-source-marker'] = True
+                return response
+            self.request = race
+            try:
+                with self.assertRaises(GuardFailure): self.run_control(text='hello')
+                self.assertEqual(self.db.execute('SELECT attestation_check_id FROM managed_operations').fetchone()[0], expected)
+            finally: self.request = original
+        self.db.execute('DROP TABLE managed_operations'); self.reserve_without_send()
+        error = GuardFailure('ATTESTATION_FAILED', attestation_check_id='Bearer malicious-unknown')
+        record_denial(self.db, self.binding, self.sid, 'operation', error)
+        self.assertIsNone(self.db.execute('SELECT attestation_check_id FROM managed_operations').fetchone()[0])
+        self.assertFalse(self.posts())
+
+    def test_attestation_detail_atomic_abort_and_secret_exception_unknown(self):
+        from workrelay.attestor import AttestationError
+        self.configure_catalog_route_fixture()
+        with patch('workrelay.attestor.verify', side_effect=AttestationError('Bearer private-secret', check_id='not-allowlisted')):
+            with self.assertRaises(GuardFailure): self.run_control(text='hello')
+        self.assertEqual(self.db.execute('SELECT denial_code,attestation_check_id FROM managed_operations').fetchone(),
+                         ('ATTESTATION_FAILED', 'UNCLASSIFIED'))
+        self.assertNotIn('private-secret', str(self.db.execute('SELECT * FROM managed_operations').fetchall()))
+        self.db.execute('DROP TABLE managed_operations'); self.reserve_without_send()
+        self.db.execute("CREATE TRIGGER reject_detail BEFORE UPDATE OF attestation_check_id ON managed_operations BEGIN SELECT RAISE(ABORT,'fixture'); END")
+        with self.assertRaises(sqlite3.IntegrityError):
+            record_denial(self.db, self.binding, self.sid, 'operation',
+                          GuardFailure('ATTESTATION_FAILED', attestation_check_id='MODEL_CATALOG_READ_UNAVAILABLE'))
+        self.assertEqual(self.db.execute('SELECT phase,denial_code,denied_at_ms,attestation_check_id FROM managed_operations').fetchone(),
+                         ('reserved', None, None, None))
+        self.assertFalse(self.posts())
+
+    def test_legacy_attestation_detail_migration_does_not_backfill(self):
+        self.reserve_without_send()
+        self.db.execute("UPDATE managed_operations SET phase='denied',denial_code='ATTESTATION_FAILED',denied_at_ms=1")
+        # Simulate the prior application schema using an isolated supported fixture.
+        self.db.execute('ALTER TABLE managed_operations DROP COLUMN attestation_check_id')
+        before = self.db.execute('SELECT * FROM managed_operations').fetchone()
+        result = inspect_operation(self.db, self.config, self, self.authorize, self.sid, 'operation', receipt_only=True)
+        self.assertEqual(result['denial_code'], 'ATTESTATION_FAILED')
+        self.assertIsNone(result['attestation_check_id'])
+        self.assertEqual(self.db.execute('SELECT * FROM managed_operations').fetchone()[:-1], before)
+        # The immediately prior application's explicit-column writer remains
+        # compatible. This is not permission to run arbitrary older writers.
+        self.db.execute("INSERT INTO managed_operations(binding,session,operation,kind,digest,message,phase,identity,reservation_pid,denial_code,denied_at_ms) SELECT binding,session,'old-writer',kind,digest,message,phase,identity,reservation_pid,denial_code,denied_at_ms FROM managed_operations")
+        old = inspect_operation(self.db, self.config, self, self.authorize, self.sid, 'old-writer', receipt_only=True)
+        self.assertIsNone(old['attestation_check_id'])
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute("UPDATE managed_operations SET attestation_check_id='non-enum-private' ")
+
 
 class CreationTests(unittest.TestCase):
     def setUp(self):

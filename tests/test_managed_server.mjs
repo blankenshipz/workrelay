@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createManagedReader, managedText } from '../src/workrelay/managed_server.mjs';
-import { createGateway, safeControlFailure } from '../src/workrelay/mcp.mjs';
+import { ATTESTATION_CHECK_IDS, createGateway, safeControlFailure } from '../src/workrelay/mcp.mjs';
 import { catalogShape } from '../src/workrelay/mcp_observation.mjs';
 import { createServer } from 'node:http';
 import { generateKeyPairSync, createHash } from 'node:crypto';
@@ -18,7 +18,7 @@ const close = s => new Promise(resolve => { s.close(resolve); s.closeAllConnecti
 
 test('control errors expose only finite code/effect/reason, never upstream text', () => {
   assert.deepEqual(safeControlFailure({ error: 'PRIVATE', code: 'CONTROL_NOT_SENT', effect: 'no_post_permitted', reason: 'PROJECT_WORKSPACE_MISMATCH', stack: 'PRIVATE' }), {
-    error: 'Managed control denied or uncertain; inspect the original operation ID.', code: 'CONTROL_NOT_SENT', effect: 'no_post_permitted', reason: 'PROJECT_WORKSPACE_MISMATCH', denial_code: 'DENIAL_REASON_NOT_RECORDED', denied_at_ms: null });
+    error: 'Managed control denied or uncertain; inspect the original operation ID.', code: 'CONTROL_NOT_SENT', effect: 'no_post_permitted', reason: 'PROJECT_WORKSPACE_MISMATCH', denial_code: 'DENIAL_REASON_NOT_RECORDED', denied_at_ms: null, attestation_check_id: null });
   assert.doesNotMatch(JSON.stringify(safeControlFailure({ error: 'PRIVATE', code: 'PRIVATE', reason: 'PRIVATE', effect: 'PRIVATE' })), /PRIVATE/);
 });
 
@@ -332,6 +332,16 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
       const body = JSON.parse(request.body); delivered.push(body); return { status: 200, body: JSON.stringify({ challenge: body.challenge }) };
     }, invoke: async (_config, command, payload) => {
       handed.push({ command, payload });
+      if (payload.operation_id === 'predicate-success') return { phase: 'accepted', inference_started: false,
+        denial_code: 'ATTESTATION_FAILED', denied_at_ms: 123, attestation_check_id: 'PRIVATE/path' };
+      if (payload.operation_id === 'predicate-other-denial') return { phase: 'denied',
+        denial_code: 'QUOTA_DENIED', denied_at_ms: 123, attestation_check_id: 'GUARD_SOURCE' };
+      if (payload.operation_id?.startsWith('attestation-')) {
+        const checks = [...ATTESTATION_CHECK_IDS, undefined, 'PRIVATE/path\nGUARD_SOURCE', { raw: 'PRIVATE' }, ['GUARD_SOURCE']];
+        const index = Number(payload.operation_id.slice('attestation-'.length));
+        return { ...(payload.action === 'inspect' ? {} : { error: 'PRIVATE raw exception', code: 'CONTROL_NOT_SENT' }),
+          phase: 'denied', denial_code: 'ATTESTATION_FAILED', denied_at_ms: 123, attestation_check_id: checks[index] };
+      }
       if (payload.action === 'waits') return { session_id: payload.session_id, pending_permission_count: 1,
         items: [{ request_id: 'per_fixture', action: 'read', resource_preview: ['sanitized fixture'], requires_explicit_human_decision: true,
           respond_via: 'native_opencode_or_openchamber_permission_ui' }], inference_started: false,
@@ -363,6 +373,7 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
   assert.equal(recovered.structuredContent.exact_session_exists, false);
   assert.equal(recovered.structuredContent.denial_code, 'DENIAL_REASON_NOT_RECORDED');
   assert.equal(recovered.structuredContent.denied_at_ms, null, 'legacy reason/time not backfilled');
+  assert.equal(recovered.structuredContent.attestation_check_id, null, 'historical cause never inferred');
   assert.equal(handed.at(-1).payload.session_id, undefined);
   const diagnosticError = (await integratedCall('workrelay_server_resume', { session_id: root, operation_id: 'finite-denial-error', text: 'synthetic bounded fixture' })).result;
   assert.equal(diagnosticError.isError, true); assert.equal(diagnosticError.structuredContent.denial_code, 'QUOTA_DENIED');
@@ -373,6 +384,26 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
   const maliciousStatus = (await integratedCall('workrelay_server_operation_status', { operation_id: 'malicious-denial-status' })).result;
   assert.equal(maliciousStatus.structuredContent.denial_code, 'DENIAL_REASON_NOT_RECORDED');
   assert.equal(maliciousStatus.structuredContent.denied_at_ms, null); assert.doesNotMatch(JSON.stringify(maliciousStatus), /PRIVATE/);
+  for (let index = 0; index < ATTESTATION_CHECK_IDS.length + 4; index++) {
+    const operation_id = 'attestation-' + index;
+    const expected = ATTESTATION_CHECK_IDS[index] ?? null;
+    const status = (await integratedCall('workrelay_server_operation_status', { operation_id })).result;
+    const error = (await integratedCall('workrelay_server_resume', { session_id: root, operation_id, text: 'synthetic bounded fixture' })).result;
+    assert.equal(error.isError, true);
+    for (const result of [status, error]) {
+      assert.equal(result.structuredContent.attestation_check_id, expected);
+      assert.equal(result.structuredContent.denial_code, 'ATTESTATION_FAILED');
+      assert.equal(result.structuredContent.denied_at_ms, 123);
+      assert.doesNotMatch(JSON.stringify(result), /PRIVATE/);
+    }
+  }
+  const successfulProjection = (await integratedCall('workrelay_server_operation_status', { operation_id: 'predicate-success' })).result;
+  assert.equal(successfulProjection.structuredContent.phase, 'accepted');
+  for (const key of ['denial_code', 'denied_at_ms', 'attestation_check_id']) assert.equal(successfulProjection.structuredContent[key], undefined);
+  assert.doesNotMatch(JSON.stringify(successfulProjection), /PRIVATE/);
+  const otherDenial = (await integratedCall('workrelay_server_operation_status', { operation_id: 'predicate-other-denial' })).result;
+  assert.equal(otherDenial.structuredContent.denial_code, 'QUOTA_DENIED');
+  assert.equal(otherDenial.structuredContent.attestation_check_id, null);
   const recoveryCount = handed.length;
   assert.equal((await integratedCall('workrelay_server_operation_status', recovery, 'other')).result.isError, true);
   assert.equal(handed.length, recoveryCount);

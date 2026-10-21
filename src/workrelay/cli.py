@@ -23,6 +23,9 @@ class BridgeError(Exception):
     pass
 
 
+from .attestor import ATTESTATION_CHECK_IDS
+
+
 CONTROL_DENIAL_CODES = frozenset({
     'QUOTA_DENIED', 'QUOTA_UNAVAILABLE', 'ATTESTATION_FAILED',
     'AUTHORITY_UNAVAILABLE_OR_CHANGED', 'SESSION_READ_FAILED',
@@ -34,8 +37,10 @@ CONTROL_DENIAL_CODES = frozenset({
 
 class GuardFailure(BridgeError):
     """Closed diagnostic at an explicit guard branch; no native error text."""
-    def __init__(self, code):
+    def __init__(self, code, *, attestation_check_id=None):
         self.denial_code = code if code in CONTROL_DENIAL_CODES else 'UNEXPECTED_PREPOST'
+        self.attestation_check_id = attestation_check_id if self.denial_code == 'ATTESTATION_FAILED' and isinstance(
+            attestation_check_id, str) and attestation_check_id in ATTESTATION_CHECK_IDS else None
         super().__init__({'QUOTA_DENIED': 'included OAuth quota admission denied; no paid fallback',
                           'QUOTA_UNAVAILABLE': 'quota unavailable; no task started',
                           'ATTESTATION_FAILED': 'guarded OAuth route unverified; execution disabled',
@@ -154,8 +159,10 @@ def admission(config, client):
     from .attestor import AttestationError, verify
     try:
         verify(config, client)
-    except (AttestationError, BridgeError):
-        raise GuardFailure('ATTESTATION_FAILED') from None
+    except AttestationError as error:
+        raise GuardFailure('ATTESTATION_FAILED', attestation_check_id=error.check_id) from None
+    except BridgeError:
+        raise GuardFailure('ATTESTATION_FAILED', attestation_check_id='UNCLASSIFIED') from None
 
 
 def database(state):

@@ -12,7 +12,7 @@ import math
 import time
 from pathlib import Path
 
-from .cli import admission, BridgeError, require, GuardFailure, CONTROL_DENIAL_CODES
+from .cli import admission, BridgeError, require, GuardFailure, CONTROL_DENIAL_CODES, ATTESTATION_CHECK_IDS
 from .supervision import redact_text
 
 
@@ -32,6 +32,9 @@ def initialize(db):
             db.execute('ALTER TABLE managed_operations ADD COLUMN denial_code TEXT CHECK(denial_code IS NULL OR denial_code IN (' + choices + '))')
         if 'denied_at_ms' not in columns:
             db.execute('ALTER TABLE managed_operations ADD COLUMN denied_at_ms INTEGER CHECK(denied_at_ms IS NULL OR denied_at_ms >= 0)')
+        if 'attestation_check_id' not in columns:
+            choices = ','.join("'" + value + "'" for value in sorted(ATTESTATION_CHECK_IDS))
+            db.execute('ALTER TABLE managed_operations ADD COLUMN attestation_check_id TEXT CHECK(attestation_check_id IS NULL OR attestation_check_id IN (' + choices + '))')
         db.execute('COMMIT')
     except Exception:
         db.execute('ROLLBACK')
@@ -41,20 +44,24 @@ def initialize(db):
 def record_denial(db, binding, session_id, operation_id, error):
     """One atomic phase/code/time fact, only before POST. Never infer from text."""
     code = error.denial_code if isinstance(error, GuardFailure) and error.denial_code in CONTROL_DENIAL_CODES else 'UNEXPECTED_PREPOST'
-    db.execute("UPDATE managed_operations SET phase='denied',denial_code=?,denied_at_ms=? WHERE binding=? AND session=? AND operation=? AND phase='reserved'",
-               (code, int(time.time() * 1000), binding, session_id, operation_id))
+    detail = getattr(error, 'attestation_check_id', None) if isinstance(error, GuardFailure) else None
+    detail = detail if code == 'ATTESTATION_FAILED' and isinstance(detail, str) and detail in ATTESTATION_CHECK_IDS else None
+    db.execute("UPDATE managed_operations SET phase='denied',denial_code=?,denied_at_ms=?,attestation_check_id=? WHERE binding=? AND session=? AND operation=? AND phase='reserved'",
+               (code, int(time.time() * 1000), detail, binding, session_id, operation_id))
 
 
-def denial_fields(phase, code, timestamp):
+def denial_fields(phase, code, timestamp, attestation_check_id=None):
     if phase != 'denied':
         return {}
     known = code in CONTROL_DENIAL_CODES
     return {'denial_code': code if known else 'DENIAL_REASON_NOT_RECORDED',
-            'denied_at_ms': timestamp if known and type(timestamp) is int and timestamp >= 0 else None}
+            'denied_at_ms': timestamp if known and type(timestamp) is int and timestamp >= 0 else None,
+            'attestation_check_id': attestation_check_id if code == 'ATTESTATION_FAILED' and isinstance(
+                attestation_check_id, str) and attestation_check_id in ATTESTATION_CHECK_IDS else None}
 
 
 def stored_denial_fields(db, binding, session_id, operation_id):
-    row = db.execute('SELECT phase,denial_code,denied_at_ms FROM managed_operations WHERE binding=? AND session=? AND operation=?',
+    row = db.execute('SELECT phase,denial_code,denied_at_ms,attestation_check_id FROM managed_operations WHERE binding=? AND session=? AND operation=?',
                      (binding, session_id, operation_id)).fetchone()
     return denial_fields(*row) if row else {}
 
@@ -165,12 +172,12 @@ def native_waits(client, authorize, session_id, *, limit=20):
             'task_outcome': 'unverified'}
 
 
-def control_result(operation_id, session_id, message_id, phase, interrupt, *, denial_code=None, denied_at_ms=None):
+def control_result(operation_id, session_id, message_id, phase, interrupt, *, denial_code=None, denied_at_ms=None, attestation_check_id=None):
     value = {'operation_id': operation_id, 'session_id': session_id, 'message_id': message_id, 'phase': phase}
     if interrupt:
         value.update(cancellation_is_rollback=False, queued_inputs_removed=False,
                      guidance='Only this session active execution is interrupted with resume=false. Queued inputs are preserved and may run on later resume. No file edits are rolled back; idle_noop is not active-cancel proof.')
-    value.update(denial_fields(phase, denial_code, denied_at_ms))
+    value.update(denial_fields(phase, denial_code, denied_at_ms, attestation_check_id))
     return value
 
 
@@ -229,7 +236,7 @@ def control(db, config, client, authorize, session_id, operation_id, *, text=Non
     initialize(db)
     db.execute('BEGIN IMMEDIATE')
     try:
-        row = db.execute('SELECT kind,digest,message,phase,identity,reservation_pid,denial_code,denied_at_ms FROM managed_operations WHERE binding=? AND session=? AND operation=?',
+        row = db.execute('SELECT kind,digest,message,phase,identity,reservation_pid,denial_code,denied_at_ms,attestation_check_id FROM managed_operations WHERE binding=? AND session=? AND operation=?',
                           (binding, session_id, operation_id)).fetchone()
         recovering = False
         if row:
@@ -261,7 +268,7 @@ def control(db, config, client, authorize, session_id, operation_id, *, text=Non
                     phase = 'queued_observed'
                     db.execute('UPDATE managed_operations SET phase=? WHERE binding=? AND session=? AND operation=?',
                                (phase, binding, session_id, operation_id))
-            return control_result(operation_id, session_id, row[2], phase, interrupt, denial_code=row[6], denied_at_ms=row[7])
+            return control_result(operation_id, session_id, row[2], phase, interrupt, denial_code=row[6], denied_at_ms=row[7], attestation_check_id=row[8])
         if not recovering:
             busy = db.execute("SELECT 1 FROM managed_operations WHERE session=? AND phase IN ('reserved','sending','uncertain') LIMIT 1",
                               (session_id,)).fetchone()
@@ -486,10 +493,10 @@ def resolve_operation(db, authorize, operation_id, session_id=None):
     initialize(db)
     if session_id is not None:
         require(isinstance(session_id, str) and bool(re.fullmatch(r'ses[A-Za-z0-9_-]{1,160}', session_id)), 'invalid session')
-        rows = db.execute('SELECT session,kind,digest,message,phase,identity,denial_code,denied_at_ms FROM managed_operations WHERE binding=? AND operation=? AND session=? LIMIT 2',
+        rows = db.execute('SELECT session,kind,digest,message,phase,identity,denial_code,denied_at_ms,attestation_check_id FROM managed_operations WHERE binding=? AND operation=? AND session=? LIMIT 2',
                           (binding, operation_id, session_id)).fetchall()
     else:
-        rows = db.execute('SELECT session,kind,digest,message,phase,identity,denial_code,denied_at_ms FROM managed_operations WHERE binding=? AND operation=? LIMIT 2',
+        rows = db.execute('SELECT session,kind,digest,message,phase,identity,denial_code,denied_at_ms,attestation_check_id FROM managed_operations WHERE binding=? AND operation=? LIMIT 2',
                           (binding, operation_id)).fetchall()
     require(authorize() == binding, 'authority changed')
     if not rows:
@@ -519,7 +526,7 @@ def classified_failure(db, authorize, operation_id, session_id, error):
         details.update(session_id=sid, phase=phase)
         if phase in ('reserved', 'denied'):
             details.update(code='CONTROL_NOT_SENT', effect='no_post_permitted')
-            details.update(denial_fields(phase, row[5], row[6]))
+            details.update(denial_fields(phase, row[5], row[6], row[7]))
         elif phase in ('sending', 'uncertain'):
             details.update(code='CONTROL_UNCERTAIN', effect='may_have_been_applied')
         else:
@@ -552,7 +559,7 @@ def inspect_operation(db, config, client, authorize, session_id, operation_id, *
             ('CONTROL_RECONCILE_EXISTING', 'recorded_existing_operation'))
         return {'operation_id': operation_id, 'session_id': session_id, 'kind': row[0],
                 'phase': phase, 'recorded_phase': phase, 'code': code, 'effect': effect,
-                **denial_fields(phase, row[5], row[6]),
+                **denial_fields(phase, row[5], row[6], row[7]),
                 'lookup_scope': 'current_authenticated_binding', 'native_observation': 'not_run',
                 'message_id': row[2] if row[0] in ('queue', 'steer') else None,
                 'task_outcome': 'unverified', 'replay_permitted': False,
@@ -586,7 +593,7 @@ def inspect_operation(db, config, client, authorize, session_id, operation_id, *
                 phase = 'queued_observed'
     require(authorize() == binding, 'authority changed')
     return {'operation_id': operation_id, 'session_id': session_id, 'kind': row[0], 'phase': phase,
-            **denial_fields(row[3], row[5], row[6]),
+            **denial_fields(row[3], row[5], row[6], row[7]),
             'recorded_phase': row[3], 'exact_session_exists': session_exists,
             'effect': ('created_observed' if session_exists else 'not_applied' if row[3] in ('reserved', 'denied') else 'unknown') if row[0] == 'create' else 'not_evaluated',
             'message_id': row[2] if row[0] in ('queue', 'steer') else None,

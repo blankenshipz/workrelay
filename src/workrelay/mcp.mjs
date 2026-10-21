@@ -233,10 +233,22 @@ export const CONTROL_DENIAL_CODES = Object.freeze([
   'MODEL_MISMATCH', 'IDENTITY_CHANGED', 'UNEXPECTED_PREPOST',
   'CREATE_CAPACITY_DENIED', 'CREATE_PROJECT_WORKSPACE_MISMATCH', 'OPERATION_ARGUMENT_CONFLICT',
 ]);
+// Closed native attestor predicate IDs only; never derive detail from errors.
+export const ATTESTATION_CHECK_IDS = Object.freeze([
+  'UNCLASSIFIED', 'MODEL_REF', 'PLUGIN_READ_UNAVAILABLE', 'PLUGIN_RESPONSE',
+  'GUARD_PLUGIN_STATE', 'GUARD_SOURCE', 'GUARD_PIN_CONFIG',
+  'GUARD_ENTRY_PIN', 'GUARD_IMPLEMENTATION_PIN', 'GUARD_FINANCIAL_PIN',
+  'GUARD_FILE_UNAVAILABLE', 'PROVIDER_READ_UNAVAILABLE', 'PROVIDER_RESPONSE',
+  'PROVIDER_INTEGRATION_SOURCE', 'INTEGRATION_READ_UNAVAILABLE', 'INTEGRATION_RESPONSE',
+  'OAUTH_CONNECTION', 'PROVIDER_OVERLAY', 'MODEL_CATALOG_READ_UNAVAILABLE',
+  'MODEL_CATALOG_RESPONSE', 'MODEL_CATALOG', 'VARIANT', 'MODEL_OVERLAY',
+  'PROVIDER_SOURCE_CHANGED', 'INTEGRATION_SOURCE_CHANGED',
+]);
 function controlDenialFields(value) {
   const known = CONTROL_DENIAL_CODES.includes(value?.denial_code);
   return { denial_code: known ? value.denial_code : 'DENIAL_REASON_NOT_RECORDED',
-    denied_at_ms: known && Number.isSafeInteger(value?.denied_at_ms) && value.denied_at_ms >= 0 ? value.denied_at_ms : null };
+    denied_at_ms: known && Number.isSafeInteger(value?.denied_at_ms) && value.denied_at_ms >= 0 ? value.denied_at_ms : null,
+    attestation_check_id: value?.denial_code === 'ATTESTATION_FAILED' && ATTESTATION_CHECK_IDS.includes(value?.attestation_check_id) ? value.attestation_check_id : null };
 }
 export const CONTROL_LOOKUP_CODES = Object.freeze([
   'CONTROL_OPERATION_NOT_FOUND_CURRENT_BINDING', 'CONTROL_OPERATION_AMBIGUOUS_CURRENT_BINDING',
@@ -253,8 +265,8 @@ function scopedLookupFields(value) {
 export function safeControlResult(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
   if (CONTROL_LOOKUP_CODES.includes(value.code)) return scopedLookupFields(value);
-  const { denial_code, denied_at_ms, ...rest } = value;
-  return value.phase === 'denied' || value.recorded_phase === 'denied' || denial_code !== undefined || denied_at_ms !== undefined ?
+  const { denial_code, denied_at_ms, attestation_check_id, ...rest } = value;
+  return value.phase === 'denied' || value.recorded_phase === 'denied' ?
     { ...rest, ...controlDenialFields(value) } : rest;
 }
 export function safeControlFailure(value) {
@@ -264,8 +276,7 @@ export function safeControlFailure(value) {
     reason: ['PROJECT_WORKSPACE_MISMATCH', 'OPERATION_ARGUMENT_CONFLICT'] };
   for (const [key, values] of Object.entries(allowed)) if (values.includes(value?.[key])) output[key] = value[key];
   if (CONTROL_LOOKUP_CODES.includes(value?.code)) return { error: 'Operation receipt lookup is unresolved within the current authenticated binding.', ...scopedLookupFields(value) };
-  if (value?.code === 'CONTROL_NOT_SENT' || value?.phase === 'denied' || value?.recorded_phase === 'denied' ||
-      value?.denial_code !== undefined || value?.denied_at_ms !== undefined) Object.assign(output, controlDenialFields(value));
+  if (value?.code === 'CONTROL_NOT_SENT' || value?.phase === 'denied' || value?.recorded_phase === 'denied') Object.assign(output, controlDenialFields(value));
   return output;
 }
 function bridge(config, command, input) {

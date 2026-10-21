@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { CONTROL_DENIAL_CODES, CONTROL_LOOKUP_CODES, safeControlFailure, safeControlResult } from '../src/workrelay/mcp.mjs';
+import { ATTESTATION_CHECK_IDS, CONTROL_DENIAL_CODES, CONTROL_LOOKUP_CODES, safeControlFailure, safeControlResult } from '../src/workrelay/mcp.mjs';
 
 test('MCP control denial enum matches actual Python constant, not exception descriptions', () => {
   const path = fileURLToPath(new URL('../src/workrelay/cli.py', import.meta.url));
@@ -12,10 +12,39 @@ test('MCP control denial enum matches actual Python constant, not exception desc
   assert.equal(Object.isFrozen(CONTROL_DENIAL_CODES), true);
 });
 
+test('attestation check enum matches native source exactly and projects only denied attestation predicates', () => {
+  const path = fileURLToPath(new URL('../src/workrelay/attestor.py', import.meta.url));
+  const script = 'import ast,json,sys; t=ast.parse(open(sys.argv[1]).read()); n=next(n for n in t.body if isinstance(n,ast.Assign) and any(isinstance(x,ast.Name) and x.id=="ATTESTATION_CHECK_IDS" for x in n.targets)); print(json.dumps(sorted(ast.literal_eval(n.value.args[0]))))';
+  assert.deepEqual([...ATTESTATION_CHECK_IDS].sort(), JSON.parse(execFileSync('/usr/bin/python3', ['-c', script, path], { encoding: 'utf8' })));
+  assert.equal(Object.isFrozen(ATTESTATION_CHECK_IDS), true);
+  for (const attestation_check_id of ATTESTATION_CHECK_IDS) {
+    for (const project of [safeControlResult, safeControlFailure]) {
+      assert.equal(project({ phase: 'denied', denial_code: 'ATTESTATION_FAILED', attestation_check_id }).attestation_check_id, attestation_check_id);
+      for (const denial_code of [...CONTROL_DENIAL_CODES.filter(code => code !== 'ATTESTATION_FAILED'), 'PRIVATE', undefined]) {
+        assert.equal(project({ phase: 'denied', denial_code, attestation_check_id }).attestation_check_id, null);
+      }
+    }
+  }
+  for (const attestation_check_id of [undefined, null, '', 'guard_source', 'GUARD_SOURCE\nPRIVATE', 'PRIVATE/path', {}, [], ['GUARD_SOURCE'], 1, true]) {
+    for (const project of [safeControlResult, safeControlFailure]) {
+      const result = project({ phase: 'denied', denial_code: 'ATTESTATION_FAILED', attestation_check_id });
+      assert.equal(result.attestation_check_id, null);
+      assert.doesNotMatch(JSON.stringify(result), /PRIVATE/);
+    }
+  }
+  for (const phase of ['accepted', 'uncertain', 'pre_post', 'unknown', undefined, 'PRIVATE']) {
+    const fields = { phase, denial_code: 'ATTESTATION_FAILED', denied_at_ms: 123, attestation_check_id: 'PRIVATE' };
+    assert.deepEqual(safeControlResult(fields), { phase });
+    const error = safeControlFailure(fields);
+    for (const key of ['denial_code', 'denied_at_ms', 'attestation_check_id']) assert.equal(error[key], undefined);
+    assert.doesNotMatch(JSON.stringify(error), /PRIVATE/);
+  }
+});
+
 test('every finite denial code and sentinel survive errors and status with safe time only', () => {
   for (const denial_code of CONTROL_DENIAL_CODES) {
     for (const denied_at_ms of [0, 1, Number.MAX_SAFE_INTEGER]) {
-      const fields = { denial_code, denied_at_ms };
+      const fields = { denial_code, denied_at_ms, attestation_check_id: null };
       assert.deepEqual(safeControlResult({ phase: 'denied', ...fields }), { phase: 'denied', ...fields });
       const error = safeControlFailure({ error: 'PRIVATE', code: 'CONTROL_NOT_SENT', ...fields, stack: 'PRIVATE', credential: 'PRIVATE' });
       assert.equal(error.denial_code, denial_code); assert.equal(error.denied_at_ms, denied_at_ms);
@@ -37,11 +66,11 @@ test('every finite denial code and sentinel survive errors and status with safe 
 
 test('legacy denied operation stays unknown/null without backfill; unaffected statuses unchanged', () => {
   const legacy = { phase: 'denied', recorded_phase: 'denied', effect: 'not_applied' };
-  assert.deepEqual(safeControlResult(legacy), { ...legacy, denial_code: 'DENIAL_REASON_NOT_RECORDED', denied_at_ms: null });
+  assert.deepEqual(safeControlResult(legacy), { ...legacy, denial_code: 'DENIAL_REASON_NOT_RECORDED', denied_at_ms: null, attestation_check_id: null });
   assert.deepEqual(legacy, { phase: 'denied', recorded_phase: 'denied', effect: 'not_applied' });
   const unchanged = { phase: 'accepted', effect: 'recorded', operation_id: 'fixture' };
   assert.deepEqual(safeControlResult(unchanged), unchanged);
-  assert.deepEqual(safeControlResult({ denial_code: 'QUOTA_DENIED', denied_at_ms: 0 }), { denial_code: 'QUOTA_DENIED', denied_at_ms: 0 });
+  assert.deepEqual(safeControlResult({ denial_code: 'QUOTA_DENIED', denied_at_ms: 0 }), {});
 });
 
 test('scoped receipt lookup codes match control source and never claim global absence/no-effect or echo raw advice', () => {
