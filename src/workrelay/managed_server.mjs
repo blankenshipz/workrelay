@@ -84,9 +84,35 @@ export function createManagedReader(expected, readBinding, { loadService = path 
     const bindingID = createHash('sha256').update(JSON.stringify(binding)).digest('hex');
     if (action === 'authorize') return { binding_id: bindingID, server_id: managedServerID(binding) };
     if (action === 'events' && input.server_id !== managedServerID(binding)) deny();
+    let pluginSession;
+    if (action === 'plugin_inventory') {
+      // Internal, finite operation: never accept caller routing context or headers.
+      if (!internalAuthorize || Object.keys(input).some(key => !['method', 'path', 'body', 'managed'].includes(key)) ||
+          input.method !== 'GET' || input.path !== '/__managed/plugin-inventory' || input.body !== null ||
+          !sid.test(input.managed?.session_id ?? '') ||
+          Object.keys(input.managed).some(key => !['claims', 'session_id', 'operation_id'].includes(key))) deny();
+      const sessionInput = { method: 'GET', path: `/api/session/${input.managed.session_id}`, body: null };
+      const session = (await read('internal', sessionInput, claims))?.data;
+      const directory = session?.location?.directory;
+      if (session?.id !== input.managed.session_id || typeof session.projectID !== 'string' ||
+          typeof directory !== 'string' || !directory.startsWith('/') || directory.length > 4096 ||
+          /[\x00-\x1f\x7f\\]/.test(directory) || directory.split('/').some(part => part === '.' || part === '..')) deny();
+      const identity = stat(directory);
+      if (!identity.isDirectory() || identity.isSymbolicLink() || canonical(directory) !== directory) deny();
+      pluginSession = { id: session.id, projectID: session.projectID, directory, dev: identity.dev, ino: identity.ino };
+      if (JSON.stringify(readBinding()) !== JSON.stringify(binding)) deny();
+      const before = stat(binding.service_registration);
+      if (canonical(binding.service_registration) !== binding.service_registration ||
+          before.dev !== registration.dev || before.ino !== registration.ino || before.mtimeMs !== registration.mtimeMs) deny();
+    }
     let path;
     let method = 'GET', body;
-    if (action === 'internal' && internalAuthorize) {
+    if (action === 'plugin_inventory') {
+      const identity = stat(pluginSession.directory);
+      if (!identity.isDirectory() || identity.isSymbolicLink() || canonical(pluginSession.directory) !== pluginSession.directory ||
+          identity.dev !== pluginSession.dev || identity.ino !== pluginSession.ino) deny();
+      path = '/api/plugin?' + new URLSearchParams({ 'location[directory]': pluginSession.directory });
+    } else if (action === 'internal' && internalAuthorize) {
       if (!await internalAuthorize(input, bindingID, endpoint, service.headers(endpoint))) deny();
       path = input.path; method = input.method; body = input.body;
       if (JSON.stringify(readBinding()) !== JSON.stringify(binding)) deny();
@@ -165,6 +191,26 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       const next = input.session_id ? null : value.cursor?.next ?? null;
       if (next !== null && (typeof next !== 'string' || next.length > 4096 || /[\x00-\x1f\x7f]/.test(next))) deny();
       return { server_id: managedServerID(binding), items, next_cursor: next };
+    }
+    if (action === 'plugin_inventory') {
+      const after = (await read('internal', { method: 'GET', path: `/api/session/${pluginSession.id}`, body: null }, claims))?.data;
+      const identity = stat(pluginSession.directory);
+      if (!identity.isDirectory() || identity.isSymbolicLink() || canonical(pluginSession.directory) !== pluginSession.directory ||
+          identity.dev !== pluginSession.dev || identity.ino !== pluginSession.ino) deny();
+      if (after?.id !== pluginSession.id || after.projectID !== pluginSession.projectID ||
+          after.location?.directory !== pluginSession.directory || JSON.stringify(readBinding()) !== JSON.stringify(binding)) deny();
+      const finalRegistration = stat(binding.service_registration);
+      if (finalRegistration.dev !== registration.dev || finalRegistration.ino !== registration.ino ||
+          finalRegistration.mtimeMs !== registration.mtimeMs) deny();
+      if (!Array.isArray(value.data) || value.data.length > 1000 || value.location?.directory !== pluginSession.directory) deny();
+      return { session_id: pluginSession.id, observed_at: new Date().toISOString(),
+        kind: 'plugin_inventory', activation_readiness: 'unknown',
+        items: value.data.map(plugin => {
+          // IDs may themselves be paths or credentials: use opaque stable handles.
+          if (!plugin || plugin.id !== undefined && (typeof plugin.id !== 'string' || plugin.id.length > 4096) ||
+              !['active', 'failed'].includes(plugin.state?.status)) deny();
+          return { plugin_id: plugin.id === undefined ? null : 'plugin_' + createHash('sha256').update(plugin.id).digest('hex'), state: plugin.state.status };
+        }), limitation: 'Inventory load state is not activation-barrier readiness. Pending hold owners are unavailable.' };
     }
     if (action === 'internal') return value;
     if (action === 'creation_target') {
