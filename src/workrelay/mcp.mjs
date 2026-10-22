@@ -380,10 +380,14 @@ function mcp(config, invoke, events, managedReader, eventTools) {
               { stage: 'return_to_subscriptions', tool: 'workrelay_event_subscriptions', requires: [] },
               { stage: 'stop_monitoring_only', tool: 'workrelay_event_unsubscribe', requires: ['subscription_id'] }] : []),
           ],
-          next_action: { tool: 'workrelay_server_discover', arguments: {} } } : await managedReader(action, input, ctx.http?.authInfo?.extra?.managedClaims);
+          next_action: { tool: 'workrelay_server_discover', arguments: {} } } : await managedReader(action, input, ctx.http?.authInfo?.extra?.managedClaims, action === 'read' ? ctx.http?.authInfo?.extra?.readBoundary?.native : undefined);
         if (action === 'read') { try { ctx.http?.authInfo?.extra?.readObservation?.(input, output); } catch { /* diagnostic only */ } }
+        try { ctx.http?.authInfo?.extra?.readBoundary?.stage('tool_serialization'); } catch { /* diagnostic only */ }
         return { content: [{ type: 'text', text: JSON.stringify(output) }], structuredContent: output };
-      } catch { return { isError: true, content: [{ type: 'text', text: 'Managed server capability unavailable or denied.' }] }; }
+      } catch (error) {
+        try { ctx.http?.authInfo?.extra?.readBoundary?.toolError(error); } catch { /* diagnostic only */ }
+        return { isError: true, content: [{ type: 'text', text: 'Managed server capability unavailable or denied.' }] };
+      }
     });
   }
   if (managedReader) for (const action of ['create', 'message', 'steer', 'resume', 'inspect', 'waits', 'interrupt']) {
@@ -912,10 +916,10 @@ export function createGateway(rawConfig, options = {}) {
     }
     // Official v2 HTTP entry classifies 2025 initialize and 2026-07-28 discover
     // without weakening the explicit token, Host, Origin or byte-limit boundary.
+    let observed = {};
     try {
-      let observed = {};
       try { observed = observation?.begin(parsedBody) ?? {}; } catch { /* diagnostic only */ }
-      if (observed.read || observed.response) {
+      if (observed.read || observed.response || observed.boundary) {
         try { if (!managedReader) throw Error('unavailable'); await managedReader('authorize', {}, managedClaims); }
         catch { observed = {}; } // Observation is scoped; serving authority is unchanged.
       }
@@ -923,12 +927,17 @@ export function createGateway(rawConfig, options = {}) {
       const request = new Request(`http://${localHost}${req.url}`, { method: req.method,
         headers: req.headers, signal: abort.signal });
       const response = await handler.fetch(request, { parsedBody, authInfo: {
-        token: bearer[1], clientId: config.principal, scopes: ['workrelay:tasks'], extra: { managedClaims, readObservation: observed.read },
+        token: bearer[1], clientId: config.principal, scopes: ['workrelay:tasks'], extra: { managedClaims, readObservation: observed.read, readBoundary: observed.boundary },
       } });
+      try { observed.boundary?.stage('sdk_response'); } catch { /* diagnostic only */ }
       if (observed.response) void observed.response(response).catch(() => {});
+      try { observed.boundary?.stage('relay'); } catch { /* diagnostic only */ }
       await relayResponse(response, req, res, abort);
     }
-    catch { if (!res.headersSent) failure(res, 500, 'mcp_unavailable'); }
+    catch (error) {
+      try { observed.boundary?.failed(error); } catch { /* diagnostic only */ }
+      if (!res.headersSent) failure(res, 500, 'mcp_unavailable');
+    }
   });
   if (config.issuer_mode === 'self-hosted') {
     const listen = server.listen.bind(server);

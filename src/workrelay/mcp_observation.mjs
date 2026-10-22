@@ -1,7 +1,7 @@
 // Opt-in finite diagnostics. Never persist arbitrary names, arguments or bodies.
 import { openSync, closeSync, readFileSync, writeFileSync, lstatSync, fstatSync, linkSync, unlinkSync, fsyncSync, constants } from 'node:fs';
 import { join } from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 import { privateDirectory } from './issuer_interactions.mjs';
 
 const known = new Set([
@@ -10,6 +10,67 @@ const known = new Set([
   ...['capabilities', 'subscriptions', 'subscription_status', 'unsubscribe'].map(x => `workrelay_event_${x}`),
 ]);
 const bounded = value => Number.isInteger(value) && value >= 0 && value <= 1000 ? value : null;
+const artifact = createHash('sha256');
+for (const file of ['mcp.mjs', 'managed_server.mjs', 'mcp_observation.mjs']) artifact.update(readFileSync(new URL(file, import.meta.url)));
+const artifactRevision = artifact.digest('hex');
+const statusCode = value => Number.isInteger(value) && value >= 100 && value <= 599 ? value : null;
+const errorType = error => {
+  try {
+    const name = error?.name;
+    return ['Error', 'TypeError', 'SyntaxError', 'RangeError', 'AbortError', 'TimeoutError'].includes(name) ? name : 'other';
+  }
+  catch { return 'other'; }
+};
+
+// This accepts no arbitrary fields from the request, exception or response.
+export function createReadBoundary(incoming, publish) {
+  const shape = { layer: 'read_rpc_boundary', method: 'tools/call', tool: 'workrelay_server_read',
+    artifact_revision: artifactRevision, incoming: flags(incoming),
+    session_present: Object.hasOwn(incoming ?? {}, 'session_id'), cursor_supplied: Object.hasOwn(incoming ?? {}, 'cursor'),
+    native_stage: null, native_action: null, native_status: null, tool_stage: 'not_entered', sdk_stage: 'sdk_fetch', error_type: null };
+  const emit = () => { try { publish({ ...shape }); } catch { /* diagnostic only */ } };
+  return {
+    native(stage, action, status) {
+      if (!['binding', 'service_discovery', 'native_fetch', 'native_status', 'native_body', 'native_json', 'revalidate', 'projection'].includes(stage) || !['read', 'messages'].includes(action)) return;
+      shape.native_stage = stage; shape.native_action = action;
+      if (stage === 'binding') shape.native_status = null;
+      if (stage === 'native_status') shape.native_status = statusCode(status);
+      shape.tool_stage = 'managed_reader';
+    },
+    stage(stage) {
+      if (stage === 'tool_serialization') shape.tool_stage = stage;
+      if (['sdk_response', 'relay'].includes(stage)) shape.sdk_stage = stage;
+    },
+    read(parsed, output) {
+      const safe = readShape({}, parsed, output);
+      for (const key of ['parsed', 'context_present', 'item_count', 'cursor_present', 'omission_present']) shape[key] = safe[key];
+    },
+    toolError(error) { shape.error_type = errorType(error); shape.tool_stage = 'tool_failed'; },
+    failed(error) { shape.error_type = errorType(error); shape.delivery = 'sdk_or_relay_threw'; emit(); },
+    async response(response) {
+      let reader, timer;
+      shape.http_status = statusCode(response.status); shape.delivery = 'sdk_response_unobserved';
+      try {
+        const type = response.headers.get('content-type') ?? '';
+        if (!/application\/json|text\/event-stream/.test(type)) return;
+        reader = response.clone().body.getReader();
+        const deadline = new Promise((_, reject) => { timer = setTimeout(() => reject(Error('expired')), 1500); });
+        let size = 0; const chunks = [];
+        while (true) { const part = await Promise.race([reader.read(), deadline]); if (part.done) break;
+          size += part.value.length; if (size > 262144) return; chunks.push(part.value); }
+        const text = Buffer.concat(chunks).toString('utf8');
+        const values = type.includes('application/json') ? [JSON.parse(text)] : text.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => JSON.parse(line.slice(5)));
+        for (const value of values) {
+          if (value?.jsonrpc !== '2.0' || (!value.error && !value.result)) continue;
+          shape.delivery = value.error ? 'rpc_error' : value.result.isError === true ? 'tool_error' : 'rpc_result';
+          shape.rpc_code = [-32700, -32600, -32601, -32602, -32603, -32000].includes(value.error?.code) ? value.error.code : null;
+          break;
+        }
+      } catch { /* Observation failure must not change the client response. */ }
+      finally { clearTimeout(timer); if (reader) void reader.cancel().catch(() => {}); emit(); }
+    },
+  };
+}
 function flags(input) {
   return { flag_present: Object.hasOwn(input ?? {}, 'include_messages'),
     flag_value: typeof input?.include_messages === 'boolean' ? input.include_messages : null,
@@ -66,8 +127,9 @@ export function createMcpObservation(directory, { now = Date.now } = {}) {
       const selected = arm();
       if (!selected) return {};
       if (selected.target === 'mcp-read' && body?.method === 'tools/call' && body.params?.name === 'workrelay_server_read') {
-        const incoming = flags(body.params.arguments);
-        return { read(parsed, output) { try { const shape = readShape({}, parsed, output); shape.incoming = incoming; publish(selected, shape); } catch { /* ignored */ } } };
+        const boundary = createReadBoundary(body.params.arguments, shape => publish(selected, shape));
+        return { boundary, response: boundary.response,
+          read: boundary.read };
       }
       if (selected.target !== 'mcp-catalog' || body?.method !== 'tools/list') return {};
       return { async response(response) {

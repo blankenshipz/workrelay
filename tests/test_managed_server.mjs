@@ -162,7 +162,7 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
   let nativeHint = { type: 'session.updated', id: 'evt_old_fixture', created: Date.now() - 1000 };
   const nativeResponses = new Set();
   let permissionBarrier, permissionEntered, gateOnlyProgress = false;
-  let permissionFailure = false, listMode = 'normal', secondPages = 0;
+  let permissionFailure = false, listMode = 'normal', secondPages = 0, readFailure = null;
   const guardEntry = join(dir, 'runtime', 'plugins', 'subscription-guard', 'index.mjs');
   const backend = createServer(async (req, res) => {
     res.setHeader('content-type', 'application/json');
@@ -199,7 +199,11 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
     if (req.url === '/api/provider/openai') return res.end(JSON.stringify({ data: { id: 'openai', package: '@opencode/ai/providers/openai' } }));
     if (req.url === '/api/model') return res.end(JSON.stringify({ data: [{ id: 'fixture', providerID: 'openai', package: '@opencode/ai/providers/openai' }] }));
     if (req.url === `/api/session/${root}`) return res.end(JSON.stringify({ data: session }));
-    if (req.url.startsWith(`/api/session/${root}/message?`)) return res.end(JSON.stringify({ data: [{ id: 'msg_visible', time: { created: 1 }, type: 'user', text: 'Review the release documentation.' }], cursor: {} }));
+    if (req.url.startsWith(`/api/session/${root}/message?`)) {
+      if (readFailure === 'denied') { res.statusCode = 403; return res.end('PRIVATE token/body'); }
+      if (readFailure === 'json') return res.end('PRIVATE invalid JSON');
+      return res.end(JSON.stringify({ data: [{ id: 'msg_visible', time: { created: 1 }, type: 'user', text: 'Review the release documentation.' }], cursor: {} }));
+    }
     if (req.url === `/api/session/${root}/inbox`) return res.end(JSON.stringify({ data: inbox }));
     if (req.url === `/api/session/${root}/permission`) {
       if (permissionFailure) { res.statusCode = 503; return res.end('{}'); }
@@ -598,6 +602,27 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
   const omittedRead = JSON.parse(await fs.readFile(join(observerDirectory, 'mcp-observation.receipt.json'), 'utf8'));
   assert.equal(omittedRead.incoming.flag_present, false); assert.equal(omittedRead.parsed.flag_present, false);
   assert.equal(omittedRead.omission_present, true);
+  assert.equal(observedRead.delivery, 'rpc_result');
+  assert.equal(observedRead.native_action, 'messages');
+  assert.equal(observedRead.native_stage, 'projection');
+  for (const mode of ['denied', 'json']) {
+    await fs.rename(join(observerDirectory, 'mcp-observation.receipt.json'), join(observerDirectory, `${mode}-previous.saved`));
+    await fs.rename(join(observerDirectory, 'mcp-observation.used'), join(observerDirectory, `${mode}-previous-used.saved`));
+    readFailure = mode;
+    const withoutObservation = (await call(client, 'workrelay_server_read', readArgs)).result;
+    await armObservation('mcp-read');
+    const withObservation = (await call(client, 'workrelay_server_read', readArgs)).result;
+    assert.deepEqual(withObservation, withoutObservation, 'diagnostics must not change the actual RPC tool denial/error');
+    assert.equal(withObservation.isError, true);
+    const failedRead = JSON.parse(await fs.readFile(join(observerDirectory, 'mcp-observation.receipt.json'), 'utf8'));
+    assert.equal(failedRead.delivery, 'tool_error');
+    assert.equal(failedRead.native_action, 'messages');
+    assert.equal(failedRead.native_stage, mode === 'denied' ? 'native_status' : 'native_json');
+    assert.equal(failedRead.native_status, mode === 'denied' ? 403 : 200);
+    assert.equal(failedRead.error_type, mode === 'denied' ? 'Error' : 'SyntaxError');
+    assert.doesNotMatch(JSON.stringify(failedRead), /PRIVATE|token\/body|invalid JSON/);
+  }
+  readFailure = null;
   assert.notEqual(visible.isError, true);
   assert.equal(visible.structuredContent.context.items[0].text, 'Review the release documentation.');
   assert.equal(visible.structuredContent.task_outcome.status, 'unknown');

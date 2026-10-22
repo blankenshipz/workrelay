@@ -61,7 +61,9 @@ function projection(session) {
 
 export function createManagedReader(expected, readBinding, { loadService = path => import(pathToFileURL(path).href),
   fetcher = fetch, canonical = realpathSync, stat = lstatSync, internalAuthorize } = {}) {
-  const read = async (action, input, claims, selectedSession) => {
+  const read = async (action, input, claims, selectedSession, observe) => {
+    const stage = (name, status) => { try { observe?.(name, action, status); } catch { /* diagnostic only */ } };
+    stage('binding');
     const binding = readBinding(); // Re-read owner-only capability every request, including revocation.
     checkManagedBinding(binding, claims, expected);
     if (canonical(binding.service_registration) !== binding.service_registration ||
@@ -78,6 +80,7 @@ export function createManagedReader(expected, readBinding, { loadService = path 
     const registration = stat(binding.service_registration);
     if (!registration.isFile() || registration.isSymbolicLink() || registration.uid !== process.getuid() ||
         registration.mode & 0o077) deny();
+    stage('service_discovery');
     const service = await loadService(binding.client_service_module);
     const endpoint = await service.discover({ file: binding.service_registration });
     if (!endpoint?.auth || endpoint.url !== binding.server) deny();
@@ -149,9 +152,11 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       } else query.set('order', 'desc');
       path = '/api/session?' + query;
     } else deny();
+    stage('native_fetch');
     const response = await fetcher(new URL(path, endpoint.url), { method, headers: { ...service.headers(endpoint), 'content-type': 'application/json' },
       ...(body != null ? { body: JSON.stringify(body) } : {}),
       redirect: 'manual', signal: action === 'open_events' && input.signal ? AbortSignal.any([input.signal, AbortSignal.timeout(10000)]) : AbortSignal.timeout(10000) });
+    stage('native_status', response.status);
     if (action === 'internal' && method === 'GET' && response.status === 404) { await response.body?.cancel(); return null; }
     if (!response.ok) { await response.body?.cancel(); deny(); }
     if (action === 'open_events') {
@@ -162,11 +167,14 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       }
       return { server_id: managedServerID(binding), response };
     }
+    stage('native_body');
     const reader = response.body.getReader(); let size = 0; const chunks = [];
     try { while (true) { const part = await reader.read(); if (part.done) break;
       size += part.value.length; if (size > 2000000) deny(); chunks.push(part.value); }
     } finally { await reader.cancel(); }
+    stage('native_json');
     const value = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    stage('revalidate');
     // Local revocation/registration replacement during network I/O must not disclose data.
     if (JSON.stringify(readBinding()) !== JSON.stringify(binding) || canonical(binding.service_registration) !== binding.service_registration) deny();
     const current = stat(binding.service_registration);
@@ -263,6 +271,7 @@ export function createManagedReader(expected, readBinding, { loadService = path 
         limitation: 'Read-only native inventory. No agent execution, model-route admission or permission grant is implied. Native inventory is bounded to 2MB; changed pages require a fresh first call.',
         next_action: { tool: 'workrelay_server_discover', arguments: {} } };
     }
+    stage('projection');
     if (action === 'messages') {
       if (!Array.isArray(value.data) || value.data.length > (input.limit ?? 10)) deny();
       const next = value.cursor?.next ?? null;
@@ -288,7 +297,7 @@ export function createManagedReader(expected, readBinding, { loadService = path 
     }
     if (action === 'read') {
       if (value.data?.id !== input.session_id) deny();
-      const context = input.include_messages === true ? await read('messages', input, claims, value.data.id) : { omission: 'Request include_messages:true for visible context.' };
+      const context = input.include_messages === true ? await read('messages', input, claims, value.data.id, observe) : { omission: 'Request include_messages:true for visible context.' };
       if (JSON.stringify(readBinding()) !== JSON.stringify(binding)) deny();
       return { ...projection(value.data), server_id: managedServerID(binding), context,
         return_action: { tool: 'workrelay_server_read', arguments: { session_id: input.session_id, include_messages: true, limit: input.limit ?? 10 } },
@@ -305,5 +314,5 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       guidance: items.length ? 'Use returned session IDs and actions; continue with next_cursor.' :
         'No sessions on this page. Continue with next_cursor if present. No enrollment is required for this bound server.' };
   };
-  return (action, input, claims) => read(action, input, claims);
+  return (action, input, claims, observe) => read(action, input, claims, undefined, observe);
 }
