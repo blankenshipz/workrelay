@@ -18,7 +18,7 @@ function fixture(change = {}) {
     stat: path => ({ isFile: () => true, isDirectory: () => !change.notDirectory || !path.startsWith('/PRIVATE'),
       isSymbolicLink: () => !!change.symlink && path.startsWith('/PRIVATE'), uid: process.getuid(), mode: 0o600,
       dev: change.deviceChanged && path.startsWith('/PRIVATE') && calls.includes('/api/plugin') ? 2 : 1,
-      ino: change.inodeChanged && path.startsWith('/PRIVATE') && calls.includes('/api/plugin') ? 2 : 1, mtimeMs: 1 }),
+      ino: (change.inodeChanged && path.startsWith('/PRIVATE') || change.registrationChanged && path === binding.service_registration) && calls.includes('/api/plugin') ? 2 : 1, mtimeMs: 1 }),
     loadService: async () => ({ discover: async () => ({ url: change.server ?? binding.server, auth: {} }), headers: () => ({ 'x-native-fixture': 'present' }) }),
     internalAuthorize: async request => request.method === 'GET' && request.path === '/api/session/ses_example' && request.body === null,
     fetcher: async (url, options) => {
@@ -49,11 +49,26 @@ test('internal client protocol derives encoded location, returns safe inventory,
   assert.doesNotMatch(JSON.stringify(result), /PRIVATE|SECRET|params|source/);
   assert.ok(Number.isFinite(Date.parse(result.observed_at)));
 });
+test('private attestation preserves native canonical IDs/envelope and rejects changed registration', async () => {
+  const f = fixture();
+  const result = await f.reader('attestation_plugin', { ...f.input, path: '/__managed/attestation-plugin' }, f.claims);
+  assert.equal(result.data[1].id, 'normal');
+  assert.equal(result.location.directory, '/PRIVATE/a b&c');
+  assert.equal(result.items, undefined, 'never substitute the hashed public projection');
+  const changed = fixture({ registrationChanged: true });
+  await assert.rejects(changed.reader('attestation_plugin', { ...changed.input, path: '/__managed/attestation-plugin' }, changed.claims));
+  for (const extra of [{ directory: '/other' }, { headers: {} }, { path: '/__managed/attestation-plugin?location[directory]=/other' }]) {
+    const bad = fixture();
+    await assert.rejects(bad.reader('attestation_plugin', { ...bad.input, path: '/__managed/attestation-plugin', ...extra }, bad.claims));
+    assert.equal(bad.calls.length, 0);
+  }
+});
 test('rejects foreign authority, missing/moved location and mid-read revocation', async () => {
   for (const change of [{ server: 'http://127.0.0.1:9999' }, { missing: true }, { move: true }, { revoke: true }, { revoked: true }, { responseLocation: '/foreign' },
     { directory: '/a/../private' }, { directory: 'relative' }, { symlink: true }, { alias: true }, { notDirectory: true },
     { canonicalChanged: true }, { deviceChanged: true }, { inodeChanged: true }]) {
     const f = fixture(change); await assert.rejects(f.reader('plugin_inventory', f.input, f.claims));
+    const a = fixture(change); await assert.rejects(a.reader('attestation_plugin', { ...a.input, path: '/__managed/attestation-plugin' }, a.claims));
   }
   const f = fixture();
   await assert.rejects(f.reader('plugin_inventory', f.input, { ...f.claims, sub: 'other' }));

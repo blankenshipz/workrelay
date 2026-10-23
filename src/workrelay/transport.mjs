@@ -244,6 +244,9 @@ print(json.dumps(r))`;
   if (input.path === '/__managed/plugin-inventory') {
     return reader('plugin_inventory', input, authority.claims);
   }
+  if (input.path === '/__managed/attestation-plugin') {
+    return reader('attestation_plugin', input, authority.claims);
+  }
   return reader(['/__managed/authorize', '/__managed/authorize-create-project'].includes(input.path) && input.method === 'GET' && input.body === null ? 'authorize' : 'internal', input, authority.claims);
 }
 

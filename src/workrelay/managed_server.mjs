@@ -88,10 +88,10 @@ export function createManagedReader(expected, readBinding, { loadService = path 
     if (action === 'authorize') return { binding_id: bindingID, server_id: managedServerID(binding) };
     if (action === 'events' && input.server_id !== managedServerID(binding)) deny();
     let pluginSession;
-    if (action === 'plugin_inventory') {
+    if (action === 'plugin_inventory' || action === 'attestation_plugin') {
       // Internal, finite operation: never accept caller routing context or headers.
       if (!internalAuthorize || Object.keys(input).some(key => !['method', 'path', 'body', 'managed'].includes(key)) ||
-          input.method !== 'GET' || input.path !== '/__managed/plugin-inventory' || input.body !== null ||
+          input.method !== 'GET' || input.path !== (action === 'attestation_plugin' ? '/__managed/attestation-plugin' : '/__managed/plugin-inventory') || input.body !== null ||
           !sid.test(input.managed?.session_id ?? '') ||
           Object.keys(input.managed).some(key => !['claims', 'session_id', 'operation_id'].includes(key))) deny();
       const sessionInput = { method: 'GET', path: `/api/session/${input.managed.session_id}`, body: null };
@@ -110,7 +110,7 @@ export function createManagedReader(expected, readBinding, { loadService = path 
     }
     let path;
     let method = 'GET', body;
-    if (action === 'plugin_inventory') {
+    if (action === 'plugin_inventory' || action === 'attestation_plugin') {
       const identity = stat(pluginSession.directory);
       if (!identity.isDirectory() || identity.isSymbolicLink() || canonical(pluginSession.directory) !== pluginSession.directory ||
           identity.dev !== pluginSession.dev || identity.ino !== pluginSession.ino) deny();
@@ -200,7 +200,7 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       if (next !== null && (typeof next !== 'string' || next.length > 4096 || /[\x00-\x1f\x7f]/.test(next))) deny();
       return { server_id: managedServerID(binding), items, next_cursor: next };
     }
-    if (action === 'plugin_inventory') {
+    if (action === 'plugin_inventory' || action === 'attestation_plugin') {
       const after = (await read('internal', { method: 'GET', path: `/api/session/${pluginSession.id}`, body: null }, claims))?.data;
       const identity = stat(pluginSession.directory);
       if (!identity.isDirectory() || identity.isSymbolicLink() || canonical(pluginSession.directory) !== pluginSession.directory ||
@@ -211,6 +211,9 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       if (finalRegistration.dev !== registration.dev || finalRegistration.ino !== registration.ino ||
           finalRegistration.mtimeMs !== registration.mtimeMs) deny();
       if (!Array.isArray(value.data) || value.data.length > 1000 || value.location?.directory !== pluginSession.directory) deny();
+      // Private admission contract: keep the native envelope/canonical IDs. The
+      // caller is the guarded local adapter, not a public inventory tool.
+      if (action === 'attestation_plugin') return value;
       return { session_id: pluginSession.id, observed_at: new Date().toISOString(),
         kind: 'plugin_inventory', activation_readiness: 'unknown',
         items: value.data.map(plugin => {

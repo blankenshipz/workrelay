@@ -129,6 +129,10 @@ class InstalledClient:
 
     def request(self, method, path, body=None):
         try:
+            # Existing managed-session admission must attest that session's native
+            # location, never the server default or caller-supplied routing data.
+            if method == 'GET' and path == '/api/plugin' and 'managed' in self.config.get('_supervision_authority', {}):
+                path = '/__managed/attestation-plugin'
             result = subprocess.run([self.config["node_executable"], self.script, self.config["_private_path"]],
                 input=json.dumps({"method": method, "path": path, "body": body,
                                   **self.config.get("_supervision_authority", {})}),
@@ -160,7 +164,13 @@ def admission(config, client):
     try:
         verify(config, client)
     except AttestationError as error:
-        raise GuardFailure('ATTESTATION_FAILED', attestation_check_id=error.check_id) from None
+        failure = GuardFailure('ATTESTATION_FAILED', attestation_check_id=error.check_id)
+        try:
+            from .guard_diagnostic import sanitize
+            failure.guard_diagnostic = sanitize(getattr(error, 'guard_diagnostic', None))
+        except Exception:
+            pass
+        raise failure from None
     except BridgeError:
         raise GuardFailure('ATTESTATION_FAILED', attestation_check_id='UNCLASSIFIED') from None
 

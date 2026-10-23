@@ -35,6 +35,8 @@ def initialize(db):
         if 'attestation_check_id' not in columns:
             choices = ','.join("'" + value + "'" for value in sorted(ATTESTATION_CHECK_IDS))
             db.execute('ALTER TABLE managed_operations ADD COLUMN attestation_check_id TEXT CHECK(attestation_check_id IS NULL OR attestation_check_id IN (' + choices + '))')
+        if 'guard_diagnostic' not in columns:
+            db.execute('ALTER TABLE managed_operations ADD COLUMN guard_diagnostic TEXT')
         db.execute('COMMIT')
     except Exception:
         db.execute('ROLLBACK')
@@ -46,8 +48,18 @@ def record_denial(db, binding, session_id, operation_id, error):
     code = error.denial_code if isinstance(error, GuardFailure) and error.denial_code in CONTROL_DENIAL_CODES else 'UNEXPECTED_PREPOST'
     detail = getattr(error, 'attestation_check_id', None) if isinstance(error, GuardFailure) else None
     detail = detail if code == 'ATTESTATION_FAILED' and isinstance(detail, str) and detail in ATTESTATION_CHECK_IDS else None
-    db.execute("UPDATE managed_operations SET phase='denied',denial_code=?,denied_at_ms=?,attestation_check_id=? WHERE binding=? AND session=? AND operation=? AND phase='reserved'",
+    updated = db.execute("UPDATE managed_operations SET phase='denied',denial_code=?,denied_at_ms=?,attestation_check_id=? WHERE binding=? AND session=? AND operation=? AND phase='reserved'",
                (code, int(time.time() * 1000), detail, binding, session_id, operation_id))
+    # Optional evidence is separate from the authoritative atomic denial update.
+    # The row key and denied_at_ms provide exact operation/session correlation.
+    try:
+        from .guard_diagnostic import sanitize
+        diagnostic = sanitize(getattr(error, 'guard_diagnostic', None)) if updated.rowcount == 1 and detail == 'GUARD_PLUGIN_STATE' else None
+        if diagnostic is not None:
+            db.execute("UPDATE managed_operations SET guard_diagnostic=? WHERE binding=? AND session=? AND operation=? AND phase='denied' AND guard_diagnostic IS NULL",
+                       (json.dumps(diagnostic, sort_keys=True), binding, session_id, operation_id))
+    except Exception:
+        pass  # Evidence persistence failure cannot replace or undo a denial.
 
 
 def denial_fields(phase, code, timestamp, attestation_check_id=None):

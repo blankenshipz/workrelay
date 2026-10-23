@@ -92,10 +92,18 @@ def verify(config, client):
           ('variant' not in ref or isinstance(ref['variant'], str) and
             0 < len(ref['variant']) <= 200 and ref['variant'].isprintable()), 'MODEL_REF')
     guard = payload(client, "/api/plugin")
-    check(isinstance(guard, list) and all(isinstance(plugin, dict) for plugin in guard), 'GUARD_PLUGIN_STATE')
-    matches = [plugin for plugin in guard if plugin.get("id") == "subscription.guard"]
-    check(len(matches) == 1 and isinstance(matches[0].get("state"), dict) and
-          matches[0]["state"].get("status") == "active", 'GUARD_PLUGIN_STATE')
+    try:
+        check(isinstance(guard, list) and all(isinstance(plugin, dict) for plugin in guard), 'GUARD_PLUGIN_STATE')
+        matches = [plugin for plugin in guard if plugin.get("id") == "subscription.guard"]
+        check(len(matches) == 1 and isinstance(matches[0].get("state"), dict) and
+              matches[0]["state"].get("status") == "active", 'GUARD_PLUGIN_STATE')
+    except AttestationError as error:
+        try:
+            from .guard_diagnostic import plugin_evidence
+            error.guard_diagnostic = plugin_evidence(guard)
+        except Exception:
+            pass  # A broken diagnostic must not replace the original denial.
+        raise
     source = matches[0].get("source")
     check(isinstance(source, dict), 'GUARD_SOURCE')
     check(source.get("type") == "local" and isinstance(source.get("path"), str), 'GUARD_SOURCE')
