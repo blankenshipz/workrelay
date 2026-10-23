@@ -128,6 +128,9 @@ class InstalledClient:
         self.script = str(Path(__file__).with_name("transport.mjs"))
 
     def request(self, method, path, body=None):
+        provider_request = method == 'GET' and path == '/api/provider/openai'
+        if provider_request:
+            self._provider_http_status = None
         try:
             # Existing managed-session admission must attest that session's native
             # location, never the server default or caller-supplied routing data.
@@ -137,6 +140,13 @@ class InstalledClient:
                 input=json.dumps({"method": method, "path": path, "body": body,
                                   **self.config.get("_supervision_authority", {})}),
                 capture_output=True, text=True, timeout=20)
+            if provider_request:
+                try:
+                    diagnostic = json.loads(result.stdout).get('provider_diagnostic')
+                    status = diagnostic.get('http_status') if type(diagnostic) is dict else None
+                    self._provider_http_status = status if type(status) is int and 100 <= status <= 599 else None
+                except Exception:
+                    pass
             require(result.returncode == 0 and len(result.stdout) <= 2_000_000,
                     "guarded local service request unavailable")
             response = json.loads(result.stdout)
@@ -165,6 +175,11 @@ def admission(config, client):
         verify(config, client)
     except AttestationError as error:
         failure = GuardFailure('ATTESTATION_FAILED', attestation_check_id=error.check_id)
+        try:
+            from .provider_diagnostic import sanitize as provider_sanitize
+            failure.provider_diagnostic = provider_sanitize(getattr(error, 'provider_diagnostic', None))
+        except Exception:
+            pass
         try:
             from .guard_diagnostic import sanitize
             failure.guard_diagnostic = sanitize(getattr(error, 'guard_diagnostic', None))

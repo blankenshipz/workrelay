@@ -37,6 +37,8 @@ def initialize(db):
             db.execute('ALTER TABLE managed_operations ADD COLUMN attestation_check_id TEXT CHECK(attestation_check_id IS NULL OR attestation_check_id IN (' + choices + '))')
         if 'guard_diagnostic' not in columns:
             db.execute('ALTER TABLE managed_operations ADD COLUMN guard_diagnostic TEXT')
+        if 'provider_diagnostic' not in columns:
+            db.execute('ALTER TABLE managed_operations ADD COLUMN provider_diagnostic TEXT')
         db.execute('COMMIT')
     except Exception:
         db.execute('ROLLBACK')
@@ -60,6 +62,14 @@ def record_denial(db, binding, session_id, operation_id, error):
                        (json.dumps(diagnostic, sort_keys=True), binding, session_id, operation_id))
     except Exception:
         pass  # Evidence persistence failure cannot replace or undo a denial.
+    try:
+        from .provider_diagnostic import sanitize as provider_sanitize
+        diagnostic = provider_sanitize(getattr(error, 'provider_diagnostic', None)) if updated.rowcount == 1 and detail in ('PROVIDER_RESPONSE', 'PROVIDER_READ_UNAVAILABLE') else None
+        if diagnostic is not None:
+            db.execute("UPDATE managed_operations SET provider_diagnostic=? WHERE binding=? AND session=? AND operation=? AND phase='denied' AND provider_diagnostic IS NULL",
+                       (json.dumps(diagnostic, sort_keys=True), binding, session_id, operation_id))
+    except Exception:
+        pass
 
 
 def denial_fields(phase, code, timestamp, attestation_check_id=None):

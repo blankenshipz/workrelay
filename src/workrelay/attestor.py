@@ -71,6 +71,14 @@ def check(condition, check_id='UNCLASSIFIED'):
         raise AttestationError(check_id=check_id)
 
 
+def provider_evidence(error, client, stage, **values):
+    try:
+        from .provider_diagnostic import attach
+        attach(error, client, stage, **values)
+    except Exception:
+        pass
+
+
 def payload(client, path):
     from .cli import BridgeError
     stage = {'/api/plugin': 'PLUGIN', '/api/provider/openai': 'PROVIDER',
@@ -78,8 +86,16 @@ def payload(client, path):
     try:
         response = client.request("GET", path)
     except (BridgeError, AttestationError, OSError, TimeoutError):
-        raise AttestationError(check_id=stage + '_READ_UNAVAILABLE') from None
-    check(isinstance(response, dict) and isinstance(response.get("data"), (dict, list)), stage + '_RESPONSE')
+        error = AttestationError(check_id=stage + '_READ_UNAVAILABLE')
+        if stage == 'PROVIDER':
+            provider_evidence(error, client, 'read')
+        raise error from None
+    try:
+        check(isinstance(response, dict) and isinstance(response.get("data"), (dict, list)), stage + '_RESPONSE')
+    except AttestationError as error:
+        if stage == 'PROVIDER':
+            provider_evidence(error, client, 'envelope', response=response)
+        raise
     return response["data"]
 
 
@@ -130,7 +146,11 @@ def verify(config, client):
             raise AttestationError(check_id='GUARD_FILE_UNAVAILABLE') from None
 
     provider = payload(client, "/api/provider/openai")
-    check(isinstance(provider, dict), 'PROVIDER_RESPONSE')
+    try:
+        check(isinstance(provider, dict), 'PROVIDER_RESPONSE')
+    except AttestationError as error:
+        provider_evidence(error, client, 'provider_data', data=provider)
+        raise
     # Native ModelResolver.load resolves credentials from
     # provider.integrationID ?? selected.providerID. Attesting another active
     # OAuth integration would not attest this request's actual credential source.

@@ -173,7 +173,7 @@ async function allow(input, config, endpoint, headers) {
   return false;
 }
 
-async function managedRequest(input, config) {
+async function managedRequest(input, config, observe) {
   const authority = input.managed;
   if (!fields(authority, ['claims', 'session_id', 'operation_id']) ||
       !/^ses[A-Za-z0-9_-]{1,160}$/.test(authority.session_id ?? '') ||
@@ -247,9 +247,10 @@ print(json.dumps(r))`;
   if (input.path === '/__managed/attestation-plugin') {
     return reader('attestation_plugin', input, authority.claims);
   }
-  return reader(['/__managed/authorize', '/__managed/authorize-create-project'].includes(input.path) && input.method === 'GET' && input.body === null ? 'authorize' : 'internal', input, authority.claims);
+  return reader(['/__managed/authorize', '/__managed/authorize-create-project'].includes(input.path) && input.method === 'GET' && input.body === null ? 'authorize' : 'internal', input, authority.claims, observe);
 }
 
+let providerDiagnostic;
 try {
   const config = JSON.parse(readFileSync(process.argv[2], 'utf8'));
   const module = await import(pathToFileURL(config.client_service_module).href);
@@ -263,9 +264,12 @@ try {
     process.stdin.on('end', () => resolve(text));
     process.stdin.on('error', reject);
   }));
+  if (input.method === 'GET' && input.path === '/api/provider/openai') providerDiagnostic = { http_status: null };
   if (input.managed !== undefined) {
-    const data = await managedRequest(input, config);
-    process.stdout.write(JSON.stringify({ status: data === null ? 404 : 200, data }));
+    const data = await managedRequest(input, config, (stage, action, status) => {
+      if (providerDiagnostic && stage === 'native_status' && action === 'internal' && Number.isInteger(status) && status >= 100 && status <= 599) providerDiagnostic.http_status = status;
+    });
+    process.stdout.write(JSON.stringify({ status: data === null ? 404 : 200, data, ...(providerDiagnostic ? { provider_diagnostic: providerDiagnostic } : {}) }));
     process.exit(0);
   }
   const headers = { ...module.headers(endpoint), 'content-type': 'application/json' };
@@ -275,17 +279,19 @@ try {
   const response = await fetch(target, { method: input.method, headers,
   body: input.body === null ? undefined : JSON.stringify(input.body), redirect: 'manual',
   signal: AbortSignal.timeout(15000) });
+  if (providerDiagnostic) providerDiagnostic.http_status = response.status;
   if (response.status >= 300 && response.status < 400) throw new Error('redirect denied');
   if (response.status === 404 && input.method === 'GET') {
-    process.stdout.write(JSON.stringify({ status: 404, data: null }));
+    process.stdout.write(JSON.stringify({ status: 404, data: null, ...(providerDiagnostic ? { provider_diagnostic: providerDiagnostic } : {}) }));
   } else if (!response.ok) {
     // Upstream errors can include credentials/transcripts. Status is sufficient.
     await response.body?.cancel();
-    process.stdout.write(JSON.stringify({ status: response.status, data: null }));
+    process.stdout.write(JSON.stringify({ status: response.status, data: null, ...(providerDiagnostic ? { provider_diagnostic: providerDiagnostic } : {}) }));
   } else {
-    process.stdout.write(JSON.stringify({ status: response.status, data: await boundedJSON(response) }));
+    process.stdout.write(JSON.stringify({ status: response.status, data: await boundedJSON(response), ...(providerDiagnostic ? { provider_diagnostic: providerDiagnostic } : {}) }));
   }
 } catch {
+  if (providerDiagnostic) process.stdout.write(JSON.stringify({ provider_diagnostic: providerDiagnostic }));
   // Never emit request/response bodies, transport exceptions or auth material.
   process.stderr.write('guarded local service request unavailable\n');
   process.exitCode = 2;

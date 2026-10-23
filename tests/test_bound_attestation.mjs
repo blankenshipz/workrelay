@@ -39,7 +39,13 @@ test('actual Python client -> release transport -> native fixtures isolates sele
         value = { location: { directory: mode === 'wrong_location' ? locations.ses_two : location }, data:
           mode === 'missing' ? [] : mode === 'duplicate' ? [guard, guard] : mode === 'malformed' ? [null] : [guard] };
       }
-    } else if (url.pathname === '/api/provider/openai') value = { data: { id: 'openai', package: '@opencode/ai/providers/openai' } };
+    } else if (url.pathname === '/api/provider/openai') {
+      if (mode === 'provider404' || mode === 'provider403') { res.statusCode = mode === 'provider404' ? 404 : 403; return res.end('PRIVATE_CANARY'); }
+      if (mode === 'provider_malformed') return res.end('PRIVATE_CANARY');
+      value = mode === 'provider_null' ? null : mode === 'provider_missing' ? {} :
+        mode === 'provider_scalar' ? { data: 'PRIVATE_CANARY' } : mode === 'provider_list' ? { data: [] } :
+        { data: { id: 'openai', package: '@opencode/ai/providers/openai' } };
+    }
     else if (url.pathname === '/api/integration/openai') value = { data: { id: 'openai', connections: [{ type: 'credential', method: 'oauth' }] } };
     else if (url.pathname === '/api/model') value = { data: [{ id: 'fixture', providerID: 'openai', package: '@opencode/ai/providers/openai' }] };
     else { res.statusCode = 404; value = {}; }
@@ -61,11 +67,11 @@ test('actual Python client -> release transport -> native fixtures isolates sele
   const configPath = join(dir, 'bridge.json');
   await fs.writeFile(configPath, JSON.stringify(base), { mode: 0o600 });
   const run = async session => {
-    const config = { ...base, _private_path: configPath, _supervision_authority: { managed: {
+    const config = { ...base, _fixture_diagnostic: mode.startsWith('provider'), _private_path: configPath, _supervision_authority: { managed: {
       claims: { iss: binding.issuer, aud: binding.audience, sub: binding.subject, client_id: client }, session_id: session, operation_id: 'fixture-read-only' } } };
     return new Promise((resolve, reject) => {
       const child = spawn(process.env.WORKRELAY_TEST_PYTHON || 'python3', ['-c',
-        'import json,sys;from workrelay.attestor import verify,AttestationError;from workrelay.cli import InstalledClient;c=json.load(sys.stdin)\ntry:\n verify(c,InstalledClient(c));print("passed")\nexcept AttestationError as e: print(e.check_id)'],
+        'import json,sys;from workrelay.attestor import verify,AttestationError;from workrelay.cli import InstalledClient;c=json.load(sys.stdin)\ntry:\n verify(c,InstalledClient(c));print("passed")\nexcept AttestationError as e: print(json.dumps({"check":e.check_id,"diagnostic":getattr(e,"provider_diagnostic",None)}) if c.get("_fixture_diagnostic") else e.check_id)'],
       { cwd: project, env: { ...process.env, PYTHONPATH: join(project, 'src') }, stdio: ['pipe', 'pipe', 'pipe'] });
       let out = '', err = ''; child.stdout.on('data', x => out += x); child.stderr.on('data', x => err += x);
       child.on('error', reject); child.on('exit', code => code === 0 ? resolve(out.trim()) : reject(Error('fixture subprocess exit ' + code + ': ' + err)));
@@ -78,6 +84,21 @@ test('actual Python client -> release transport -> native fixtures isolates sele
   for (mode of ['missing', 'inactive', 'duplicate', 'malformed']) assert.equal(await run('ses_one'), 'GUARD_PLUGIN_STATE');
   for (mode of ['denied', 'wrong_location']) assert.equal(await run('ses_one'), 'PLUGIN_READ_UNAVAILABLE');
   assert.equal(await run('ses_missing'), 'PLUGIN_READ_UNAVAILABLE');
+  for (const [scenario, status, check, shape] of [
+    ['provider404',404,'PROVIDER_RESPONSE','null'], ['provider_null',200,'PROVIDER_RESPONSE','null'],
+    ['provider_missing',200,'PROVIDER_RESPONSE','object'], ['provider_scalar',200,'PROVIDER_RESPONSE','object'],
+    ['provider_list',200,'PROVIDER_RESPONSE','object'], ['provider_malformed',200,'PROVIDER_READ_UNAVAILABLE','unknown'],
+    ['provider403',403,'PROVIDER_READ_UNAVAILABLE','unknown']]) {
+    mode = scenario;
+    const raw = await run('ses_one');
+    assert.ok(!raw.includes('PRIVATE_CANARY'));
+    const observed = JSON.parse(raw);
+    assert.equal(observed.check, check);
+    assert.equal(observed.diagnostic.http_status, status);
+    assert.equal(observed.diagnostic.envelope_shape, shape);
+    if (scenario === 'provider_list') assert.equal(observed.diagnostic.data_shape, 'list');
+  }
+  mode = 'active';
   await fs.writeFile(capability, JSON.stringify({ ...binding, revoked: true }));
   assert.equal(await run('ses_one'), 'PLUGIN_READ_UNAVAILABLE');
   assert.equal(unscoped, 0, 'never query or fall back to server default');
