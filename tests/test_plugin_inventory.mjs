@@ -4,6 +4,7 @@ import { createManagedReader } from '../src/workrelay/managed_server.mjs';
 
 const client = 'https://chatgpt.com/oauth/client.json';
 function fixture(change = {}) {
+  const nativePath = change.metadata ? '/api/provider/openai' : '/api/plugin';
   const binding = { enabled: true, revoked: false, issuer: 'https://issuer.test', audience: 'https://issuer.test/mcp',
     subject: 'alice', client_id: client, server: 'http://127.0.0.1:12345', service_registration: '/private/service.json', client_service_module: '/private/service.mjs' };
   const claims = { iss: binding.issuer, aud: binding.audience, sub: binding.subject, client_id: client };
@@ -14,19 +15,20 @@ function fixture(change = {}) {
   let sessions = 0;
   const reader = createManagedReader({ issuer: binding.issuer, audience: binding.audience, principal: binding.subject,
     managed_server: { ...binding } }, () => ({ ...binding }), {
-    canonical: path => path.startsWith('/PRIVATE') && (change.alias || change.canonicalChanged && calls.includes('/api/plugin')) ? '/OTHER' : path,
+    canonical: path => path.startsWith('/PRIVATE') && (change.alias || change.canonicalChanged && calls.includes(nativePath)) ? '/OTHER' : path,
     stat: path => ({ isFile: () => true, isDirectory: () => !change.notDirectory || !path.startsWith('/PRIVATE'),
       isSymbolicLink: () => !!change.symlink && path.startsWith('/PRIVATE'), uid: process.getuid(), mode: 0o600,
-      dev: change.deviceChanged && path.startsWith('/PRIVATE') && calls.includes('/api/plugin') ? 2 : 1,
-      ino: (change.inodeChanged && path.startsWith('/PRIVATE') || change.registrationChanged && path === binding.service_registration) && calls.includes('/api/plugin') ? 2 : 1, mtimeMs: 1 }),
+      dev: change.deviceChanged && path.startsWith('/PRIVATE') && calls.includes(nativePath) ? 2 : 1,
+      ino: (change.inodeChanged && path.startsWith('/PRIVATE') || change.registrationChanged && path === binding.service_registration) && calls.includes(nativePath) ? 2 : 1, mtimeMs: 1 }),
     loadService: async () => ({ discover: async () => ({ url: change.server ?? binding.server, auth: {} }), headers: () => ({ 'x-native-fixture': 'present' }) }),
     internalAuthorize: async request => request.method === 'GET' && request.path === '/api/session/ses_example' && request.body === null,
     fetcher: async (url, options) => {
       calls.push(url.pathname); assert.equal(options.method, 'GET'); assert.equal(options.redirect, 'manual');
       assert.equal(options.headers['x-native-fixture'], 'present');
-      if (url.pathname === '/api/plugin') {
+      if (url.pathname === nativePath) {
         assert.deepEqual([...url.searchParams], [['location[directory]', '/PRIVATE/a b&c']]);
         if (change.revoke) binding.revoked = true;
+        if (change.status) return new Response('PRIVATE_CANARY', { status: change.status });
         return new Response(JSON.stringify({ location: { directory: change.responseLocation ?? '/PRIVATE/a b&c' }, data: [
           { id: '/PRIVATE/token=SECRET', state: { status: 'failed', error: 'SECRET' }, source: { path: '/PRIVATE' }, params: 'SECRET' },
           { id: 'normal', state: { status: 'active' } }, { state: { status: 'failed' } } ] }));
@@ -48,6 +50,29 @@ test('internal client protocol derives encoded location, returns safe inventory,
   assert.match(result.items[0].plugin_id, /^plugin_[a-f0-9]{64}$/);
   assert.doesNotMatch(JSON.stringify(result), /PRIVATE|SECRET|params|source/);
   assert.ok(Number.isFinite(Date.parse(result.observed_at)));
+});
+test('private metadata context uses same identity refusals and closed finite routes', async () => {
+  for (const change of [{ missing: true }, { move: true }, { revoke: true }, { revoked: true }, { responseLocation: '/foreign' },
+    { directory: '/a/../private' }, { directory: 'relative' }, { symlink: true }, { alias: true }, { notDirectory: true },
+    { canonicalChanged: true }, { deviceChanged: true }, { inodeChanged: true }, { registrationChanged: true }, { status: 401 }, { status: 403 }]) {
+    const f = fixture({ ...change, metadata: true });
+    await assert.rejects(f.reader('attestation_metadata', { ...f.input, path: '/__managed/attestation-provider' }, f.claims));
+  }
+  for (const path of ['toString', '__proto__', '/api/provider/foreign', '/__managed/attestation-provider?location[directory]=/other', '/__managed/attestation-provider/../models']) {
+    const f = fixture({ metadata: true });
+    await assert.rejects(f.reader('attestation_metadata', { ...f.input, path }, f.claims));
+    assert.equal(f.calls.length, 0);
+  }
+  for (const extra of [{ directory: '/other' }, { headers: {} }, { method: 'POST' }, { body: {} }]) {
+    const f = fixture({ metadata: true });
+    await assert.rejects(f.reader('attestation_metadata', { ...f.input, path: '/__managed/attestation-provider', ...extra }, f.claims));
+    assert.equal(f.calls.length, 0);
+  }
+  const f = fixture({ metadata: true, status: 404 }), observed = [];
+  assert.equal(await f.reader('attestation_metadata', { ...f.input, path: '/__managed/attestation-provider' }, f.claims,
+    (stage, action, status) => { if (stage === 'native_status') observed.push(status); }), null);
+  assert.deepEqual(observed, [404]);
+  assert.deepEqual(f.calls, ['/api/session/ses_example', '/api/provider/openai', '/api/session/ses_example']);
 });
 test('private attestation preserves native canonical IDs/envelope and rejects changed registration', async () => {
   const f = fixture();

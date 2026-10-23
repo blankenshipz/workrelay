@@ -88,10 +88,17 @@ export function createManagedReader(expected, readBinding, { loadService = path 
     if (action === 'authorize') return { binding_id: bindingID, server_id: managedServerID(binding) };
     if (action === 'events' && input.server_id !== managedServerID(binding)) deny();
     let pluginSession;
-    if (action === 'plugin_inventory' || action === 'attestation_plugin') {
+    const metadataRoutes = {
+      '/__managed/attestation-provider': '/api/provider/openai',
+      '/__managed/attestation-integration': '/api/integration/openai',
+      '/__managed/attestation-models': '/api/model',
+    };
+    const metadataRoute = action === 'attestation_metadata' && Object.hasOwn(metadataRoutes, input.path) ? metadataRoutes[input.path] : undefined;
+    const sessionBound = action === 'plugin_inventory' || action === 'attestation_plugin' || action === 'attestation_metadata';
+    if (sessionBound) {
       // Internal, finite operation: never accept caller routing context or headers.
       if (!internalAuthorize || Object.keys(input).some(key => !['method', 'path', 'body', 'managed'].includes(key)) ||
-          input.method !== 'GET' || input.path !== (action === 'attestation_plugin' ? '/__managed/attestation-plugin' : '/__managed/plugin-inventory') || input.body !== null ||
+          input.method !== 'GET' || (action === 'attestation_metadata' ? !metadataRoute : input.path !== (action === 'attestation_plugin' ? '/__managed/attestation-plugin' : '/__managed/plugin-inventory')) || input.body !== null ||
           !sid.test(input.managed?.session_id ?? '') ||
           Object.keys(input.managed).some(key => !['claims', 'session_id', 'operation_id'].includes(key))) deny();
       const sessionInput = { method: 'GET', path: `/api/session/${input.managed.session_id}`, body: null };
@@ -108,13 +115,24 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       if (canonical(binding.service_registration) !== binding.service_registration ||
           before.dev !== registration.dev || before.ino !== registration.ino || before.mtimeMs !== registration.mtimeMs) deny();
     }
-    let path;
-    let method = 'GET', body;
-    if (action === 'plugin_inventory' || action === 'attestation_plugin') {
+    const revalidateSession = async () => {
+      const after = (await read('internal', { method: 'GET', path: `/api/session/${pluginSession.id}`, body: null }, claims))?.data;
       const identity = stat(pluginSession.directory);
       if (!identity.isDirectory() || identity.isSymbolicLink() || canonical(pluginSession.directory) !== pluginSession.directory ||
           identity.dev !== pluginSession.dev || identity.ino !== pluginSession.ino) deny();
-      path = '/api/plugin?' + new URLSearchParams({ 'location[directory]': pluginSession.directory });
+      if (after?.id !== pluginSession.id || after.projectID !== pluginSession.projectID ||
+          after.location?.directory !== pluginSession.directory || JSON.stringify(readBinding()) !== JSON.stringify(binding)) deny();
+      const finalRegistration = stat(binding.service_registration);
+      if (canonical(binding.service_registration) !== binding.service_registration || finalRegistration.dev !== registration.dev || finalRegistration.ino !== registration.ino ||
+          finalRegistration.mtimeMs !== registration.mtimeMs) deny();
+    };
+    let path;
+    let method = 'GET', body;
+    if (sessionBound) {
+      const identity = stat(pluginSession.directory);
+      if (!identity.isDirectory() || identity.isSymbolicLink() || canonical(pluginSession.directory) !== pluginSession.directory ||
+          identity.dev !== pluginSession.dev || identity.ino !== pluginSession.ino) deny();
+      path = (metadataRoute ?? '/api/plugin') + '?' + new URLSearchParams({ 'location[directory]': pluginSession.directory });
     } else if (action === 'internal' && internalAuthorize) {
       if (!await internalAuthorize(input, bindingID, endpoint, service.headers(endpoint))) deny();
       path = input.path; method = input.method; body = input.body;
@@ -157,6 +175,9 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       ...(body != null ? { body: JSON.stringify(body) } : {}),
       redirect: 'manual', signal: action === 'open_events' && input.signal ? AbortSignal.any([input.signal, AbortSignal.timeout(10000)]) : AbortSignal.timeout(10000) });
     stage('native_status', response.status);
+    if (action === 'attestation_metadata' && response.status === 404) {
+      await response.body?.cancel(); await revalidateSession(); return null;
+    }
     if (action === 'internal' && method === 'GET' && response.status === 404) { await response.body?.cancel(); return null; }
     if (!response.ok) { await response.body?.cancel(); deny(); }
     if (action === 'open_events') {
@@ -200,16 +221,14 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       if (next !== null && (typeof next !== 'string' || next.length > 4096 || /[\x00-\x1f\x7f]/.test(next))) deny();
       return { server_id: managedServerID(binding), items, next_cursor: next };
     }
-    if (action === 'plugin_inventory' || action === 'attestation_plugin') {
-      const after = (await read('internal', { method: 'GET', path: `/api/session/${pluginSession.id}`, body: null }, claims))?.data;
-      const identity = stat(pluginSession.directory);
-      if (!identity.isDirectory() || identity.isSymbolicLink() || canonical(pluginSession.directory) !== pluginSession.directory ||
-          identity.dev !== pluginSession.dev || identity.ino !== pluginSession.ino) deny();
-      if (after?.id !== pluginSession.id || after.projectID !== pluginSession.projectID ||
-          after.location?.directory !== pluginSession.directory || JSON.stringify(readBinding()) !== JSON.stringify(binding)) deny();
-      const finalRegistration = stat(binding.service_registration);
-      if (finalRegistration.dev !== registration.dev || finalRegistration.ino !== registration.ino ||
-          finalRegistration.mtimeMs !== registration.mtimeMs) deny();
+    if (sessionBound) {
+      await revalidateSession();
+      if (action === 'attestation_metadata') {
+        // Invalid envelopes still reach the unchanged attestor shape refusal.
+        // Any usable data must be attributed to the verified native location.
+        if (value?.data !== null && typeof value?.data === 'object' && value.location?.directory !== pluginSession.directory) deny();
+        return value;
+      }
       if (!Array.isArray(value.data) || value.data.length > 1000 || value.location?.directory !== pluginSession.directory) deny();
       // Private admission contract: keep the native envelope/canonical IDs. The
       // caller is the guarded local adapter, not a public inventory tool.

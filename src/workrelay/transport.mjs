@@ -247,6 +247,9 @@ print(json.dumps(r))`;
   if (input.path === '/__managed/attestation-plugin') {
     return reader('attestation_plugin', input, authority.claims);
   }
+  if (['/__managed/attestation-provider', '/__managed/attestation-integration', '/__managed/attestation-models'].includes(input.path)) {
+    return reader('attestation_metadata', input, authority.claims, observe);
+  }
   return reader(['/__managed/authorize', '/__managed/authorize-create-project'].includes(input.path) && input.method === 'GET' && input.body === null ? 'authorize' : 'internal', input, authority.claims, observe);
 }
 
@@ -264,10 +267,10 @@ try {
     process.stdin.on('end', () => resolve(text));
     process.stdin.on('error', reject);
   }));
-  if (input.method === 'GET' && input.path === '/api/provider/openai') providerDiagnostic = { http_status: null };
+  if (input.method === 'GET' && ['/api/provider/openai', '/__managed/attestation-provider'].includes(input.path)) providerDiagnostic = { http_status: null };
   if (input.managed !== undefined) {
     const data = await managedRequest(input, config, (stage, action, status) => {
-      if (providerDiagnostic && stage === 'native_status' && action === 'internal' && Number.isInteger(status) && status >= 100 && status <= 599) providerDiagnostic.http_status = status;
+      if (providerDiagnostic && stage === 'native_status' && ['internal', 'attestation_metadata'].includes(action) && Number.isInteger(status) && status >= 100 && status <= 599) providerDiagnostic.http_status = status;
     });
     process.stdout.write(JSON.stringify({ status: data === null ? 404 : 200, data, ...(providerDiagnostic ? { provider_diagnostic: providerDiagnostic } : {}) }));
     process.exit(0);

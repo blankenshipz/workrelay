@@ -136,6 +136,10 @@ class InstalledClient:
             # location, never the server default or caller-supplied routing data.
             if method == 'GET' and path == '/api/plugin' and 'managed' in self.config.get('_supervision_authority', {}):
                 path = '/__managed/attestation-plugin'
+            if method == 'GET' and 'managed' in self.config.get('_supervision_authority', {}):
+                path = {'/api/provider/openai': '/__managed/attestation-provider',
+                        '/api/integration/openai': '/__managed/attestation-integration',
+                        '/api/model': '/__managed/attestation-models'}.get(path, path)
             result = subprocess.run([self.config["node_executable"], self.script, self.config["_private_path"]],
                 input=json.dumps({"method": method, "path": path, "body": body,
                                   **self.config.get("_supervision_authority", {})}),

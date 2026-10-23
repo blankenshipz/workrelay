@@ -22,9 +22,15 @@ test('actual Python client -> release transport -> native fixtures isolates sele
   }
   let mode = 'active', posts = 0, unscoped = 0;
   const selected = [];
+  const metadataLocations = [];
   const server = createServer((req, res) => {
     if (req.method !== 'GET') { posts++; res.statusCode = 405; return res.end('{}'); }
     const url = new URL(req.url, 'http://fixture');
+    const location = url.searchParams.get('location[directory]');
+    if (['/api/provider/openai', '/api/integration/openai', '/api/model'].includes(url.pathname)) {
+      if (!location) { unscoped++; res.statusCode = 404; return res.end('PRIVATE_CANARY'); }
+      metadataLocations.push([url.pathname, location]);
+    }
     let value;
     if (url.pathname.startsWith('/api/session/')) {
       const id = url.pathname.split('/').at(-1);
@@ -42,12 +48,13 @@ test('actual Python client -> release transport -> native fixtures isolates sele
     } else if (url.pathname === '/api/provider/openai') {
       if (mode === 'provider404' || mode === 'provider403') { res.statusCode = mode === 'provider404' ? 404 : 403; return res.end('PRIVATE_CANARY'); }
       if (mode === 'provider_malformed') return res.end('PRIVATE_CANARY');
+      const attribution = { directory: mode === 'provider_wrong_location' ? locations.ses_two : location };
       value = mode === 'provider_null' ? null : mode === 'provider_missing' ? {} :
-        mode === 'provider_scalar' ? { data: 'PRIVATE_CANARY' } : mode === 'provider_list' ? { data: [] } :
-        { data: { id: 'openai', package: '@opencode/ai/providers/openai' } };
+        mode === 'provider_scalar' ? { location: attribution, data: 'PRIVATE_CANARY' } : mode === 'provider_list' ? { location: attribution, data: [] } :
+        { location: attribution, data: { id: mode === 'provider_wrong_id' ? 'foreign' : 'openai', package: location === locations.ses_two ? '@opencode/ai/providers/openai/responses' : '@opencode/ai/providers/openai' } };
     }
-    else if (url.pathname === '/api/integration/openai') value = { data: { id: 'openai', connections: [{ type: 'credential', method: 'oauth' }] } };
-    else if (url.pathname === '/api/model') value = { data: [{ id: 'fixture', providerID: 'openai', package: '@opencode/ai/providers/openai' }] };
+    else if (url.pathname === '/api/integration/openai') value = { location: { directory: location }, data: { id: 'openai', connections: [{ type: 'credential', method: 'oauth' }] } };
+    else if (url.pathname === '/api/model') value = { location: { directory: location }, data: [{ id: location === locations.ses_two ? 'fixture_two' : 'fixture', providerID: 'openai', package: '@opencode/ai/providers/openai' }] };
     else { res.statusCode = 404; value = {}; }
     res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(value));
   });
@@ -67,7 +74,7 @@ test('actual Python client -> release transport -> native fixtures isolates sele
   const configPath = join(dir, 'bridge.json');
   await fs.writeFile(configPath, JSON.stringify(base), { mode: 0o600 });
   const run = async session => {
-    const config = { ...base, _fixture_diagnostic: mode.startsWith('provider'), _private_path: configPath, _supervision_authority: { managed: {
+    const config = { ...base, model: { ...base.model, id: session === 'ses_two' ? 'fixture_two' : 'fixture' }, _fixture_diagnostic: mode.startsWith('provider'), _private_path: configPath, _supervision_authority: { managed: {
       claims: { iss: binding.issuer, aud: binding.audience, sub: binding.subject, client_id: client }, session_id: session, operation_id: 'fixture-read-only' } } };
     return new Promise((resolve, reject) => {
       const child = spawn(process.env.WORKRELAY_TEST_PYTHON || 'python3', ['-c',
@@ -81,6 +88,7 @@ test('actual Python client -> release transport -> native fixtures isolates sele
   await fs.writeFile(capability, JSON.stringify(binding), { mode: 0o600 });
   assert.equal(await run('ses_one'), 'passed'); assert.equal(await run('ses_two'), 'passed');
   assert.deepEqual(selected, [locations.ses_one, locations.ses_two]);
+  assert.deepEqual(metadataLocations, Object.values(locations).flatMap(location => ['/api/provider/openai', '/api/integration/openai', '/api/model', '/api/provider/openai', '/api/integration/openai'].map(path => [path, location])));
   for (mode of ['missing', 'inactive', 'duplicate', 'malformed']) assert.equal(await run('ses_one'), 'GUARD_PLUGIN_STATE');
   for (mode of ['denied', 'wrong_location']) assert.equal(await run('ses_one'), 'PLUGIN_READ_UNAVAILABLE');
   assert.equal(await run('ses_missing'), 'PLUGIN_READ_UNAVAILABLE');
@@ -88,7 +96,7 @@ test('actual Python client -> release transport -> native fixtures isolates sele
     ['provider404',404,'PROVIDER_RESPONSE','null'], ['provider_null',200,'PROVIDER_RESPONSE','null'],
     ['provider_missing',200,'PROVIDER_RESPONSE','object'], ['provider_scalar',200,'PROVIDER_RESPONSE','object'],
     ['provider_list',200,'PROVIDER_RESPONSE','object'], ['provider_malformed',200,'PROVIDER_READ_UNAVAILABLE','unknown'],
-    ['provider403',403,'PROVIDER_READ_UNAVAILABLE','unknown']]) {
+    ['provider403',403,'PROVIDER_READ_UNAVAILABLE','unknown'], ['provider_wrong_location',200,'PROVIDER_READ_UNAVAILABLE','unknown']]) {
     mode = scenario;
     const raw = await run('ses_one');
     assert.ok(!raw.includes('PRIVATE_CANARY'));
@@ -98,6 +106,8 @@ test('actual Python client -> release transport -> native fixtures isolates sele
     assert.equal(observed.diagnostic.envelope_shape, shape);
     if (scenario === 'provider_list') assert.equal(observed.diagnostic.data_shape, 'list');
   }
+  mode = 'provider_wrong_id';
+  assert.equal(JSON.parse(await run('ses_one')).check, 'PROVIDER_OVERLAY');
   mode = 'active';
   await fs.writeFile(capability, JSON.stringify({ ...binding, revoked: true }));
   assert.equal(await run('ses_one'), 'PLUGIN_READ_UNAVAILABLE');
