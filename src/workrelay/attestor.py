@@ -178,8 +178,8 @@ def verify(config, client):
               not u.username and not u.password and not u.query and not u.fragment, 'PROVIDER_OVERLAY')
     models = payload(client, "/api/model")
     check(isinstance(models, list) and models and all(isinstance(m, dict) and
-          m.get("providerID") == "openai" for m in models), 'MODEL_CATALOG')
-    selected = [m for m in models if m.get("id") == config["model"]["id"]]
+          isinstance(m.get("providerID"), str) for m in models), 'MODEL_CATALOG')
+    selected = [m for m in models if m.get("providerID") == ref["providerID"] and m.get("id") == ref["id"]]
     check(len(selected) == 1 and selected[0].get("package") in
           ("@opencode/ai/providers/openai", "@opencode/ai/providers/openai/responses"), 'MODEL_CATALOG')
     model = selected[0]

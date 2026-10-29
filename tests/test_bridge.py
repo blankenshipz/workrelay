@@ -294,6 +294,19 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("unverified", result[2])
         self.assertFalse(any(path == "/api/session" for _, path in FakeClient.calls))
 
+    def test_attestor_scopes_selection_to_requested_provider(self):
+        client = FakeClient(self.data, None)
+        original = dict(FakeClient.metadata["/api/model"][0])
+        other = dict(original, providerID="anthropic", package="other/provider")
+        FakeClient.metadata["/api/model"].append(other)
+        self.assertTrue(verify(self.data, client))
+        FakeClient.metadata["/api/model"] = [other]
+        with self.assertRaises(AttestationError):
+            verify(self.data, client)
+        FakeClient.metadata["/api/model"] = [original, dict(original), other]
+        with self.assertRaises(AttestationError):
+            verify(self.data, client)
+
     def test_attestor_rejects_ambiguous_metadata_and_tampering(self):
         client = FakeClient(self.data, None)
         self.assertTrue(verify(self.data, client))
