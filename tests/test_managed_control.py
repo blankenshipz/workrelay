@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from workrelay.cli import BridgeError, GuardFailure, CONTROL_DENIAL_CODES
-from workrelay.managed_control import control, reservation_owner_dead, create_session, creation_session_id, inspect_operation, identity, resolve_operation, classified_failure, native_waits, record_denial
+from workrelay.managed_control import control, reservation_owner_dead, create_session, creation_session_id, inspect_operation, identity, resolve_operation, classified_failure, native_waits, record_denial, settle_question, reconcile_question, reconcile_operation, initialize
 
 
 class ManagedControlTests(unittest.TestCase):
@@ -26,7 +26,7 @@ class ManagedControlTests(unittest.TestCase):
         self.config = {'model': {'providerID': 'openai', 'id': 'included'}}
         self.session = {'id': self.sid, 'model': self.config['model'], 'agent': 'existing-owner',
                         'parentID': 'ses_parent', 'metadata': {'taskIntent': 'unchanged'}, 'permissions': {'ask': True}}
-        self.calls = []; self.inbox = []; self.binding = 'a' * 64; self.timeout = False
+        self.calls = []; self.inbox = []; self.exact_message = None; self.reconcile_during_post = None; self.binding = 'a' * 64; self.timeout = False
 
     def authorize(self):
         if self.binding is None:
@@ -37,13 +37,16 @@ class ManagedControlTests(unittest.TestCase):
         self.calls.append((method, path, copy.deepcopy(body)))
         if method == 'GET':
             if path.endswith('/inbox'): return {'data': self.inbox}
-            if '/message/' in path: return None
+            if path.endswith('/permission') or path.endswith('/form'): return {'data': []}
+            if '/message/' in path: return self.exact_message
             return {'data': copy.deepcopy(self.session)}
         if '/prompt' in path:
             self.assertEqual(set(body), {'id', 'text', 'delivery'})
             self.assertIn(body['delivery'], ('queue', 'steer'))
-            result = {'id': body['id'], 'sessionID': self.sid, 'delivery': body['delivery']}
+            result = {'id': body['id'], 'sessionID': self.sid, 'type': 'user', 'payload': {'text': body['text']}, 'delivery': body['delivery']}
             self.inbox.append(result)
+            if self.reconcile_during_post:
+                reconcile_operation(self.db, self.config, self, self.authorize, self.sid, self.reconcile_during_post)
             if self.timeout: raise TimeoutError()
             return {'data': result}
         self.assertEqual(path, f'/api/session/{self.sid}/interrupt?resume=false')
@@ -74,6 +77,43 @@ class ManagedControlTests(unittest.TestCase):
         with self.assertRaises(BridgeError): self.run_control(text='hello')
         self.assertEqual(self.run_control(text='hello')['phase'], 'queued_observed')
         self.assertEqual(len(self.posts()), 1)
+
+    @patch('workrelay.managed_control.admission')
+    def test_native_shaped_queue_receipts_require_exact_user_text_before_durable_clear(self, admit):
+        def uncertain(op):
+            self.timeout = True
+            with self.assertRaises(BridgeError): self.run_control(op, text='hello')
+            self.timeout = False
+            self.inbox = []
+        uncertain('message-exact')
+        message_id = self.db.execute("SELECT message FROM managed_operations WHERE operation='message-exact'").fetchone()[0]
+        self.exact_message = {'data': {'id': message_id, 'type': 'user', 'text': 'hello'}}
+        self.assertEqual(reconcile_operation(self.db, self.config, self, self.authorize, self.sid, 'message-exact')['recorded_phase'], 'message_observed')
+        self.assertEqual(self.db.execute("SELECT phase FROM managed_operations WHERE operation='message-exact'").fetchone()[0], 'message_observed')
+        for index, malformed in enumerate([
+            {'data': {'id': 'wrong', 'type': 'user', 'text': 'hello'}},
+            {'data': {'id': None, 'type': 'assistant', 'text': 'hello'}},
+            {'data': {'id': None, 'type': 'user', 'text': 'wrong'}},
+            {'data': {'id': None, 'type': 'user'}},
+            {'data': {'id': None, 'sessionID': 'ses_other', 'type': 'user', 'text': 'hello'}},
+        ]):
+            operation = 'message-bad' + str(index); uncertain(operation)
+            message_id = self.db.execute('SELECT message FROM managed_operations WHERE operation=?', (operation,)).fetchone()[0]
+            malformed['data']['id'] = message_id if malformed['data']['id'] is None else malformed['data']['id']
+            self.exact_message = malformed
+            self.assertEqual(reconcile_operation(self.db, self.config, self, self.authorize, self.sid, operation)['recorded_phase'], 'uncertain')
+            self.db.execute("UPDATE managed_operations SET phase='message_observed' WHERE operation=?", (operation,))
+        uncertain('inbox-exact')
+        row = self.db.execute("SELECT message FROM managed_operations WHERE operation='inbox-exact'").fetchone()[0]
+        self.exact_message = None
+        self.inbox = [{'id': row, 'sessionID': self.sid, 'type': 'user', 'payload': {'text': 'hello'}, 'delivery': 'queue'}]
+        self.assertEqual(reconcile_operation(self.db, self.config, self, self.authorize, self.sid, 'inbox-exact')['recorded_phase'], 'queued_observed')
+
+    @patch('workrelay.managed_control.admission')
+    def test_late_sender_failure_cannot_downgrade_reconciled_receipt(self, admit):
+        self.reconcile_during_post = 'race-receipt'; self.timeout = True
+        with self.assertRaises(BridgeError): self.run_control('race-receipt', text='hello')
+        self.assertEqual(self.db.execute("SELECT phase FROM managed_operations WHERE operation='race-receipt'").fetchone()[0], 'queued_observed')
 
     @patch('workrelay.managed_control.admission')
     def test_unresolved_and_concurrent_operation_serialization(self, admit):
@@ -1022,6 +1062,7 @@ class NativeWaitTests(unittest.TestCase):
         self.pending = [{'id': 'per_wait', 'sessionID': 'ses_waits', 'action': 'shell',
                          'resources': ['token=synthetic-sensitive', 'Bearer synthetic-private-token'],
                          'metadata': {'approval': True, 'secret': 'never-expose'}, 'message': 'never-expose'}]
+        self.forms = []
     def authorize(self):
         if self.binding is None: raise BridgeError('revoked')
         return self.binding
@@ -1031,6 +1072,10 @@ class NativeWaitTests(unittest.TestCase):
         if path == '/api/session/ses_waits/permission':
             if self.after_permission: self.after_permission()
             return {'data': self.pending}
+        if path == '/api/session/ses_waits/form':
+            return {'data': self.forms}
+        if path == '/api/session/ses_waits/form/frm_question':
+            return {'data': {**self.forms[0], 'state': {'status': 'pending'}}}
         self.assertEqual(path, '/api/session/ses_waits')
         return {'data': copy.deepcopy(self.session)}
 
@@ -1042,13 +1087,13 @@ class NativeWaitTests(unittest.TestCase):
         self.assertEqual(result['items'][0]['request_id'], 'per_wait')
         self.assertTrue(result['items'][0]['requires_explicit_human_decision'])
         self.assertFalse(result['native_permission_reply_exposed'])
-        self.assertFalse(result['native_question_reply_exposed'])
+        self.assertTrue(result['native_question_reply_exposed'])
         self.assertIn('approval UI', result['guidance'])
         for secret in ('synthetic-sensitive', 'synthetic-private-token', 'never-expose'):
             self.assertNotIn(secret, str(result))
         self.assertEqual(self.session, before); admit.assert_not_called()
         self.assertEqual([path for _, path, _ in self.calls],
-                         ['/api/session/ses_waits', '/api/session/ses_waits/permission', '/api/session/ses_waits'])
+                         ['/api/session/ses_waits', '/api/session/ses_waits/permission', '/api/session/ses_waits/form', '/api/session/ses_waits'])
 
     def test_bounds_other_session_duplicate_and_unknown_permissions_fail_closed(self):
         original = copy.deepcopy(self.pending)
@@ -1068,9 +1113,146 @@ class NativeWaitTests(unittest.TestCase):
         self.assertTrue(result['truncated']); self.assertEqual(len(result['items']), 1)
         self.after_permission = lambda: setattr(self, 'binding', None)
         with self.assertRaises(BridgeError): native_waits(self, self.authorize, 'ses_waits')
+
+    def test_question_wait_is_separate_from_permission_and_requires_core_provenance(self):
+        self.forms = [{'id': 'frm_question', 'sessionID': 'ses_waits', 'title': 'Questions',
+                       'metadata': {'kind': 'question', 'tool': {'messageID': 'msg_question', 'id': 'call_question'}},
+                       'fields': [{'key': 'q0', 'title': 'Direction', 'description': 'Choose safely', 'type': 'string'}]},
+                      {'id': 'frm_auth', 'sessionID': 'ses_waits', 'title': 'Questions',
+                       'metadata': {'kind': 'question'}, 'fields': [{'key': 'q0', 'type': 'string'}]}]
+        result = native_waits(self, self.authorize, 'ses_waits')
+        self.assertEqual(result['pending_question_count'], 1)
+        self.assertEqual(result['questions'][0]['form_id'], 'frm_question')
+        self.assertTrue(result['questions'][0]['requires_explicit_caller_decision'])
         self.binding = 'a' * 64
         self.after_permission = lambda: self.session.update(agent='other-owner')
         with self.assertRaises(BridgeError): native_waits(self, self.authorize, 'ses_waits')
+
+class NativeQuestionMutationTests(unittest.TestCase):
+    def setUp(self):
+        self.db = sqlite3.connect(':memory:', isolation_level=None); self.addCleanup(self.db.close)
+        self.sid = 'ses_question'; self.binding = 'a' * 64; self.posts = []; self.fail_post = False; self.form_override = False; self.message_session = None
+        self.session = {'id': self.sid, 'model': {'providerID': 'openai', 'id': 'included'}, 'agent': 'owner', 'metadata': {}, 'permissions': {}}
+        self.form = {'id': 'frm_question', 'sessionID': self.sid, 'title': 'Questions',
+          'metadata': {'kind': 'question', 'tool': {'messageID': 'msg_question', 'id': 'call_question'}},
+          'fields': [{'key': 'q0', 'type': 'string'}], 'state': {'status': 'pending'}}
+    def authorize(self): return self.binding
+    def request(self, method, path, body=None):
+        if path == '/api/session/' + self.sid: return {'data': copy.deepcopy(self.session)}
+        if path.endswith('/reply') or method == 'DELETE':
+            self.posts.append((method,path,copy.deepcopy(body)))
+            if self.fail_post: raise TimeoutError()
+            self.form['state'] = {'status': 'cancelled'} if method == 'DELETE' else {'status': 'answered', 'answer': body['answer']}; return {}
+        if path == f'/api/session/{self.sid}/form/frm_question':
+            return self.form_override if self.form_override is not False else {'data': copy.deepcopy(self.form)}
+        if path == f'/api/session/{self.sid}/message/msg_question': return {'data': {'id':'msg_question', **({'sessionID': self.message_session} if self.message_session is not None else {}), 'content':[{'type':'tool','id':'call_question','name':'question','executed':{},'providerState':{},'state':{'status':'running'},'time':{}}]}}
+        raise AssertionError((method,path,body))
+    def reserve_question(self, operation, *, cancel=False, answer=None, pid=999999):
+        initialize(self.db)
+        kind = 'question_cancel' if cancel else 'question_reply'
+        digest = hashlib.sha256((kind + '\0' + 'frm_question' + '\0' + json.dumps(answer, sort_keys=True, separators=(',', ':'), ensure_ascii=False)).encode()).hexdigest()
+        self.db.execute('INSERT INTO managed_operations(binding,session,operation,kind,digest,message,phase,identity,reservation_pid) VALUES(?,?,?,?,?,?,?,?,?)',
+                        (self.binding, self.sid, operation, kind, digest, 'frm_question', 'reserved', identity(self.session, self.sid), pid))
+    @patch('workrelay.managed_control.admission')
+    def test_reply_cancel_idempotency_and_conflicts(self, admit):
+        result = settle_question(self.db, {}, self, self.authorize, self.sid, 'reply', 'frm_question', answer={'q0':'yes'})
+        self.assertEqual(result['phase'], 'question_answered_observed'); self.assertEqual(len(self.posts), 1)
+        self.assertEqual(settle_question(self.db, {}, self, self.authorize, self.sid, 'reply', 'frm_question', answer={'q0':'yes'})['phase'], result['phase'])
+        self.assertEqual(len(self.posts), 1)
+        for kwargs in ({'answer':{'q0':'no'}}, {'answer':None, 'cancel':True}):
+            with self.assertRaises(BridgeError): settle_question(self.db, {}, self, self.authorize, self.sid, 'reply', 'frm_question', **kwargs)
+        self.form['state'] = {'status':'pending'}
+        self.assertEqual(settle_question(self.db, {}, self, self.authorize, self.sid, 'cancel', 'frm_question', cancel=True)['phase'], 'question_cancelled_observed')
+        self.assertEqual(len(self.posts), 2)
+    @patch('workrelay.managed_control.admission')
+    def test_invalid_foreign_settled_or_tool_mismatch_never_posts(self, admit):
+        cases = [lambda: self.form.update(sessionID='ses_other'), lambda: self.form.update(state={'status':'answered'}),
+                 lambda: self.form.update(metadata={'kind':'auth','tool':{'messageID':'msg_question','id':'call_question'}}),
+                 lambda: setattr(self, 'message_session', 'ses_other')]
+        for index, change in enumerate(cases):
+            self.form['sessionID']=self.sid; self.form['state']={'status':'pending'}; self.form['metadata']={'kind':'question','tool':{'messageID':'msg_question','id':'call_question'}}; self.message_session = None; change()
+            with self.assertRaises(BridgeError): settle_question(self.db, {}, self, self.authorize, self.sid, 'bad'+str(index), 'frm_question', answer={'q0':'x'})
+        self.assertEqual(self.posts, [])
+    @patch('workrelay.managed_control.admission')
+    def test_uncertain_post_never_replays_and_admission_denial_never_posts(self, admit):
+        self.fail_post = True
+        with self.assertRaises(BridgeError): settle_question(self.db, {}, self, self.authorize, self.sid, 'uncertain', 'frm_question', answer={'q0':'x'})
+        self.fail_post = False
+        self.assertEqual(settle_question(self.db, {}, self, self.authorize, self.sid, 'uncertain', 'frm_question', answer={'q0':'x'})['phase'], 'uncertain')
+        self.assertEqual(len(self.posts), 1)
+        admit.side_effect = BridgeError('denied')
+        with self.assertRaises(BridgeError): settle_question(self.db, {}, self, self.authorize, self.sid, 'denied', 'frm_question', answer={'q0':'x'})
+        self.assertEqual(len(self.posts), 1)
+
+    @patch('workrelay.managed_control.admission')
+    def test_reconcile_requires_exact_form_identity_and_recorded_answer(self, admit):
+        self.fail_post = True
+        with self.assertRaises(BridgeError):
+            settle_question(self.db, {}, self, self.authorize, self.sid, 'uncertain', 'frm_question', answer={'q0':'expected'})
+        self.fail_post = False
+        self.form['state'] = {'status': 'answered', 'answer': {'q0': 'other'}}
+        result = reconcile_question(self.db, self, self.authorize, self.sid, 'uncertain')
+        self.assertEqual(result['native_form_state'], 'answered_other')
+        self.assertEqual(len(self.posts), 1)
+        self.form['sessionID'] = 'ses_foreign'
+        with self.assertRaises(BridgeError): reconcile_question(self.db, self, self.authorize, self.sid, 'uncertain')
+        self.form['sessionID'] = self.sid
+        self.form_override = {'data': {}}
+        with self.assertRaises(BridgeError): reconcile_question(self.db, self, self.authorize, self.sid, 'uncertain')
+        self.form_override = None
+        self.assertEqual(reconcile_question(self.db, self, self.authorize, self.sid, 'uncertain')['native_form_state'], 'absent')
+        self.form_override = False
+        self.session['agent'] = 'other-owner'
+        with self.assertRaises(BridgeError): reconcile_question(self.db, self, self.authorize, self.sid, 'uncertain')
+
+    @patch('workrelay.managed_control.admission')
+    def test_exact_uncertain_question_receipt_clears_durable_block_once(self, admit):
+        self.fail_post = True
+        with self.assertRaises(BridgeError):
+            settle_question(self.db, {}, self, self.authorize, self.sid, 'clear', 'frm_question', answer={'q0': 'yes'})
+        self.fail_post = False
+        self.form['state'] = {'status': 'answered', 'answer': {'q0': 'yes'}}
+        self.assertEqual(reconcile_question(self.db, self, self.authorize, self.sid, 'clear')['recorded_phase'], 'question_answered_observed')
+        self.assertEqual(self.db.execute("SELECT phase FROM managed_operations WHERE operation='clear'").fetchone()[0], 'question_answered_observed')
+        self.assertEqual(reconcile_question(self.db, self, self.authorize, self.sid, 'clear')['recorded_phase'], 'question_answered_observed')
+
+    def test_generic_reconcile_cas_clears_only_exact_observed_queue_receipt(self):
+        initialize(self.db)
+        digest = hashlib.sha256(b'queue\0expected').hexdigest()
+        self.db.execute('INSERT INTO managed_operations(binding,session,operation,kind,digest,message,phase,identity,reservation_pid) VALUES(?,?,?,?,?,?,?,?,?)',
+                        (self.binding, self.sid, 'queue-clear', 'queue', digest, 'msg_queue', 'uncertain', identity(self.session, self.sid), os.getpid()))
+        observed = {'operation_id': 'queue-clear', 'session_id': self.sid, 'kind': 'queue', 'phase': 'message_observed', 'recorded_phase': 'uncertain'}
+        with patch('workrelay.managed_control.inspect_operation', return_value=observed), patch('workrelay.managed_control.native_waits', return_value={'pending_question_count': 0, 'pending_permission_count': 0}):
+            self.assertEqual(reconcile_operation(self.db, {}, self, self.authorize, self.sid, 'queue-clear')['recorded_phase'], 'message_observed')
+            self.assertEqual(reconcile_operation(self.db, {}, self, self.authorize, self.sid, 'queue-clear')['recorded_phase'], 'message_observed')
+        self.assertEqual(self.db.execute("SELECT phase FROM managed_operations WHERE operation='queue-clear'").fetchone()[0], 'message_observed')
+        self.db.execute('INSERT INTO managed_operations(binding,session,operation,kind,digest,message,phase,identity,reservation_pid) VALUES(?,?,?,?,?,?,?,?,?)',
+                        (self.binding, self.sid, 'queue-mismatch', 'queue', digest, 'msg_other', 'uncertain', identity(self.session, self.sid), os.getpid()))
+        unresolved = {'operation_id': 'queue-mismatch', 'session_id': self.sid, 'kind': 'queue', 'phase': 'uncertain', 'recorded_phase': 'uncertain'}
+        with patch('workrelay.managed_control.inspect_operation', return_value=unresolved), patch('workrelay.managed_control.native_waits', return_value={'pending_question_count': 0, 'pending_permission_count': 0}):
+            reconcile_operation(self.db, {}, self, self.authorize, self.sid, 'queue-mismatch')
+        self.assertEqual(self.db.execute("SELECT phase FROM managed_operations WHERE operation='queue-mismatch'").fetchone()[0], 'uncertain')
+
+    @patch('workrelay.managed_control.admission')
+    @patch('workrelay.managed_control.reservation_owner_dead', return_value=True)
+    def test_dead_reservations_recover_reply_and_cancel_without_changing_receipt(self, dead, admit):
+        self.reserve_question('crashed-reply', answer={'q0': 'yes'})
+        reply = settle_question(self.db, {}, self, self.authorize, self.sid, 'crashed-reply', 'frm_question', answer={'q0': 'yes'})
+        self.assertEqual(reply['phase'], 'question_answered_observed')
+        self.assertEqual(len(self.posts), 1)
+        self.form['state'] = {'status': 'pending'}
+        self.reserve_question('crashed-cancel', cancel=True)
+        cancel = settle_question(self.db, {}, self, self.authorize, self.sid, 'crashed-cancel', 'frm_question', cancel=True)
+        self.assertEqual(cancel['phase'], 'question_cancelled_observed')
+        self.assertEqual(len(self.posts), 2)
+
+    @patch('workrelay.managed_control.admission')
+    @patch('workrelay.managed_control.reservation_owner_dead', return_value=False)
+    def test_live_or_unknown_question_reservation_blocks_without_post(self, dead, admit):
+        self.reserve_question('live-reserved', answer={'q0': 'yes'}, pid=os.getpid())
+        with self.assertRaises(BridgeError):
+            settle_question(self.db, {}, self, self.authorize, self.sid, 'live-reserved', 'frm_question', answer={'q0': 'yes'})
+        self.assertEqual(self.posts, [])
 
 
 if __name__ == '__main__': unittest.main()

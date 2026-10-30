@@ -33,11 +33,13 @@ test('managed observer reads only pinned session outcome/permission IDs and rech
     loadService: async () => ({ discover: async () => ({ url: binding.server, auth: {} }), headers: () => ({}) }),
     fetcher: async (url, options) => { assert.equal(options.method, 'GET'); assert.equal(options.redirect, 'manual');
       if (url.pathname.endsWith('/permission')) { if (revokeDuring) binding.revoked = true; return new Response(JSON.stringify({ data: [{ sessionID: permissionSession, id: 'per_decision', patterns: ['SECRET'], metadata: { token: 'SECRET' } }] })); }
+      if (url.pathname.endsWith('/form')) return new Response(JSON.stringify({ data: [] }));
+      if (url.pathname === '/api/session/active') return new Response(JSON.stringify({ data: {} }));
       return new Response(JSON.stringify({ data: { id: session, outcome: undefined, title: 'SECRET', projectID: 'SECRET', time: { idle: 1 } } })); },
   });
   const filter = { server_id: managedServerID(binding), session_id: session };
   const result = await reader('events', filter, claims);
-  assert.deepEqual(result.items, [{ session_id: session, state: 'needs_input', decisions: ['per_decision'] }]); assert.ok(!JSON.stringify(result).includes('SECRET'));
+  assert.deepEqual(result.items, [{ session_id: session, state: 'needs_input', decisions: ['per_decision'], forms: [] }]); assert.ok(!JSON.stringify(result).includes('SECRET'));
   await assert.rejects(reader('events', { ...filter, server_id: 'srv_' + 'f'.repeat(64) }, claims));
   await assert.rejects(reader('events', filter, { ...claims, client_id: 'other' }));
   permissionSession = 'ses_other'; await assert.rejects(reader('events', filter, claims)); permissionSession = session;
@@ -110,6 +112,8 @@ test('actual authenticated MCP facade: pinned ChatGPT server/session subscriptio
       res.on('close', () => clearTimeout(timer)); return;
     }
     if (req.url === `/api/session/${session}/permission`) return res.end(JSON.stringify({ data: permissions.map(id => ({ id, sessionID: session, text: 'SECRET' })) }));
+    if (req.url === `/api/session/${session}/form`) return res.end(JSON.stringify({ data: [] }));
+    if (req.url === '/api/session/active') return res.end(JSON.stringify({ data: {} }));
     const item = { id: session, projectID: 'private/path', title: 'SECRET', outcome, time: idle ? { idle: 1 } : {} };
     res.end(JSON.stringify(req.url.startsWith('/api/session?') ? { data: [item], cursor: {} } : { data: item }));
   }); await listen(backend); t.after(() => close(backend)); const origin = `http://127.0.0.1:${backend.address().port}`;

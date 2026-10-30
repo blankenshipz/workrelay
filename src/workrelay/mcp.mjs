@@ -375,6 +375,7 @@ function mcp(config, invoke, events, managedReader, eventTools) {
             { stage: 'queue_continuation', tool: 'workrelay_server_message', requires: ['session_id', 'operation_id', 'text'] },
             { stage: 'steer_existing_owner', tool: 'workrelay_server_steer', requires: ['session_id', 'operation_id', 'text'] },
             { stage: 'recover_original_operation', tool: 'workrelay_server_operation_status', requires: ['operation_id'] },
+            { stage: 'reconcile_native_operation', tool: 'workrelay_server_reconcile', requires: ['session_id', 'operation_id'] },
             { stage: 'stop_execution_only', tool: 'workrelay_server_interrupt', requires: ['session_id', 'operation_id'] },
             ...(eventTools ? [{ stage: 'events_prerequisites', tool: 'workrelay_event_capabilities', requires: [] },
               { stage: 'return_to_subscriptions', tool: 'workrelay_event_subscriptions', requires: [] },
@@ -390,10 +391,13 @@ function mcp(config, invoke, events, managedReader, eventTools) {
       }
     });
   }
-  if (managedReader) for (const action of ['create', 'message', 'steer', 'resume', 'inspect', 'waits', 'interrupt']) {
+  if (managedReader) for (const action of ['create', 'message', 'steer', 'resume', 'inspect', 'waits', 'question_reply', 'question_cancel', 'reconcile', 'interrupt']) {
     register(`workrelay_server_${action === 'inspect' ? 'operation_status' : action}`, {
       description: action === 'create' ? 'For the pinned server-wide principal, select project_id from workrelay_server_projects and omit directory to create an idle session at that verified native project canonical root. Optional creation_target selects the default project only. Explicit directory must be the selected root or an operator-allowlisted location within it; no arbitrary filesystem access. Supply operation_id/title. Inspect original operations before retry; never change arguments on an existing operation ID. Native model/permission/financial checks remain.' :
-        action === 'waits' ? 'Read bounded redacted native permission waits for an exact session; no operation_id, inference, permission reply or approval. Decide in the native OpenCode/OpenChamber UI, then read waits again. Native question list/reply/reject routes are unsupported; messages are not approval replies.' :
+        action === 'waits' ? 'Read bounded redacted native permission waits and native question forms for an exact session. This cannot reply to permissions or approve anything.' :
+        action === 'question_reply' ? 'Submit an explicit caller-supplied answer to one exact, pending native question-tool form. The exact question form and owning running question tool are revalidated. Permission, authentication and MCP forms are never settled.' :
+        action === 'question_cancel' ? 'Cancel one exact, pending native question-tool form. This can resume native inference and retains model, financial and native gates. Permission, authentication and MCP forms are never settled.' :
+        action === 'reconcile' ? 'Read current native receipt for a retained operation and persist only an exact verified local observation. This distinguishes queued from materialized messages and native blockers, or observes question form state. It never posts or permits replay; historical operation status remains receipt-only.' :
         action === 'inspect' ? 'Read a historical durable receipt under the current authenticated principal/server binding; no current execution-model guard, native observation, continuation or interruption. session_id is optional when unknown. Not-found/ambiguous is scoped to this binding, never global absence or proof of no effect. Use retained original references or operator receipt reconciliation, not repeated identical failed lookups, guessed sessions, binding changes or replay. Writes retain native model/permission/financial guards.' :
         action === 'steer' ? 'Steer bounded text to the existing native owner at its supported boundary. No agent transfer or permission approval. Reuse operation_id and identical inputs.' :
         ['message', 'resume'].includes(action) ? 'Queue a bounded continuation to the existing session owner; preserves agent/model/permissions. Native approval gates and financial admission apply. Reuse operation_id with identical text to reconcile uncertainty; never blindly replay.' :
@@ -401,8 +405,10 @@ function mcp(config, invoke, events, managedReader, eventTools) {
       inputSchema: action === 'create' ? z.object({ operation_id: key, project_id: z.string().regex(/^project_[a-f0-9]{64}$/), title: z.string().trim().min(1).max(160), directory: z.string().min(1).max(4096).optional() }).strict() :
         z.object({ session_id: action === 'inspect' ? z.string().regex(/^ses[A-Za-z0-9_-]{1,160}$/).optional() : z.string().regex(/^ses[A-Za-z0-9_-]{1,160}$/),
         ...(action === 'waits' ? { limit: z.number().int().min(1).max(50).optional() } : { operation_id: key }),
+        ...(['question_reply', 'question_cancel'].includes(action) ? { form_id: z.string().regex(/^frm_[A-Za-z0-9_-]{1,160}$/) } : {}),
+        ...(action === 'question_reply' ? { answer: z.record(z.string(), z.union([z.string(), z.array(z.string())])).refine(value => Object.keys(value).length <= 20) } : {}),
         ...(['message', 'steer', 'resume'].includes(action) ? { text } : {}) }).strict(),
-      annotations: { readOnlyHint: ['inspect', 'waits'].includes(action), destructiveHint: action === 'interrupt', idempotentHint: true, openWorldHint: false },
+      annotations: { readOnlyHint: ['inspect', 'waits'].includes(action), destructiveHint: ['interrupt', 'question_cancel'].includes(action), idempotentHint: true, openWorldHint: false },
     }, async (input, ctx) => {
       try {
         const claims = ctx.http?.authInfo?.extra?.managedClaims;

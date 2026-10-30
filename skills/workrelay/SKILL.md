@@ -13,3 +13,17 @@ Use this skill only if the human enabled local computer tasks and supplied a pri
 4. `workrelay cancel --key <same-key> --owner dot-work` requests an interruption of only the owned session. Descendant sessions are not automatically canceled. If a submission is uncertain, stop and ask the human to inspect it rather than retrying a possibly duplicated prompt.
 
 This skill does not establish that Dot supports invoking these commands; verify connected-computer availability and real mobile round trip separately.
+
+## Managed-server native questions
+
+When the authenticated managed-server tools are available, inspect the exact
+session with `workrelay_server_waits`. A pending question is different from a
+native permission request. Only after the human explicitly supplies the answer
+or requests dismissal, use `workrelay_server_question_reply` or
+`workrelay_server_question_cancel` for that exact form, with a stable operation
+ID. Do not infer approval from task text or answer authorization/security forms.
+These tools may continue the existing execution; native tool permissions remain.
+Use `workrelay_server_reconcile` for authorized recovery: it persists verified
+local receipt state without replay or native mutation. Read-only monitoring uses
+operation status and waits instead.
+An uncertain operation remains uncertain until native evidence resolves it.

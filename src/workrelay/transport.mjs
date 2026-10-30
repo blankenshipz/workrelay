@@ -187,7 +187,8 @@ async function managedRequest(input, config, observe) {
         const sid = authority.session_id;
         if (request.method === 'GET' && request.body === null) {
           if (rootRoutes.has(request.path) || request.path === '/api/project' || request.path === `/api/session/${sid}` ||
-              request.path === `/api/session/${sid}/inbox` || request.path === `/api/session/${sid}/permission`) return true;
+              request.path === `/api/session/${sid}/inbox` || request.path === `/api/session/${sid}/permission` ||
+              request.path === `/api/session/${sid}/form`) return true;
         }
         const code = `import json,sqlite3,sys
 db=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True,timeout=3)
@@ -196,8 +197,27 @@ print(json.dumps(r))`;
         const row = JSON.parse(execFileSync('/usr/bin/python3', ['-c', code, `${config.state_dir}/managed-control.sqlite`, binding, sid, authority.operation_id],
           { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }));
         if (!row) return false;
-        if (request.method === 'GET' && request.body === null)
-          return request.path === `/api/session/${sid}/message/${row[2]}`;
+        if (request.method === 'GET' && request.body === null) {
+          if (request.path === `/api/session/${sid}/message/${row[2]}`) return true;
+          if ((row[0] === 'question_reply' || row[0] === 'question_cancel') &&
+              (request.path === `/api/session/${sid}/form/${row[2]}` || new RegExp(`^/api/session/${sid}/message/msg[A-Za-z0-9_-]{1,160}$`).test(request.path))) return true;
+          return false;
+        }
+        if ((row[0] === 'question_reply' || row[0] === 'question_cancel')) {
+          if (row[3] !== 'sending') return false;
+          const reply = row[0] === 'question_reply';
+          if ((reply ? request.method !== 'POST' || request.path !== `/api/session/${sid}/form/${row[2]}/reply` || !fields(request.body, ['answer']) :
+              request.method !== 'DELETE' || request.path !== `/api/session/${sid}/form/${row[2]}` || request.body !== null)) return false;
+          const canonical = value => Array.isArray(value) ? value.map(canonical) : value && typeof value === 'object' ?
+            Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
+          const decision = reply ? request.body.answer : null;
+          const found = await fetch(new URL(`/api/session/${sid}`, endpoint.url), { headers, redirect: 'manual', signal: AbortSignal.timeout(5000) });
+          if (!found.ok) return false;
+          const session = (await boundedJSON(found))?.data;
+          const hash = execFileSync('/usr/bin/python3', ['-c', 'import json,sys;from workrelay.managed_control import identity;print(identity(json.load(sys.stdin),sys.argv[1]))', sid],
+            { input: JSON.stringify(session), encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'ignore'] }).trim();
+          return hash === row[4] && createHash('sha256').update(row[0] + '\0' + row[2] + '\0' + JSON.stringify(canonical(decision))).digest('hex') === row[1];
+        }
         if (request.method !== 'POST' || row[3] !== 'sending') return false;
         if (row[0] === 'create') {
           const body = JSON.parse(row[4]);

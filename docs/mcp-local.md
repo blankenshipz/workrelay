@@ -20,6 +20,39 @@ Identity is the trusted canonical registration plus fixed endpoint, not a PID or
 
 An owner-only `managed-control.sqlite` ledger reserves the operation, deterministic message ID and hashes before POST. Reuse the same operation ID and identical arguments after a lost acknowledgement: exact-message/inbox reconciliation may report `queued_observed`; absence is not permission to replay. A reserved/sending/uncertain operation blocks a different same-session operation until resolved. Only a pre-send reservation whose recorded process is proven absent can be recovered, with fresh financial/authority/identity checks; live/reused/unknown owners remain blocked. Sending/uncertain operations never replay. Queue acknowledgement is not task completion. Interrupt acknowledgement may mean no active execution was interrupted. Revoking the capability blocks reads, controls and managed subscription authorization. These behaviors have isolated local tests, not live managed-server write/Events acceptance.
 
+### Native question recovery and observed delivery
+
+A session can remain native-active while its question tool waits. Queued chat
+text is not a form answer: it may remain unread until the question is settled.
+Read `workrelay_server_waits` before interpreting a quiet session as stalled.
+
+Use `workrelay_server_question_reply` only for the user's explicit answer to the
+exact returned form; use `workrelay_server_question_cancel` only for an explicitly
+requested dismissal. Supply the original session/form IDs and a stable operation
+ID. A reply's `answer` maps the native field keys to chosen values. These actions
+can resume execution and therefore retain financial and model admission. They
+never answer native permission prompts or generic authorization/MCP forms.
+The form must be corroborated by its originating native question tool call.
+
+Repeated operation IDs must have identical arguments. A lost acknowledgement is
+uncertain, not permission to resend; reconcile the existing operation against
+native state. A reservation proven unsent and owned by a dead local process can
+be reclaimed with the same ID and arguments after all admission checks repeat;
+a live or unknown owner, or any sending/uncertain operation, cannot be replayed. Another actor settling a form is not proof that this caller's answer
+was delivered. Native state and protected session identity are checked again
+before mutation. No automatic answer extraction from conversation text occurs.
+
+`workrelay_server_operation_status` preserves historical receipt-only inspection.
+`workrelay_server_reconcile` separately observes native message/inbox and waits,
+and atomically persists a verified receipt to clear an unresolved local control.
+It makes no native mutation, replay, inference, or task-completion claim. Because
+it updates local control bookkeeping, read-only monitors use operation status
+and waits instead. Treat `queued_observed`
+as queued and `message_observed` as materialized, not as executed or accepted.
+Current execution/wait evidence takes precedence over historical idle outcomes;
+missing evidence is unknown, never guessed idle. Remote client visibility of
+these tools requires a refreshed tool catalog after gateway upgrade.
+
 ### Control-ledger upgrade and denial diagnostics
 
 The current source adds nullable `denial_code` and `denied_at_ms` columns to `managed-control.sqlite` through its normal additive migration on ledger open. **Source/tests are not proof that an installed runtime has been upgraded.** Before any migration, coordinate a maintenance boundary: pause new gateway/CLI control requests, allow owned in-flight writers to finish, stop only the owned Workrelay gateway, and verify that **all old and new version ledger writers are stopped**. Do not stop OpenCode, unrelated services or conversations. Take a consistent owner-only private SQLite ledger backup (including required journal/WAL state through a supported backup procedure) and configuration backup before opening the ledger with new code. Older positional `INSERT` statements cannot write the expanded schema; do not run mixed versions against it.
@@ -39,9 +72,9 @@ Start with `workrelay_server_capabilities({})` to see the tools actually registe
 | Power-user stage | Managed-server tools / protocol | What they do and do not do |
 |---|---|---|
 | Inventory | `workrelay_server_projects`, `workrelay_server_agents`, `workrelay_server_discover` | Bounded, paginated projects/agent definitions/sessions on the one bound server; agents are not running owners. No per-session enrollment is required for the pinned principal. |
-| Read | `workrelay_server_read`, `workrelay_server_waits` | Sanitized visible conversation/results and bounded native permission waits. No inference, native permission reply, or question reply. |
+| Read | `workrelay_server_read`, `workrelay_server_waits` | Sanitized visible conversation/results and bounded native permission/question waits. Read-only; no inference or permission decisions. |
 | Create/select | `workrelay_server_create`, optional `workrelay_server_creation_target` | Create an idle session in a selected native project's verified root; helper only selects the configured default project. Create does not start inference. |
-| Control/recovery | `workrelay_server_message`, `workrelay_server_resume`, `workrelay_server_steer`, `workrelay_server_operation_status`, `workrelay_server_interrupt` | Queue/steer only to the existing owner; recover by operation ID; interrupt only the named session. No owner/model transfer, permission bypass, rollback, or queued-input deletion. |
+| Control/recovery | `workrelay_server_message`, `workrelay_server_resume`, `workrelay_server_steer`, `workrelay_server_operation_status`, `workrelay_server_reconcile`, `workrelay_server_question_reply`, `workrelay_server_question_cancel`, `workrelay_server_interrupt` | Explicit native question decisions; queue/steer only to the existing owner; recover by operation ID; interrupt only the named session. No owner/model transfer, permission bypass, rollback, or queued-input deletion. |
 | Events | `workrelay_event_capabilities`, `workrelay_event_subscriptions`, `workrelay_event_subscription_status`, `workrelay_event_unsubscribe`; protocol `events/list`, `events/subscribe`, `events/unsubscribe` | Bound-server/session lifecycle monitoring. Unsubscribe stops monitoring, not service/work. Receiver and remote client delivery require separate verification. |
 
 Ordinary scoped `workrelay_*` task tools remain available separately. The managed-server family applies only to the exact pinned ChatGPT principal and canonical bound server; it does not widen another principal or server.
@@ -51,7 +84,7 @@ Ordinary scoped `workrelay_*` task tools remain available separately. The manage
 - Both inventories default to 20 items, maximum 50. Follow `next_cursor`; if the inventory changes, restart from the first page. Native list responses are bounded to 2 MB / 10,000 records rather than streamed without limit.
 - `workrelay_server_discover({search?,limit?,cursor?})` supports native session search (1–200 characters); preserve `search` on subsequent pages. Do not put credentials in search text. Existing session discovery and action arguments remain compatible.
 - `workrelay_server_read({session_id,include_messages:true,limit?,cursor?})` provides bounded visible conversation/results. Runtime success is not verified task completion; no authoritative harness progress/blocker/completion report is invented from native metadata.
-- `workrelay_server_waits({session_id,limit?})` is read-only (limit 1–50) and returns bounded redacted native permission summaries. It does not expose permission/question reply routes; decide in the native OpenCode/OpenChamber UI, then reread waits.
+- `workrelay_server_waits({session_id,limit?})` is read-only (limit 1–50) and returns bounded redacted native permission and question summaries. Permission decisions remain in the native UI; verified question forms may receive an explicit human answer through the exact-form tools below.
 
 The gateway registers ordinary scoped start/status/result/respond/cancel plus these managed controls:
 

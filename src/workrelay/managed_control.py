@@ -184,14 +184,258 @@ def native_waits(client, authorize, session_id, *, limit=20):
                           'content_trust': 'untrusted_native_request_text',
                           'requires_explicit_human_decision': True,
                           'respond_via': 'native_opencode_or_openchamber_permission_ui'})
+    forms = get(f'/api/session/{session_id}/form')
+    require(isinstance(forms, dict) and isinstance(forms.get('data'), list) and len(forms['data']) <= 1000,
+            'native form state unavailable or exceeds bound')
+    questions = []
+    question_ids = set()
+    for form in forms['data']:
+        # This is deliberately only the core question-tool provenance marker.
+        # Auth, MCP elicitation and arbitrary plugin forms stay opaque here.
+        if not _question_form(form, session_id):
+            continue
+        state = form.get('state')
+        # Core form.list is pending-only; an explicit terminal state is not a
+        # wait and must not be presented as an answerable form.
+        if isinstance(state, dict) and state.get('status') != 'pending':
+            continue
+        require(form['id'] not in question_ids, 'duplicate native question form')
+        question_ids.add(form['id'])
+        if len(questions) < limit:
+            questions.append({'form_id': form['id'], 'title': 'Questions',
+                              'fields': [{'key': field['key'], 'title': redact_text(field.get('title', ''), 160),
+                                          'description': redact_text(field.get('description', ''), 400), 'type': field['type'],
+                                          'options': [{'value': option['value'], 'label': redact_text(option.get('label', ''), 160)}
+                                                      for option in field.get('options', []) if isinstance(option, dict) and isinstance(option.get('value'), str)]}
+                                         for field in form['fields']],
+                              'requires_explicit_caller_decision': True,
+                              'content_trust': 'untrusted_native_question_text'})
     last = get('/api/session/' + session_id)
     require(identity(last.get('data') if isinstance(last, dict) else None, session_id) == snapshot, 'session identity changed')
     return {'session_id': session_id, 'pending_permission_count': len(seen), 'items': items,
-            'truncated': len(seen) > len(items), 'inference_started': False,
-            'native_permission_reply_exposed': False, 'native_question_reply_exposed': False,
-            'guidance': 'Open this exact session/request in the native OpenCode/OpenChamber approval UI. Review and explicitly decide there; then read waits again. Messages, resume, and server-wide authorization do not approve permission requests. No blanket approval is available.',
+            'pending_question_count': len(questions), 'questions': questions,
+            'truncated': len(seen) > len(items) or len(question_ids) > len(questions), 'inference_started': False,
+            'native_permission_reply_exposed': False, 'native_question_reply_exposed': True,
+            'guidance': 'Permission requests remain native-UI-only in the native approval UI. For a listed core question form, use the exact explicit question reply/cancel action; queued text never answers it. Messages, resume, and server-wide authorization do not approve permission requests. No blanket approval is available.',
             'ordinary_follow_up': 'Use same-session message/steer for normal visible conversation only, not as a native permission/question reply.',
             'task_outcome': 'unverified'}
+
+
+def _question_form(form, session_id):
+    """Strict native question-tool form shape; never classify arbitrary forms."""
+    if not (isinstance(form, dict) and isinstance(form.get('id'), str) and bool(re.fullmatch(r'frm_[A-Za-z0-9_-]{1,160}', form['id'])) and
+            form.get('sessionID') == session_id and form.get('title') == 'Questions' and isinstance(form.get('metadata'), dict) and
+            form['metadata'].get('kind') == 'question' and isinstance(form['metadata'].get('tool'), dict)):
+        return False
+    tool = form['metadata']['tool']
+    if not (set(tool) == {'messageID', 'id'} and isinstance(tool.get('messageID'), str) and
+            bool(re.fullmatch(r'msg[A-Za-z0-9_-]{1,160}', tool['messageID'])) and isinstance(tool.get('id'), str) and
+            bool(re.fullmatch(r'[A-Za-z0-9_-]{1,160}', tool['id']))):
+        return False
+    fields = form.get('fields')
+    return isinstance(fields, list) and 1 <= len(fields) <= 20 and all(isinstance(field, dict) and
+        isinstance(field.get('key'), str) and bool(re.fullmatch(r'q[0-9]{1,2}', field['key'])) and
+        field.get('type') in ('string', 'multiselect') for field in fields) and len({field['key'] for field in fields}) == len(fields)
+
+
+def _question_tool_matches(message, form):
+    """Corroborate marker against the exact still-running native question call."""
+    data = message.get('data') if isinstance(message, dict) else None
+    # Native SessionMessage.Base intentionally has no sessionID.  The pinned,
+    # authenticated `/session/:sid/message/:id` endpoint scopes that lookup;
+    # reject a conflicting extension field when a backend supplies one.
+    if not isinstance(data, dict) or data.get('id') != form['metadata']['tool']['messageID'] or (
+            'sessionID' in data and data.get('sessionID') != form['sessionID']) or not isinstance(data.get('content'), list):
+        return False
+    target = form['metadata']['tool']['id']
+    return any(isinstance(part, dict) and part.get('type') == 'tool' and part.get('id') == target and
+               part.get('name') == 'question' and isinstance(part.get('state'), dict) and part['state'].get('status') == 'running'
+               for part in data['content'])
+
+
+def _observed_question_form(client, authorize, binding, session_id, form_id, expected_identity):
+    """Read one authoritative native question receipt with binding checks.
+
+    ``None`` is the installed client's structured 404 result.  Any other
+    malformed response is unavailable rather than evidence that a form was
+    removed or settled.
+    """
+    require(authorize() == binding, 'authority changed')
+    response = client.request('GET', f'/api/session/{session_id}/form/{form_id}')
+    require(authorize() == binding, 'authority changed')
+    if response is None:
+        return None
+    data = response.get('data') if isinstance(response, dict) else None
+    require(_question_form(data, session_id) and data.get('id') == form_id,
+            'native form state unavailable')
+    require(authorize() == binding, 'authority changed')
+    session = client.request('GET', '/api/session/' + session_id)
+    require(authorize() == binding, 'authority changed')
+    require(identity(session.get('data') if isinstance(session, dict) else None, session_id) == expected_identity,
+            'session identity changed')
+    return data
+
+
+def settle_question(db, config, client, authorize, session_id, operation_id, form_id, *, answer=None, cancel=False):
+    """Explicit, durable question decision. A failed/uncertain POST is never replayed."""
+    require(bool(re.fullmatch(r'ses[A-Za-z0-9_-]{1,160}', session_id or '')), 'invalid session')
+    require(bool(re.fullmatch(r'[A-Za-z0-9_-]{1,80}', operation_id or '')), 'invalid operation')
+    require(bool(re.fullmatch(r'frm_[A-Za-z0-9_-]{1,160}', form_id or '')), 'invalid form')
+    require(type(cancel) is bool and (answer is None if cancel else isinstance(answer, dict)), 'invalid question decision')
+    if not cancel:
+        require(len(answer) <= 20 and all(isinstance(k, str) and bool(re.fullmatch(r'q[0-9]{1,2}', k)) and
+                (isinstance(v, str) or isinstance(v, list) and all(isinstance(x, str) for x in v)) for k, v in answer.items()), 'invalid answer')
+    binding = authorize(); require(isinstance(binding, str) and bool(re.fullmatch(r'[0-9a-f]{64}', binding)), 'bound authorization required')
+    kind = 'question_cancel' if cancel else 'question_reply'
+    digest = hashlib.sha256((kind + '\0' + form_id + '\0' + json.dumps(answer, sort_keys=True, separators=(',', ':'), ensure_ascii=False)).encode()).hexdigest()
+    initialize(db); db.execute('BEGIN IMMEDIATE')
+    try:
+        row = db.execute('SELECT kind,digest,message,phase,identity,reservation_pid FROM managed_operations WHERE binding=? AND session=? AND operation=?', (binding, session_id, operation_id)).fetchone()
+        recovering = False
+        if row:
+            require(row[0] == kind and row[1] == digest and row[2] == form_id, 'operation argument conflict')
+            phase = row[3]
+            if phase == 'reserved':
+                # Reservation precedes every authority/admission/form check, so
+                # only a proved-dead local owner can safely resume it.  Keep
+                # the original decision digest and session identity.
+                require(reservation_owner_dead(row[5]), 'question operation reservation active')
+                current = row[4]
+                db.execute('UPDATE managed_operations SET reservation_pid=? WHERE binding=? AND session=? AND operation=? AND phase=?',
+                           (os.getpid(), binding, session_id, operation_id, 'reserved'))
+                recovering = True
+            if phase in ('sending', 'uncertain'):
+                # Read-only receipt reconciliation only.  Absence/pending never
+                # authorizes a second reply or cancel POST.
+                observed_data = _observed_question_form(client, authorize, binding, session_id, form_id, row[4])
+                state_data = observed_data.get('state', {}) if observed_data is not None else {}
+                state = state_data.get('status')
+                wanted = 'cancelled' if cancel else 'answered'
+                if state == wanted and (cancel or state_data.get('answer') == answer):
+                    require(authorize() == binding, 'authority changed')
+                    phase = 'question_cancelled_observed' if cancel else 'question_answered_observed'
+                    db.execute("UPDATE managed_operations SET phase=? WHERE binding=? AND session=? AND operation=? AND phase IN ('sending','uncertain')", (phase, binding, session_id, operation_id))
+            if not recovering:
+                db.execute('COMMIT'); return {'operation_id': operation_id, 'session_id': session_id, 'form_id': form_id, 'phase': phase, 'task_outcome': 'unverified', 'replay_permitted': False}
+        if not recovering:
+            busy = db.execute("SELECT 1 FROM managed_operations WHERE session=? AND phase IN ('reserved','sending','uncertain') LIMIT 1", (session_id,)).fetchone()
+            require(not busy, 'session has unresolved control operation')
+            session = client.request('GET', '/api/session/' + session_id)
+            current = identity(session.get('data') if isinstance(session, dict) else None, session_id)
+            db.execute('INSERT INTO managed_operations(binding,session,operation,kind,digest,message,phase,identity,reservation_pid) VALUES(?,?,?,?,?,?,?,?,?)',
+                       (binding, session_id, operation_id, kind, digest, form_id, 'reserved', current, os.getpid()))
+        db.execute('COMMIT')
+    except Exception:
+        if db.in_transaction: db.execute('ROLLBACK')
+        raise
+    try:
+        require(authorize() == binding, 'authority changed')
+        session = client.request('GET', '/api/session/' + session_id)
+        session_data = session.get('data') if isinstance(session, dict) else None
+        require(identity(session_data, session_id) == current, 'session identity changed')
+        model = session_data.get('model') if isinstance(session_data, dict) else None
+        require(isinstance(model, dict) and model.get('providerID') == 'openai' and set(model) <= {'providerID', 'id', 'variant'} and
+                isinstance(model.get('id'), str) and model['id'], 'native model unavailable')
+        admission({**config, 'model': model}, client)
+        require(authorize() == binding, 'authority changed')
+        form_reply = client.request('GET', f'/api/session/{session_id}/form/{form_id}')
+        form = form_reply.get('data') if isinstance(form_reply, dict) else None
+        require(_question_form(form, session_id) and form.get('state', {}).get('status') == 'pending', 'native question unavailable or not pending')
+        if not cancel:
+            fields = {field['key']: field for field in form['fields']}
+            require(set(answer) <= set(fields) and all(not field.get('required') or key in answer for key, field in fields.items()), 'answer fields unavailable')
+            for key, value in answer.items():
+                field = fields[key]
+                require((field['type'] == 'string' and isinstance(value, str)) or
+                        (field['type'] == 'multiselect' and isinstance(value, list) and all(isinstance(v, str) for v in value)), 'answer type unavailable')
+                options = field.get('options')
+                if isinstance(options, list) and not field.get('custom', False):
+                    allowed = {item.get('value') for item in options if isinstance(item, dict)}
+                    values = value if isinstance(value, list) else [value]
+                    require(all(value in allowed for value in values), 'answer option unavailable')
+        message = client.request('GET', f"/api/session/{session_id}/message/{form['metadata']['tool']['messageID']}")
+        require(_question_tool_matches(message, form), 'native question provenance mismatch')
+        require(authorize() == binding, 'authority changed')
+    except Exception as exc:
+        record_denial(db, binding, session_id, operation_id, exc); raise
+    db.execute("UPDATE managed_operations SET phase='sending' WHERE binding=? AND session=? AND operation=?", (binding, session_id, operation_id))
+    try:
+        response = client.request('DELETE' if cancel else 'POST', f'/api/session/{session_id}/form/{form_id}' + ('' if cancel else '/reply'), None if cancel else {'answer': answer})
+        require(authorize() == binding, 'authority changed')
+        # No response body is required by the native contract; exact form GET is the receipt.
+        observed_data = _observed_question_form(client, authorize, binding, session_id, form_id, current)
+        require(observed_data is not None, 'question settlement acknowledgement unavailable')
+        state_data = observed_data.get('state', {})
+        state = state_data.get('status')
+        require(state == ('cancelled' if cancel else 'answered') and (cancel or state_data.get('answer') == answer), 'question settlement acknowledgement unavailable')
+    except Exception:
+        db.execute("UPDATE managed_operations SET phase='uncertain' WHERE binding=? AND session=? AND operation=? AND phase='sending'", (binding, session_id, operation_id))
+        raise BridgeError('question decision outcome uncertain; reconcile original operation, never blindly replay') from None
+    phase = 'question_cancelled_observed' if cancel else 'question_answered_observed'
+    db.execute("UPDATE managed_operations SET phase=? WHERE binding=? AND session=? AND operation=? AND phase='sending'", (phase, binding, session_id, operation_id))
+    return {'operation_id': operation_id, 'session_id': session_id, 'form_id': form_id, 'phase': phase,
+            'task_outcome': 'unverified', 'replay_permitted': False}
+
+
+def reconcile_question(db, client, authorize, session_id, operation_id):
+    """Current native form observation, intentionally separate from receipt-only inspect."""
+    binding, sid, row = resolve_operation(db, authorize, operation_id, session_id)
+    require(row[0] in ('question_reply', 'question_cancel'), 'not a question operation')
+    data = _observed_question_form(client, authorize, binding, sid, row[2], row[4])
+    if data is None:
+        state = 'absent'
+    else:
+        state_data = data.get('state')
+        require(isinstance(state_data, dict) and state_data.get('status') in ('pending', 'answered', 'cancelled'), 'native form state unavailable')
+        state = state_data['status']
+        if state == 'answered' and row[0] == 'question_reply':
+            observed = hashlib.sha256((row[0] + '\0' + row[2] + '\0' + json.dumps(state_data.get('answer'), sort_keys=True, separators=(',', ':'), ensure_ascii=False)).encode()).hexdigest()
+            state = 'answered_recorded' if observed == row[1] else 'answered_other'
+    observed_phase = ('question_answered_observed' if state == 'answered_recorded' else
+                      'question_cancelled_observed' if state == 'cancelled' and row[0] == 'question_cancel' else None)
+    if observed_phase:
+        # A native receipt is safe to record locally only when it matches the
+        # original bound decision.  This closes a crashed pre/post receipt so
+        # it no longer blocks later same-session operations; it never retries.
+        require(authorize() == binding, 'authority changed')
+        db.execute("UPDATE managed_operations SET phase=? WHERE binding=? AND session=? AND operation=? AND kind=? AND digest=? AND message=? AND identity=? AND phase IN ('sending','uncertain')",
+                   (observed_phase, binding, sid, operation_id, row[0], row[1], row[2], row[4]))
+        current_row = db.execute('SELECT phase FROM managed_operations WHERE binding=? AND session=? AND operation=? AND kind=? AND digest=? AND message=? AND identity=?',
+                                 (binding, sid, operation_id, row[0], row[1], row[2], row[4])).fetchone()
+        require(current_row is not None, 'operation receipt changed')
+        recorded_phase = current_row[0]
+    else:
+        recorded_phase = row[3]
+    return {'operation_id': operation_id, 'session_id': sid, 'form_id': row[2], 'recorded_phase': recorded_phase,
+            'native_form_state': state, 'task_outcome': 'unverified', 'replay_permitted': False}
+
+
+def reconcile_operation(db, config, client, authorize, session_id, operation_id):
+    """Explicit current native receipt reconciliation; inspect remains historical-only."""
+    binding, sid, row = resolve_operation(db, authorize, operation_id, session_id)
+    if row[0] in ('question_reply', 'question_cancel'):
+        return reconcile_question(db, client, authorize, sid, operation_id)
+    result = inspect_operation(db, config, client, authorize, sid, operation_id, receipt_only=False)
+    if result.get('phase') in ('message_observed', 'queued_observed') and row[3] in ('sending', 'uncertain'):
+        require(authorize() == binding, 'authority changed')
+        db.execute("UPDATE managed_operations SET phase=? WHERE binding=? AND session=? AND operation=? AND kind=? AND digest=? AND message=? AND identity=? AND phase IN ('sending','uncertain')",
+                   (result['phase'], binding, sid, operation_id, row[0], row[1], row[2], row[4]))
+        current_row = db.execute('SELECT phase FROM managed_operations WHERE binding=? AND session=? AND operation=? AND kind=? AND digest=? AND message=? AND identity=?',
+                                 (binding, sid, operation_id, row[0], row[1], row[2], row[4])).fetchone()
+        require(current_row is not None, 'operation receipt changed')
+        result['recorded_phase'] = current_row[0]
+    if row[0] in ('queue', 'steer'):
+        waits = native_waits(client, authorize, sid, limit=1)
+        if waits['pending_question_count']:
+            result['blocking_reason'] = 'pending_native_question'
+        elif waits['pending_permission_count']:
+            result['blocking_reason'] = 'pending_native_permission'
+        elif result['phase'] == 'queued_observed':
+            result['blocking_reason'] = 'queued_not_materialized'
+        elif result['phase'] == 'message_observed':
+            result['blocking_reason'] = None
+    result['replay_permitted'] = False
+    return result
 
 
 def control_result(operation_id, session_id, message_id, phase, interrupt, *, denial_code=None, denied_at_ms=None, attestation_check_id=None):
@@ -332,10 +576,10 @@ def control(db, config, client, authorize, session_id, operation_id, *, text=Non
             require(isinstance(response, dict) and type(response.get('interrupted')) is bool, 'interrupt acknowledgement unavailable')
         phase = ('interrupt_acknowledged' if response['interrupted'] else 'idle_noop') if interrupt else 'steering' if steer else 'queued'
     except Exception:
-        db.execute("UPDATE managed_operations SET phase='uncertain' WHERE binding=? AND session=? AND operation=?",
+        db.execute("UPDATE managed_operations SET phase='uncertain' WHERE binding=? AND session=? AND operation=? AND phase='sending'",
                    (binding, session_id, operation_id))
         raise BridgeError('control outcome uncertain; reconcile exact ID, never blindly replay') from None
-    db.execute('UPDATE managed_operations SET phase=? WHERE binding=? AND session=? AND operation=?',
+    db.execute("UPDATE managed_operations SET phase=? WHERE binding=? AND session=? AND operation=? AND phase='sending'",
                (phase, binding, session_id, operation_id))
     return control_result(operation_id, session_id, message, phase, interrupt)
 
@@ -606,12 +850,18 @@ def inspect_operation(db, config, client, authorize, session_id, operation_id, *
         remote = get('/api/session/' + session_id)
         require(identity(remote.get('data') if isinstance(remote, dict) else None, session_id) == row[4], 'session identity changed')
         exact = get(f'/api/session/{session_id}/message/{row[2]}')
-        if isinstance(exact, dict) and exact.get('data', {}).get('id') == row[2]:
+        exact_data = exact.get('data') if isinstance(exact, dict) else None
+        exact_text_matches = isinstance(exact_data, dict) and exact_data.get('type') == 'user' and isinstance(exact_data.get('text'), str) and hashlib.sha256(
+            (row[0] + '\0' + exact_data['text']).encode()).hexdigest() == row[1]
+        if isinstance(exact_data, dict) and exact_data.get('id') == row[2] and exact_text_matches and (
+                'sessionID' not in exact_data or exact_data.get('sessionID') == session_id):
             phase = 'message_observed'  # Materialization, not completion or task success.
         else:
             inbox = get(f'/api/session/{session_id}/inbox')
             if isinstance(inbox, dict) and isinstance(inbox.get('data'), list) and any(
-                    isinstance(item, dict) and item.get('id') == row[2] and item.get('sessionID') == session_id for item in inbox['data']):
+                    isinstance(item, dict) and item.get('id') == row[2] and item.get('sessionID') == session_id and item.get('type') == 'user' and
+                        isinstance(item.get('payload'), dict) and isinstance(item['payload'].get('text'), str) and
+                        hashlib.sha256((row[0] + '\0' + item['payload']['text']).encode()).hexdigest() == row[1] for item in inbox['data']):
                 phase = 'queued_observed'
     require(authorize() == binding, 'authority changed')
     return {'operation_id': operation_id, 'session_id': session_id, 'kind': row[0], 'phase': phase,

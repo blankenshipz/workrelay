@@ -6,6 +6,25 @@ For example, ask your assistant to inspect a small issue in an isolated project,
 
 OpenAI describes Dots as ongoing assistants that carry goals and follow up across conversations, and documents connected apps through Plugins. Its developer docs describe authenticated MCP tools and MCP Events, including Dot use. Those docs establish the client/protocol surface—not successful Workrelay acceptance on every account or client path: [Introducing Dots](https://openai.com/index/introducing-dots/), [Dot setup and controls](https://help.openai.com/en/articles/20001530-getting-started-with-your-dot), [MCP servers](https://developers.openai.com/plugins/concepts/mcp-server), [MCP Events](https://developers.openai.com/plugins/build/mcp-events), and [OAuth authentication](https://developers.openai.com/plugins/build/auth).
 
+## Recover a paused conversation without duplicating work
+
+Use `workrelay_server_waits` to distinguish a native question from a permission
+request. Ordinary queued chat text cannot answer either one. For a question,
+collect the user's explicit choice, then use `workrelay_server_question_reply`
+with the exact session, form and stable operation IDs. An explicitly requested
+question dismissal uses `workrelay_server_question_cancel`. These operations can
+let the existing session continue; they never grant native tool permissions.
+Permission requests still require the OpenCode/OpenChamber approval UI.
+
+Keep `workrelay_server_operation_status` for historical receipts, including when
+execution admission is unavailable. Use `workrelay_server_reconcile` for authorized
+recovery: it reads native message/inbox and waits, then persists a verified local
+receipt without resending work. Read-only monitors use operation status and waits.
+Queued, consumed, executing and idle are different observations; none proves the
+user's task was accepted as complete. A failed historical idle outcome is not a
+failure of a currently running execution. Unknown or uncertain delivery is never
+permission to replay a message or create a replacement worker.
+
 ## From goal to useful outcome
 
 1. **Connect your assistant once.** Set up an authenticated remote MCP connection to Workrelay. OpenCode remains loopback-only; a user-controlled HTTPS route reaches the Workrelay gateway, not OpenCode. For managed-server access, enable the private capability bound to the exact ChatGPT principal and one local server.

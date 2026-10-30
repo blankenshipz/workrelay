@@ -6,7 +6,7 @@ import { privateDirectory } from './issuer_interactions.mjs';
 
 const known = new Set([
   ...['discover', 'profile', 'start', 'status', 'result', 'enrolled_result', 'respond', 'cancel'].map(x => `workrelay_${x}`),
-  ...['discover', 'read', 'projects', 'agents', 'capabilities', 'creation_target', 'create', 'operation_status', 'message', 'steer', 'resume', 'waits', 'interrupt'].map(x => `workrelay_server_${x}`),
+  ...['discover', 'read', 'projects', 'agents', 'capabilities', 'creation_target', 'create', 'operation_status', 'message', 'steer', 'resume', 'waits', 'question_reply', 'question_cancel', 'reconcile', 'interrupt'].map(x => `workrelay_server_${x}`),
   ...['capabilities', 'subscriptions', 'subscription_status', 'unsubscribe'].map(x => `workrelay_event_${x}`),
 ]);
 const bounded = value => Number.isInteger(value) && value >= 0 && value <= 1000 ? value : null;

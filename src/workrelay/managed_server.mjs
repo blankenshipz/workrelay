@@ -39,7 +39,7 @@ export function managedText(value, limit = 4000) {
     ...(safe.length > limit ? { omission: 'text_truncated', truncated: true } : {}) };
 }
 
-function projection(session) {
+function projection(session, active = false) {
   if (!session || !sid.test(session.id) || typeof session.projectID !== 'string' || session.projectID.length > 160) deny();
   // Arbitrary metadata and location paths are never copied.
   const project = 'project_' + createHash('sha256').update(session.projectID).digest('hex');
@@ -47,7 +47,9 @@ function projection(session) {
     label: managedText(session.title, 200).text || `Session ${session.id.slice(-8)}`, title: managedText(session.title, 200), type: 'existing_session',
     owner: { session_id: session.id, parent_session_id: sid.test(session.parentID ?? '') ? session.parentID : null },
     task_outcome: { status: 'unknown', verification: 'unverified', reason: 'No authoritative harness task checks available through this API.' },
-    runtime_status: ['succeeded', 'failed', 'interrupted'].includes(session.outcome) ? session.outcome :
+    // `outcome` is explicitly the last completed drain.  It can coexist with a
+    // new foreground drain, which only /session/active can establish.
+    runtime_status: active ? 'running' : ['succeeded', 'failed', 'interrupted'].includes(session.outcome) ? session.outcome :
       session.time?.idle ? 'idle' : 'unknown',
     actions: [{ tool: 'workrelay_server_read', arguments: { session_id: session.id, include_messages: true } },
       { tool: 'workrelay_server_waits', arguments: { session_id: session.id } },
@@ -143,6 +145,8 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       path = '/api/event';
     } else if (action === 'projects' || action === 'agents' || action === 'resolve_project' || action === 'creation_target') {
       path = action === 'agents' ? '/api/agent' : '/api/project';
+    } else if (action === 'active') {
+      path = '/api/session/active';
     } else if (action === 'messages') {
       if (!sid.test(input.session_id ?? '') || selectedSession !== input.session_id) deny();
       const limit = input.limit ?? 10;
@@ -203,6 +207,7 @@ export function createManagedReader(expected, readBinding, { loadService = path 
     if (action === 'events') {
       const sessions = input.session_id ? [value.data] : value.data;
       if (!Array.isArray(sessions) || sessions.length > 10 || input.session_id && sessions[0]?.id !== input.session_id) deny();
+      const active = await read('active', {}, claims, undefined, observe);
       const items = [];
       for (const session of sessions) {
         if (!sid.test(session?.id ?? '')) deny();
@@ -212,7 +217,17 @@ export function createManagedReader(expected, readBinding, { loadService = path 
         try { while (true) { const part = await stream.read(); if (part.done) break; bytes += part.value.length; if (bytes > 262144) deny(); parts.push(part.value); } } finally { await stream.cancel(); }
         const pending = JSON.parse(Buffer.concat(parts).toString('utf8')).data;
         if (!Array.isArray(pending) || pending.length > 1000 || pending.some(p => p.sessionID !== session.id || !/^per[A-Za-z0-9_-]{1,160}$/.test(p.id))) deny();
-        items.push({ session_id: session.id, state: ['succeeded', 'failed', 'interrupted'].includes(session.outcome) ? session.outcome : pending.length ? 'needs_input' : session.time?.idle ? 'idle' : 'unknown', decisions: pending.map(p => p.id).sort() });
+        // Core form.list is pending-only.  Do not copy titles, fields, metadata,
+        // or arbitrary native text into this event projection.
+        const forms = await fetcher(new URL(`/api/session/${session.id}/form`, endpoint.url), { method: 'GET', headers: service.headers(endpoint), redirect: 'manual', signal: AbortSignal.timeout(10000) });
+        if (!forms.ok) { await forms.body?.cancel(); deny(); }
+        const formStream = forms.body.getReader(); const formParts = []; let formBytes = 0;
+        try { while (true) { const part = await formStream.read(); if (part.done) break; formBytes += part.value.length; if (formBytes > 262144) deny(); formParts.push(part.value); } } finally { await formStream.cancel(); }
+        const pendingForms = JSON.parse(Buffer.concat(formParts).toString('utf8')).data;
+        if (!Array.isArray(pendingForms) || pendingForms.length > 1000 || pendingForms.some(form => form?.sessionID !== session.id || !/^frm_[A-Za-z0-9_-]{1,160}$/.test(form.id))) deny();
+        const needsInput = pending.length > 0 || pendingForms.length > 0;
+        items.push({ session_id: session.id, state: needsInput ? 'needs_input' : active[session.id] ? 'running' : ['succeeded', 'failed', 'interrupted'].includes(session.outcome) ? session.outcome : session.time?.idle ? 'idle' : 'unknown',
+          decisions: pending.map(p => p.id).sort(), forms: pendingForms.map(form => form.id).sort() });
       }
       if (JSON.stringify(readBinding()) !== JSON.stringify(binding) || canonical(binding.service_registration) !== binding.service_registration) deny();
       const after = stat(binding.service_registration);
@@ -294,6 +309,11 @@ export function createManagedReader(expected, readBinding, { loadService = path 
         next_action: { tool: 'workrelay_server_discover', arguments: {} } };
     }
     stage('projection');
+    if (action === 'active') {
+      if (!value?.data || typeof value.data !== 'object' || Array.isArray(value.data) || Object.keys(value.data).length > 1000 ||
+          Object.entries(value.data).some(([id, item]) => !sid.test(id) || !item || typeof item !== 'object' || item.type !== 'running')) deny();
+      return value.data;
+    }
     if (action === 'messages') {
       if (!Array.isArray(value.data) || value.data.length > (input.limit ?? 10)) deny();
       const next = value.cursor?.next ?? null;
@@ -319,9 +339,10 @@ export function createManagedReader(expected, readBinding, { loadService = path 
     }
     if (action === 'read') {
       if (value.data?.id !== input.session_id) deny();
+      const active = await read('active', {}, claims, undefined, observe);
       const context = input.include_messages === true ? await read('messages', input, claims, value.data.id, observe) : { omission: 'Request include_messages:true for visible context.' };
       if (JSON.stringify(readBinding()) !== JSON.stringify(binding)) deny();
-      return { ...projection(value.data), server_id: managedServerID(binding), context,
+      return { ...projection(value.data, active[value.data.id]?.type === 'running'), server_id: managedServerID(binding), context,
         return_action: { tool: 'workrelay_server_read', arguments: { session_id: input.session_id, include_messages: true, limit: input.limit ?? 10 } },
         progress: { verification: 'unverified', source: 'native_session_metadata_and_requested_visible_text',
           limitation: 'Runtime success/idle and assistant text are not authoritative task checks. Permission/question decisions require the native request and an explicit supported decision action; continuation text never grants approval.' } };
@@ -329,7 +350,8 @@ export function createManagedReader(expected, readBinding, { loadService = path 
     if (!Array.isArray(value.data) || value.data.length > (input.limit ?? 20)) deny();
     const next = value.cursor?.next ?? null;
     if (next !== null && (typeof next !== 'string' || next.length > 4096 || /[\x00-\x1f\x7f]/.test(next))) deny();
-    const items = value.data.map(projection);
+    const active = await read('active', {}, claims, undefined, observe);
+    const items = value.data.map(session => projection(session, active[session.id]?.type === 'running'));
     return { server_id: managedServerID(binding), items, projects: [...new Set(items.map(item => item.project_id))].map(id => ({ id, label: `Project ${id.slice(-8)}` })),
       next_cursor: next, next_action: next ? { tool: 'workrelay_server_discover', arguments: { cursor: next, limit: input.limit ?? 20,
         ...(input.search !== undefined ? { search: input.search } : {}) } } : null, access: 'managed_server_read',

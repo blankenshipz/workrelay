@@ -395,10 +395,10 @@ def main(argv=None):
         client = InstalledClient(config) if config.get("transport") == "installed-client" else Client(config, token)
         require(args.owner == config["authorized_owner"], "owner not authorized by private configuration")
         if args.command == 'managed-control':
-            from .managed_control import control, create_session, creation_session_id, inspect_operation, resolve_operation, classified_failure, native_waits
+            from .managed_control import control, create_session, creation_session_id, inspect_operation, resolve_operation, classified_failure, native_waits, settle_question, reconcile_operation
             require(config.get('transport') == 'installed-client', 'managed control requires guarded installed transport')
             envelope = json.loads(sys.stdin.read(50000))
-            require(isinstance(envelope, dict) and envelope.get('action') in ('message', 'steer', 'resume', 'interrupt', 'inspect', 'create', 'waits'), 'invalid control handoff')
+            require(isinstance(envelope, dict) and envelope.get('action') in ('message', 'steer', 'resume', 'interrupt', 'inspect', 'create', 'waits', 'question_reply', 'question_cancel', 'reconcile'), 'invalid control handoff')
             if envelope['action'] == 'waits':
                 envelope['operation_id'] = 'native-waits-read'
             config['_supervision_authority'] = {'managed': {'claims': envelope.get('claims'),
@@ -418,6 +418,11 @@ def main(argv=None):
                     return result.get('binding_id') if isinstance(result, dict) else None
                 if envelope['action'] == 'waits':
                     result = native_waits(client, authorize, envelope.get('session_id'), limit=envelope.get('limit', 20))
+                elif envelope['action'] in ('question_reply', 'question_cancel'):
+                    result = settle_question(db, config, client, authorize, envelope.get('session_id'), envelope.get('operation_id'),
+                        envelope.get('form_id'), answer=envelope.get('answer'), cancel=envelope['action'] == 'question_cancel')
+                elif envelope['action'] == 'reconcile':
+                    result = reconcile_operation(db, config, client, authorize, envelope.get('session_id'), envelope.get('operation_id'))
                 elif envelope['action'] == 'create':
                     binding = authorize()
                     config['_supervision_authority']['managed']['session_id'] = creation_session_id(binding, envelope.get('operation_id'))

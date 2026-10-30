@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased — native questions and observed delivery
+
+- Recover only proven pre-send question reservations after a dead owner, retaining the same decision and all admission checks.
+
+- Add explicitly authorized, exact-form question replies/dismissals with durable operation identity and no blind replay after uncertain delivery. Native permission approvals remain in the native UI.
+- Expose pending questions and read-only native operation reconciliation separately from historical receipt inspection.
+- Distinguish current execution and wait state from historical idle outcomes and unverified task completion.
+
+
 ## Unreleased
 
 - OAuth renewal/reconnect: documented the reviewed candidate's 300-second access-token and fixed 14-day refresh-family contract, binding checks before token consumption/replay, concurrent duplicate `invalid_grant` handling and atomic family revocation. Fresh consent using the same authorized client/browser can create a new `workrelay:tasks openid` grant after revocation; old grant tokens remain denied. Rotation is strict: lost-response/stale-token replay yields `invalid_grant` and family revocation; transparent retry/grace is not implemented. The intended recovery is explicit reconnect, not client remove/re-add.

@@ -38,7 +38,7 @@ test('managed registration read boundary is pinned, revoked, bounded and sanitiz
     subject: 'alice', client_id: client, server: 'http://127.0.0.1:12345', service_registration: '/private/service.json', client_service_module: '/private/service.mjs' };
   const expected = { issuer: b.issuer, audience: b.audience, principal: b.subject, managed_server: { ...b } };
   const claims = { iss: b.issuer, aud: b.audience, sub: b.subject, client_id: client };
-  let binding = { ...b }, endpoint = b.server, moved = false, calls = 0, during, foreign = false, messageRevocation = false, surfaceText, wrongSelection = false;
+  let binding = { ...b }, endpoint = b.server, moved = false, calls = 0, during, foreign = false, messageRevocation = false, surfaceText, wrongSelection = false, nativeActive = {}, nativeForms = [];
   const reader = createManagedReader(expected, () => ({ ...binding }), {
     canonical: path => moved ? '/replacement' : path,
     stat: () => ({ isFile: () => true, isDirectory: () => true, isSymbolicLink: () => false, uid: process.getuid(), mode: 0o600, dev: 1, ino: 1, mtimeMs: 1 }),
@@ -46,6 +46,8 @@ test('managed registration read boundary is pinned, revoked, bounded and sanitiz
     fetcher: async (url, options) => {
       calls++; assert.equal(options.method, 'GET'); assert.equal(options.redirect, 'manual');
       if (url.pathname.endsWith('/permission')) return new Response(JSON.stringify({ data: [] }));
+      if (url.pathname.endsWith('/form')) return new Response(JSON.stringify({ data: nativeForms }));
+      if (url.pathname === '/api/session/active') return new Response(JSON.stringify({ data: nativeActive }));
       if (url.searchParams.has('search')) assert.equal(url.searchParams.get('search'), 'release notes');
       const session = { id: root, projectID: '/PRIVATE/SECRET_PROJECT?token=SECRET', title: surfaceText ?? 'Useful project password=SECRET', metadata: { password: 'SECRET' }, location: { directory: '/PRIVATE' }, time: { idle: 1 }, outcome: 'succeeded' };
       if (during) during(session);
@@ -87,6 +89,13 @@ test('managed registration read boundary is pinned, revoked, bounded and sanitiz
   const observed = await reader('events', { server_id: page.server_id, session_id: root }, claims);
   assert.equal(observed.items[0].state, 'idle', 'progress uses explicit native idle, not inferred running');
   during = undefined;
+  nativeActive = { [root]: { type: 'running' } };
+  assert.equal((await reader('read', { session_id: root }, claims)).runtime_status, 'running',
+    'a current native drain overrides the historical last-completed outcome');
+  nativeForms = [{ id: 'frm_pending', sessionID: root }];
+  assert.equal((await reader('events', { server_id: page.server_id, session_id: root }, claims)).items[0].state, 'needs_input',
+    'a pending form must outrank a concurrent active drain');
+  nativeForms = []; nativeActive = {};
   const context = (await reader('read', { session_id: root, include_messages: true, limit: 3 }, claims)).context;
   assert.equal(context.next_cursor, 'older');
   assert.equal(context.items[0].text, 'Please repair navigation token=[REDACTED]');
@@ -157,8 +166,8 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
   const jwk = { ...await exportJWK(keys.publicKey), kid: 'test', alg: 'RS256', use: 'sig' };
   let reads = 0;
   const session = { id: root, projectID: 'project', agent: 'existing-owner', parentID: 'ses_parent',
-    model: { providerID: 'openai', id: 'fixture' }, metadata: { intent: 'unchanged' }, time: {} };
-  const posts = [], inbox = []; let dropAck = false, sourceConnections = 0, activeSources = 0, maxSources = 0;
+    model: { providerID: 'openai', id: 'fixture' }, metadata: { intent: 'unchanged' }, location: { directory: dir }, time: {} };
+  const posts = [], inbox = [], questionMutations = []; let nativeForms = [], dropAck = false, sourceConnections = 0, activeSources = 0, maxSources = 0;
   let nativeHint = { type: 'session.updated', id: 'evt_old_fixture', created: Date.now() - 1000 };
   const nativeResponses = new Set();
   let permissionBarrier, permissionEntered, gateOnlyProgress = false;
@@ -176,13 +185,27 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
       res.on('close', () => { clearTimeout(end); activeSources--; nativeResponses.delete(res); }); return;
     }
     if (req.url === '/jwks') return res.end(JSON.stringify({ keys: [jwk] }));
+    const reply = new RegExp(`^/api/session/${root}/form/(frm_[A-Za-z0-9_-]{1,160})/reply$`).exec(req.url);
+    const cancel = new RegExp(`^/api/session/${root}/form/(frm_[A-Za-z0-9_-]{1,160})$`).exec(req.url);
+    if (req.method === 'POST' && reply) {
+      let text = ''; for await (const chunk of req) text += chunk;
+      const body = JSON.parse(text); const form = nativeForms.find(item => item.id === reply[1]);
+      assert.equal(form?.state?.status, 'pending'); assert.deepEqual(body, { answer: { q0: 'yes' } });
+      form.state = { status: 'answered', answer: body.answer }; questionMutations.push({ path: req.url, body });
+      return res.end(JSON.stringify({}));
+    }
+    if (req.method === 'DELETE' && cancel) {
+      const form = nativeForms.find(item => item.id === cancel[1]); assert.equal(form?.state?.status, 'pending');
+      form.state = { status: 'cancelled' }; questionMutations.push({ path: req.url, body: null });
+      return res.end(JSON.stringify({}));
+    }
     if (req.method === 'POST') {
       let text = ''; for await (const chunk of req) text += chunk;
       const body = text ? JSON.parse(text) : null; posts.push({ path: req.url, body });
       if (req.url === `/api/session/${root}/interrupt?resume=false`) return res.end(JSON.stringify({ interrupted: true }));
       assert.equal(req.url, `/api/session/${root}/prompt`);
       assert.deepEqual(Object.keys(body).sort(), ['delivery', 'id', 'text']); assert.equal(body.delivery, 'queue');
-      const item = { id: body.id, sessionID: root, delivery: 'queue' }; inbox.push(item);
+      const item = { id: body.id, sessionID: root, type: 'user', payload: { text: body.text }, delivery: 'queue' }; inbox.push(item);
       if (dropAck) { res.destroy(); return; }
       return res.end(JSON.stringify({ data: item }));
     }
@@ -194,10 +217,11 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
     if (req.url === '/api/agent') return res.end(JSON.stringify({ location: { directory: '/PRIVATE' }, data: [
       { id: 'reviewer', name: 'Review helper', description: 'Review code token=SECRET', mode: 'subagent', hidden: false, system: 'HIDDEN', request: { password: 'SECRET' }, permissions: {} }
     ] }));
-    if (req.url === '/api/plugin') return res.end(JSON.stringify({ data: [{ id: 'subscription.guard', state: { status: 'active' }, source: { type: 'local', path: guardEntry } }] }));
-    if (req.url === '/api/integration/openai') return res.end(JSON.stringify({ data: { id: 'openai', connections: [{ type: 'credential', method: 'oauth' }] } }));
-    if (req.url === '/api/provider/openai') return res.end(JSON.stringify({ data: { id: 'openai', package: '@opencode/ai/providers/openai' } }));
-    if (req.url === '/api/model') return res.end(JSON.stringify({ data: [{ id: 'fixture', providerID: 'openai', package: '@opencode/ai/providers/openai' }] }));
+    if (req.url.startsWith('/api/plugin?')) return res.end(JSON.stringify({ location: { directory: dir }, data: [{ id: 'subscription.guard', state: { status: 'active' }, source: { type: 'local', path: guardEntry } }] }));
+    if (req.url.startsWith('/api/integration/openai?')) return res.end(JSON.stringify({ location: { directory: dir }, data: { id: 'openai', connections: [{ type: 'credential', method: 'oauth' }] } }));
+    if (req.url.startsWith('/api/provider/openai?')) return res.end(JSON.stringify({ location: { directory: dir }, data: { id: 'openai', package: '@opencode/ai/providers/openai' } }));
+    if (req.url.startsWith('/api/model?')) return res.end(JSON.stringify({ location: { directory: dir }, data: [{ id: 'fixture', providerID: 'openai', package: '@opencode/ai/providers/openai' }] }));
+    if (req.url === '/api/session/active') return res.end(JSON.stringify({ data: {} }));
     if (req.url === `/api/session/${root}`) return res.end(JSON.stringify({ data: session }));
     if (req.url.startsWith(`/api/session/${root}/message?`)) {
       if (readFailure === 'denied') { res.statusCode = 403; return res.end('PRIVATE token/body'); }
@@ -211,6 +235,17 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
       if (shouldGate) { permissionEntered?.(); await permissionBarrier; }
       return res.end(JSON.stringify({ data: [] }));
     }
+    if (req.url === `/api/session/${root}/form`) return res.end(JSON.stringify({ data: nativeForms.filter(form => form.state?.status === 'pending') }));
+    const formDetail = new RegExp(`^/api/session/${root}/form/(frm_[A-Za-z0-9_-]{1,160})$`).exec(req.url);
+    if (formDetail) {
+      const form = nativeForms.find(item => item.id === formDetail[1]);
+      if (!form) { res.statusCode = 404; return res.end('{}'); }
+      return res.end(JSON.stringify({ data: form }));
+    }
+    const formMessage = nativeForms.find(form => req.url === `/api/session/${root}/message/${form.metadata.tool.messageID}`);
+    if (formMessage) return res.end(JSON.stringify({ data: { id: formMessage.metadata.tool.messageID, content: [
+      { type: 'tool', id: formMessage.metadata.tool.id, name: 'question', state: { status: 'running' } }
+    ] } }));
     if (req.url.includes('/message/')) { res.statusCode = 404; return res.end('{}'); }
     if (req.url.startsWith('/api/session?')) {
       if (listMode === 'empty') return res.end(JSON.stringify({ data: [], cursor: {} }));
@@ -268,13 +303,14 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
     } finally { await sdk.close(); }
   };
   const nativeWaits = await call(client, 'workrelay_server_waits', { session_id: root, limit: 1 });
-  assert.notEqual(nativeWaits.result.isError, true);
+  assert.notEqual(nativeWaits.result.isError, true, JSON.stringify(nativeWaits.result));
   assert.equal(nativeWaits.result.structuredContent.pending_permission_count, 0);
   assert.equal(nativeWaits.result.structuredContent.inference_started, false);
   assert.equal(nativeWaits.result.structuredContent.native_permission_reply_exposed, false);
-  assert.equal(nativeWaits.result.structuredContent.native_question_reply_exposed, false);
+  assert.equal(nativeWaits.result.structuredContent.native_question_reply_exposed, true);
   const waitsDefinition = nativeWaits.tools.find(tool => tool.name === 'workrelay_server_waits');
   assert.equal(waitsDefinition.annotations.readOnlyHint, true);
+  assert.equal(nativeWaits.tools.find(tool => tool.name === 'workrelay_server_reconcile').annotations.readOnlyHint, false);
   assert.equal(Object.hasOwn(waitsDefinition.inputSchema.properties, 'operation_id'), false);
   assert.equal((await call('other', 'workrelay_server_waits', { session_id: root })).result.isError, true);
   assert.equal((await call(client, 'workrelay_server_waits', { session_id: root, limit: 51 })).result.isError, true);
@@ -662,6 +698,29 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
   assert.equal((await call(client, 'workrelay_server_interrupt', { session_id: root, operation_id: 'revoked-stop' })).result.isError, true);
   assert.equal(posts.length, 3);
   await fs.writeFile(capability, JSON.stringify(binding)); await fs.writeFile(quota, '#!/bin/sh\nexit 0\n');
+  const question = id => ({ id, sessionID: root, title: 'Questions',
+    metadata: { kind: 'question', tool: { messageID: `msg_${id.slice(4)}`, id: `call_${id.slice(4)}` } },
+    fields: [{ key: 'q0', title: 'Direction', type: 'string', required: true }], state: { status: 'pending' } });
+  nativeForms = [question('frm_reply')];
+  const pendingQuestions = await call(client, 'workrelay_server_waits', { session_id: root, limit: 1 });
+  assert.equal(pendingQuestions.result.structuredContent.pending_question_count, 1);
+  assert.equal(pendingQuestions.result.structuredContent.questions[0].form_id, 'frm_reply');
+  const replyArgs = { session_id: root, operation_id: 'native-reply', form_id: 'frm_reply', answer: { q0: 'yes' } };
+  const answered = await call(client, 'workrelay_server_question_reply', replyArgs);
+  assert.equal(answered.result.isError, false, JSON.stringify(answered.result));
+  assert.equal(answered.result.structuredContent.phase, 'question_answered_observed');
+  assert.equal(questionMutations.length, 1);
+  assert.equal((await call(client, 'workrelay_server_question_reply', replyArgs)).result.structuredContent.phase, 'question_answered_observed');
+  assert.equal(questionMutations.length, 1, 'same stable reply receipt never posts twice');
+  const reconciledQuestion = await call(client, 'workrelay_server_reconcile', { session_id: root, operation_id: 'native-reply' });
+  assert.equal(reconciledQuestion.result.structuredContent.native_form_state, 'answered_recorded');
+  nativeForms = [question('frm_cancel')];
+  const cancelled = await call(client, 'workrelay_server_question_cancel', { session_id: root, operation_id: 'native-cancel', form_id: 'frm_cancel' });
+  assert.equal(cancelled.result.isError, false, JSON.stringify(cancelled.result));
+  assert.equal(cancelled.result.structuredContent.phase, 'question_cancelled_observed');
+  assert.equal(questionMutations.length, 2);
+  assert.equal((await call(client, 'workrelay_server_question_cancel', { session_id: root, operation_id: 'native-cancel', form_id: 'frm_cancel' })).result.structuredContent.phase, 'question_cancelled_observed');
+  assert.equal(questionMutations.length, 2, 'same stable cancel receipt never posts twice');
   dropAck = true;
   const uncertain = { ...message, operation_id: 'lost-ack' };
   assert.equal((await call(client, 'workrelay_server_message', uncertain)).result.isError, true);
