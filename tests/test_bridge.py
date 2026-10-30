@@ -294,6 +294,16 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("unverified", result[2])
         self.assertFalse(any(path == "/api/session" for _, path in FakeClient.calls))
 
+    def test_router_configuration_is_allowed_without_arbitrary_agents(self):
+        self.data["agent"] = "harness-router"
+        self.write_config()
+        config, *_ = cli.load_config(str(self.config))
+        self.assertEqual(config["agent"], "harness-router")
+        self.data["agent"] = "unapproved-agent"
+        self.write_config()
+        with self.assertRaises(cli.BridgeError):
+            cli.load_config(str(self.config))
+
     def test_attestor_scopes_selection_to_requested_provider(self):
         client = FakeClient(self.data, None)
         original = dict(FakeClient.metadata["/api/model"][0])

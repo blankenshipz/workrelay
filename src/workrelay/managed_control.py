@@ -352,7 +352,7 @@ def create_body(config, binding, operation_id, directory, title, *, verified_pro
     allowed = config.get('managed_allowed_directories', [config.get('directory')])
     require(isinstance(allowed, list) and (directory in allowed or directory == verified_project_root), 'workspace not authorized for creation')
     require(isinstance(title, str) and 0 < len(title.strip()) <= 160 and not any(ord(c) < 32 for c in title), 'invalid title')
-    require(config.get('agent', 'quick-builder') in ('quick-builder', 'builder') and
+    require(config.get('agent', 'quick-builder') in ('quick-builder', 'builder', 'harness-router') and
             isinstance(config.get('model'), dict) and config['model'].get('providerID') == 'openai', 'invalid attested create route')
     metadata = {'workrelayOperation': operation_id, 'workrelayBinding': binding}
     if verified_project_root is not None:

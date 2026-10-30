@@ -782,6 +782,22 @@ class CreationTests(unittest.TestCase):
         return create_session(self.db, self.config, self, self.authorize, op,
                               **{'directory': self.directory, 'title': 'Isolated check', 'project_id': 'project', **kw})
 
+    def test_router_creation_changes_only_new_conversations(self):
+        old = self.create(op='old-builder')
+        self.config['agent'] = 'harness-router'
+        self.config['model'] = {'providerID': 'openai', 'id': 'router-fixture', 'variant': 'medium'}
+        with patch('workrelay.managed_control.admission') as admit:
+            new = self.create(op='new-router')
+            admit.assert_not_called()
+        self.assertFalse(new['inference_started'])
+        self.assertEqual(self.sessions[new['session_id']]['agent'], 'harness-router')
+        self.assertEqual(self.sessions[new['session_id']]['model'], self.config['model'])
+        self.assertEqual(self.sessions[old['session_id']]['agent'], 'quick-builder')
+        posts = sum(method == 'POST' for method, _, _ in self.calls)
+        with self.assertRaises(BridgeError):
+            self.create(op='old-builder')
+        self.assertEqual(sum(method == 'POST' for method, _, _ in self.calls), posts)
+
     def test_durable_create_duplicate_conflict_and_no_inference(self):
         with patch('workrelay.managed_control.admission') as admit:
             result = self.create()

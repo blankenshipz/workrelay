@@ -52,7 +52,7 @@ The required scoped-work fields are:
   "directory": "<absolute path to existing isolated workspace>",
   "state_dir": "<absolute path to owner-only Workrelay state directory>",
   "authorized_owner": "remote-work",
-  "agent": "quick-builder",
+  "agent": "harness-router",
   "model": {"providerID": "openai", "id": "<exact eligible model id from the native catalog>"},
   "quota_command": "<absolute path to installed codex-quota executable>",
   "guard_entry": "<absolute path to active subscription.guard index.mjs>",
@@ -64,7 +64,7 @@ The required scoped-work fields are:
 }
 ```
 
-This is a template, not a ready-to-run config: replace each placeholder with a path or value verified from this installation. The workspace and state directory must already exist; `server` must be an uncredentialed loopback HTTP origin. `authorized_owner` is only a local routing label, not human authentication. `agent` must be an enabled scoped builder (`quick-builder` or `builder`). Get the model ID from the authenticated native model catalog; do not invent an ID or substitute a provider. Locate the actual active `subscription.guard` entry in the installed service, review and trust all three guard files, then compute their individual SHA-256 values with `shasum -a 256`; the files are the entry, its sibling `../subscription-guard.mjs`, and the project-root `config/guard-validation.mjs`. Store those exact digests in the matching fields—never use sample or stale pins. The attestor checks that the guard is active and those installed files match; it does not read credentials or guarantee billing behavior.
+This is a template, not a ready-to-run config: replace each placeholder with a path or value verified from this installation. The workspace and state directory must already exist; `server` must be an uncredentialed loopback HTTP origin. `authorized_owner` is only a local routing label, not human authentication. `agent` must be an enabled `harness-router` or scoped builder (`quick-builder` or `builder`). Use `harness-router` with its discovered model/variant to let the installed harness delegate, pace its enabled subscription pools, and decide when review is useful. Workrelay attests the OpenAI entry route; delegated requests remain subject to the harness's own provider, permission and financial checks. Native builders remain an explicit configuration option for installations without the harness. Changing the creation default does not retarget existing conversations. Old create retries retain their argument/model identity and may report an argument conflict after a default change; inspect the original receipt and continue its existing session instead of creating a replacement. Get the model ID from the authenticated native model catalog; do not invent an ID or substitute a provider. Locate the actual active `subscription.guard` entry in the installed service, review and trust all three guard files, then compute their individual SHA-256 values with `shasum -a 256`; the files are the entry, its sibling `../subscription-guard.mjs`, and the project-root `config/guard-validation.mjs`. Store those exact digests in the matching fields—never use sample or stale pins. The attestor checks that the guard is active and those installed files match; it does not read credentials or guarantee billing behavior.
 
 After installing the Python adapter, run its read-only check with the config you just created:
 

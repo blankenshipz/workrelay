@@ -84,8 +84,8 @@ def load_config(path):
             "private state directory missing, foreign-owned or permissions too broad")
     require(config.get("model", {}).get("providerID") == "openai" and config["model"].get("id"),
             "model must explicitly use OpenAI OAuth; no fallback")
-    require(config.get("agent", "quick-builder") in ("quick-builder", "builder"),
-            "coding agent must be an enabled scoped builder")
+    require(config.get("agent", "quick-builder") in ("quick-builder", "builder", "harness-router"),
+            "coding agent must be an enabled scoped builder or harness-router")
     require(bool(re.fullmatch(r"[A-Za-z0-9_-]{1,80}", config.get("authorized_owner", ""))),
             "private configuration must declare one authorized owner")
     require(Path(config["quota_command"]).is_file(), "quota admission command missing")
