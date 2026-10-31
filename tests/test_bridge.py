@@ -320,10 +320,10 @@ class BridgeTests(unittest.TestCase):
     def test_attestor_rejects_ambiguous_metadata_and_tampering(self):
         client = FakeClient(self.data, None)
         self.assertTrue(verify(self.data, client))
-        FakeClient.metadata["/api/integration/openai"]["connections"].append({"type": "credential", "method": "key"})
+        FakeClient.metadata["/api/integration/openai"]["connections"][0]["method"] = "key"
         with self.assertRaises(AttestationError):
             verify(self.data, client)
-        FakeClient.metadata["/api/integration/openai"]["connections"].pop()
+        FakeClient.metadata["/api/integration/openai"]["connections"][0]["method"] = "oauth"
         FakeClient.metadata["/api/provider/openai"]["settings"]["apiKey"] = "synthetic"
         with self.assertRaises(AttestationError):
             verify(self.data, client)
@@ -335,6 +335,34 @@ class BridgeTests(unittest.TestCase):
         self.entry.write_text("modified guard")
         with self.assertRaises(AttestationError):
             verify(self.data, client)
+
+    def test_attestor_uses_native_first_connection_only(self):
+        client = FakeClient(self.data, None)
+        FakeClient.metadata["/api/integration/openai"]["connections"] = [
+            {"type": "credential", "method": "oauth"},
+            {"type": "credential", "method": "oauth", "active": False},
+        ]
+        self.assertTrue(verify(self.data, client))
+
+        for first in (
+            {"type": "credential", "method": "key"},
+            {"type": "environment", "method": "oauth"},
+            {},
+        ):
+            with self.subTest(first=first):
+                FakeClient.metadata["/api/integration/openai"]["connections"] = [
+                    first, {"type": "credential", "method": "oauth"},
+                ]
+                with self.assertRaises(AttestationError) as failure:
+                    verify(self.data, client)
+                self.assertEqual(failure.exception.check_id, "OAUTH_CONNECTION")
+
+        for connections in ([], None, [{"type": "credential"}]):
+            with self.subTest(connections=connections):
+                FakeClient.metadata["/api/integration/openai"]["connections"] = connections
+                with self.assertRaises(AttestationError) as failure:
+                    verify(self.data, client)
+                self.assertEqual(failure.exception.check_id, "OAUTH_CONNECTION")
 
     def test_interrupt_false_is_not_acknowledgment(self):
         result = self.run_bridge("start", "--key", "interrupt", "--owner", "dot-work", "--text", "x")

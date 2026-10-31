@@ -158,7 +158,9 @@ def verify(config, client):
     integration = payload(client, "/api/integration/openai")
     check(isinstance(integration, dict), 'INTEGRATION_RESPONSE')
     connections = integration.get("connections")
-    check(integration.get("id") == "openai" and isinstance(connections, list) and len(connections) == 1 and
+    # Native connection selection uses the first entry after its own ordering;
+    # later entries may be historical or inactive and must not be selected here.
+    check(integration.get("id") == "openai" and isinstance(connections, list) and connections and
           isinstance(connections[0], dict) and
           connections[0].get("type") == "credential" and connections[0].get("method") == "oauth", 'OAUTH_CONNECTION')
     settings = provider.get("settings") or {}
