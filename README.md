@@ -19,11 +19,16 @@ Permission requests still require the OpenCode/OpenChamber approval UI.
 Keep `workrelay_server_operation_status` for historical receipts, including when
 execution admission is unavailable. Use `workrelay_server_reconcile` for authorized
 recovery: it reads native message/inbox and waits, then persists a verified local
-receipt without resending work. Read-only monitors use operation status and waits.
-Queued, consumed, executing and idle are different observations; none proves the
-user's task was accepted as complete. A failed historical idle outcome is not a
-failure of a currently running execution. Unknown or uncertain delivery is never
-permission to replay a message or create a replacement worker.
+receipt without resending work. Reconcile reports a bounded native observation:
+`queued` includes a native queue timestamp and age only when that matching inbox
+item supplies a valid non-future `time.created`; `materialized` may include its
+native timestamp. Missing, malformed, or future clocks remain unavailable.
+Receipt-only status reports `native_observation:not_run`; it cannot know queue age.
+Read-only monitors use operation status and waits. Queued, consumed, executing and
+idle are different observations; none proves the user's task was accepted as
+complete. A failed historical idle outcome is not a failure of a currently running
+execution. Unknown or uncertain delivery is never permission to replay a message or
+create a replacement worker.
 
 ## From goal to useful outcome
 

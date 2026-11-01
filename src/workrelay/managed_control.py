@@ -443,6 +443,9 @@ def control_result(operation_id, session_id, message_id, phase, interrupt, *, de
     if interrupt:
         value.update(cancellation_is_rollback=False, queued_inputs_removed=False,
                      guidance='Only this session active execution is interrupted with resume=false. Queued inputs are preserved and may run on later resume. No file edits are rolled back; idle_noop is not active-cancel proof.')
+    elif phase in ('queued', 'steering'):
+        value['guidance'] = ('Accepted by the native control endpoint and recorded as queued; this is not proof the owner consumed, '
+                             'executed, or completed it. Inspect/reconcile the original operation ID to observe native queue or materialization; never replay it.')
     value.update(denial_fields(phase, denial_code, denied_at_ms, attestation_check_id))
     return value
 
@@ -806,7 +809,21 @@ def classified_failure(db, authorize, operation_id, session_id, error):
     return ControlFailure(details)
 
 
-def inspect_operation(db, config, client, authorize, session_id, operation_id, *, receipt_only=False):
+def _observation_time_ms(clock_ms):
+    """Return a bounded local observation time, or no timestamp at all."""
+    value = int(time.time() * 1000) if clock_ms is None else clock_ms
+    return value if type(value) is int and 0 <= value <= 9007199254740991 else None
+
+
+def _native_created_ms(item, observed_at_ms):
+    """Accept only the native item's exact, non-future millisecond timestamp."""
+    value = item.get('time', {}).get('created') if isinstance(item, dict) and isinstance(item.get('time'), dict) else None
+    if type(value) is not int or value < 0 or value > 9007199254740991:
+        return None
+    return value if observed_at_ms is not None and value <= observed_at_ms else None
+
+
+def inspect_operation(db, config, client, authorize, session_id, operation_id, *, receipt_only=False, clock_ms=None):
     """Read/reconcile a known principal-bound operation without prompt text or inference."""
     try:
         binding, session_id, row = resolve_operation(db, authorize, operation_id, session_id)
@@ -816,7 +833,9 @@ def inspect_operation(db, config, client, authorize, session_id, operation_id, *
         return {'operation_id': operation_id, 'session_id': session_id, 'code': error.code,
                 'phase': 'unknown', 'effect': 'not_established',
                 'lookup_scope': 'current_authenticated_binding', 'task_outcome': 'unverified',
-                'native_observation': 'not_run', 'replay_permitted': False}
+                'native_observation': 'not_run', 'native_observed_at_ms': None,
+                'native_queued_at_ms': None, 'native_queue_age_ms': None,
+                'native_materialized_at_ms': None, 'replay_permitted': False}
     phase = row[3]
     if receipt_only:
         require(authorize() == binding, 'authority changed')
@@ -827,6 +846,8 @@ def inspect_operation(db, config, client, authorize, session_id, operation_id, *
                 'phase': phase, 'recorded_phase': phase, 'code': code, 'effect': effect,
                 **denial_fields(phase, row[5], row[6], row[7]),
                 'lookup_scope': 'current_authenticated_binding', 'native_observation': 'not_run',
+                'native_observed_at_ms': None, 'native_queued_at_ms': None,
+                'native_queue_age_ms': None, 'native_materialized_at_ms': None,
                 'message_id': row[2] if row[0] in ('queue', 'steer') else None,
                 'task_outcome': 'unverified', 'replay_permitted': False,
                 'cancellation_is_rollback': False, 'queued_inputs_removed': False}
@@ -834,6 +855,11 @@ def inspect_operation(db, config, client, authorize, session_id, operation_id, *
         require(authorize() == binding, 'authority changed'); result = client.request('GET', path)
         require(authorize() == binding, 'authority changed'); return result
     session_exists = None
+    native_observation = 'not_run'
+    native_observed_at_ms = None
+    native_queued_at_ms = None
+    native_queue_age_ms = None
+    native_materialized_at_ms = None
     if row[0] == 'create':
         remote = get('/api/session/' + session_id)
         session_exists = remote is not None
@@ -846,7 +872,7 @@ def inspect_operation(db, config, client, authorize, session_id, operation_id, *
                     'created session identity mismatch')
             require(phase not in ('reserved', 'denied'), 'session exists despite no-POST phase; operator review required')
             phase = 'created_observed'
-    if row[0] in ('queue', 'steer') and phase in ('sending', 'uncertain', 'queued', 'steering', 'queued_observed'):
+    if row[0] in ('queue', 'steer') and phase in ('sending', 'uncertain', 'queued', 'steering', 'queued_observed', 'message_observed'):
         remote = get('/api/session/' + session_id)
         require(identity(remote.get('data') if isinstance(remote, dict) else None, session_id) == row[4], 'session identity changed')
         exact = get(f'/api/session/{session_id}/message/{row[2]}')
@@ -856,13 +882,24 @@ def inspect_operation(db, config, client, authorize, session_id, operation_id, *
         if isinstance(exact_data, dict) and exact_data.get('id') == row[2] and exact_text_matches and (
                 'sessionID' not in exact_data or exact_data.get('sessionID') == session_id):
             phase = 'message_observed'  # Materialization, not completion or task success.
+            native_observation = 'materialized'
+            native_observed_at_ms = _observation_time_ms(clock_ms)
+            native_materialized_at_ms = _native_created_ms(exact_data, native_observed_at_ms)
         else:
             inbox = get(f'/api/session/{session_id}/inbox')
-            if isinstance(inbox, dict) and isinstance(inbox.get('data'), list) and any(
-                    isinstance(item, dict) and item.get('id') == row[2] and item.get('sessionID') == session_id and item.get('type') == 'user' and
-                        isinstance(item.get('payload'), dict) and isinstance(item['payload'].get('text'), str) and
-                        hashlib.sha256((row[0] + '\0' + item['payload']['text']).encode()).hexdigest() == row[1] for item in inbox['data']):
+            matching = next((item for item in inbox.get('data', []) if isinstance(item, dict) and item.get('id') == row[2] and
+                             item.get('sessionID') == session_id and item.get('type') == 'user' and
+                             isinstance(item.get('payload'), dict) and isinstance(item['payload'].get('text'), str) and
+                             hashlib.sha256((row[0] + '\0' + item['payload']['text']).encode()).hexdigest() == row[1]), None) if isinstance(inbox, dict) and isinstance(inbox.get('data'), list) else None
+            if matching is not None:
                 phase = 'queued_observed'
+                native_observation = 'queued'
+                native_observed_at_ms = _observation_time_ms(clock_ms)
+                native_queued_at_ms = _native_created_ms(matching, native_observed_at_ms)
+                native_queue_age_ms = native_observed_at_ms - native_queued_at_ms if native_queued_at_ms is not None else None
+            else:
+                native_observation = 'unknown'
+                native_observed_at_ms = _observation_time_ms(clock_ms)
     require(authorize() == binding, 'authority changed')
     return {'operation_id': operation_id, 'session_id': session_id, 'kind': row[0], 'phase': phase,
             **denial_fields(row[3], row[5], row[6], row[7]),
@@ -870,4 +907,8 @@ def inspect_operation(db, config, client, authorize, session_id, operation_id, *
             'effect': ('created_observed' if session_exists else 'not_applied' if row[3] in ('reserved', 'denied') else 'unknown') if row[0] == 'create' else 'not_evaluated',
             'message_id': row[2] if row[0] in ('queue', 'steer') else None,
             'task_outcome': 'unverified', 'cancellation_is_rollback': False,
-            'queued_inputs_removed': False}
+            'queued_inputs_removed': False, 'native_observation': native_observation,
+            'native_observed_at_ms': native_observed_at_ms,
+            'native_queued_at_ms': native_queued_at_ms,
+            'native_queue_age_ms': native_queue_age_ms,
+            'native_materialized_at_ms': native_materialized_at_ms}

@@ -49,6 +49,11 @@ It makes no native mutation, replay, inference, or task-completion claim. Becaus
 it updates local control bookkeeping, read-only monitors use operation status
 and waits instead. Treat `queued_observed`
 as queued and `message_observed` as materialized, not as executed or accepted.
+Native reconciliation reports `native_observation` as `queued`, `materialized`, or
+`unknown`, with bounded observation/timestamp fields. Queue age is present only
+when the exact hash-matched inbox item carries a valid non-future native
+`time.created`; receipt-only operation status always reports `not_run` and cannot
+know a queue age. Missing native clocks are unavailable, never estimated.
 Current execution/wait evidence takes precedence over historical idle outcomes;
 missing evidence is unknown, never guessed idle. Remote client visibility of
 these tools requires a refreshed tool catalog after gateway upgrade.

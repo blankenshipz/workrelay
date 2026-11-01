@@ -279,6 +279,72 @@ class ManagedControlTests(unittest.TestCase):
         self.assertEqual(missing['code'], 'CONTROL_OPERATION_NOT_FOUND_CURRENT_BINDING')
         self.assertEqual(missing['effect'], 'not_established')
 
+    @patch('workrelay.managed_control.admission')
+    def test_inspection_exposes_exact_queue_age_without_writing_or_inference(self, admit):
+        self.run_control(text='hello')
+        message_id = self.db.execute("SELECT message FROM managed_operations WHERE operation='operation'").fetchone()[0]
+        self.inbox = [{'id': message_id, 'sessionID': self.sid, 'type': 'user',
+                       'payload': {'text': 'hello'}, 'time': {'created': 1000}}]
+        before = self.db.execute('SELECT * FROM managed_operations').fetchall()
+        observed = inspect_operation(self.db, self.config, self, self.authorize, self.sid, 'operation', clock_ms=6000)
+        self.assertEqual(observed['phase'], 'queued_observed')
+        self.assertEqual(observed['native_observation'], 'queued')
+        self.assertEqual(observed['native_observed_at_ms'], 6000)
+        self.assertEqual(observed['native_queued_at_ms'], 1000)
+        self.assertEqual(observed['native_queue_age_ms'], 5000)
+        self.assertIsNone(observed['native_materialized_at_ms'])
+        self.assertEqual(self.db.execute('SELECT * FROM managed_operations').fetchall(), before)
+        self.assertEqual(self.posts(), [('POST', f'/api/session/{self.sid}/prompt', {'id': message_id, 'text': 'hello', 'delivery': 'queue'})])
+        self.assertIn('not proof the owner consumed', self.run_control(text='hello')['guidance'])
+
+    @patch('workrelay.managed_control.admission')
+    def test_inspection_materialization_and_invalid_native_clocks_are_not_invented(self, admit):
+        self.run_control(text='hello')
+        message_id = self.db.execute("SELECT message FROM managed_operations WHERE operation='operation'").fetchone()[0]
+        self.exact_message = {'data': {'id': message_id, 'sessionID': self.sid, 'type': 'user', 'text': 'hello',
+                                       'time': {'created': 5000}}}
+        observed = inspect_operation(self.db, self.config, self, self.authorize, self.sid, 'operation', clock_ms=6000)
+        self.assertEqual(observed['native_observation'], 'materialized')
+        self.assertEqual(observed['native_materialized_at_ms'], 5000)
+        self.assertIsNone(observed['native_queue_age_ms'])
+        self.exact_message = None
+        self.inbox = [{'id': message_id, 'sessionID': self.sid, 'type': 'user', 'payload': {'text': 'hello'},
+                       'time': {'created': 6001}}]
+        future = inspect_operation(self.db, self.config, self, self.authorize, self.sid, 'operation', clock_ms=6000)
+        self.assertEqual(future['native_observation'], 'queued')
+        self.assertIsNone(future['native_queued_at_ms'])
+        self.assertIsNone(future['native_queue_age_ms'])
+        self.inbox[0]['time'] = {'created': 'not-a-clock'}
+        malformed = inspect_operation(self.db, self.config, self, self.authorize, self.sid, 'operation', clock_ms=6000)
+        self.assertIsNone(malformed['native_queued_at_ms'])
+        self.assertIsNone(malformed['native_queue_age_ms'])
+
+    @patch('workrelay.managed_control.admission')
+    def test_inspection_unknown_and_receipt_only_never_claim_native_observation(self, admit):
+        self.run_control(text='hello')
+        self.inbox = []
+        self.exact_message = None
+        unknown = inspect_operation(self.db, self.config, self, self.authorize, self.sid, 'operation', clock_ms=6000)
+        self.assertEqual(unknown['native_observation'], 'unknown')
+        self.assertEqual(unknown['native_observed_at_ms'], 6000)
+        self.calls = []
+        receipt = inspect_operation(self.db, self.config, self, self.authorize, self.sid, 'operation', receipt_only=True)
+        self.assertEqual(receipt['native_observation'], 'not_run')
+        self.assertIsNone(receipt['native_observed_at_ms'])
+        self.assertIsNone(receipt['native_queue_age_ms'])
+        self.assertEqual(self.calls, [])
+
+    @patch('workrelay.managed_control.admission', side_effect=GuardFailure('QUOTA_DENIED'))
+    def test_denied_receipt_is_not_misrepresented_as_native_queue_state(self, admit):
+        with self.assertRaises(GuardFailure):
+            self.run_control(text='hello')
+        self.calls = []
+        denied = inspect_operation(self.db, self.config, self, self.authorize, self.sid, 'operation')
+        self.assertEqual(denied['phase'], 'denied')
+        self.assertEqual(denied['native_observation'], 'not_run')
+        self.assertIsNone(denied['native_observed_at_ms'])
+        self.assertEqual(self.calls, [])
+
     def test_exact_full_model_and_raw_input_bound(self):
         self.session['model'] = {**self.config['model'], 'unrecognizedRouteOverride': 'different'}
         with self.assertRaises(BridgeError): self.run_control(text='hello')
