@@ -198,6 +198,18 @@ print(json.dumps(r))`;
           { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }));
         if (!row) return false;
         if (request.method === 'GET' && request.body === null) {
+          if (row[0] === 'create') {
+            const body = JSON.parse(row[4]);
+            const root = body.location?.directory;
+            let locationURL;
+            if (typeof request.path !== 'string' || !request.path.startsWith('/api/location?')) return false;
+            try { locationURL = new URL(request.path, 'http://managed.local'); } catch { return false; }
+            const keys = [...locationURL.searchParams.keys()];
+            if (['reserved', 'sending'].includes(row[3]) && body?.id === sid && typeof root === 'string' &&
+                locationURL.origin === 'http://managed.local' && locationURL.pathname === '/api/location' && !locationURL.hash &&
+                keys.length === 1 && keys[0] === 'location[directory]' && locationURL.searchParams.getAll('location[directory]').length === 1 &&
+                locationURL.searchParams.get('location[directory]') === root) return true;
+          }
           if (request.path === `/api/session/${sid}/message/${row[2]}`) return true;
           if ((row[0] === 'question_reply' || row[0] === 'question_cancel') &&
               (request.path === `/api/session/${sid}/form/${row[2]}` || new RegExp(`^/api/session/${sid}/message/msg[A-Za-z0-9_-]{1,160}$`).test(request.path))) return true;
@@ -235,7 +247,16 @@ print(json.dumps(r))`;
           if (!within(root, directory)) return false;
           const candidates = projects.filter(project => typeof project?.canonical === 'string' && within(project.canonical, directory));
           candidates.sort((a, b) => b.canonical.length - a.canonical.length);
-          if (candidates[0]?.id !== row[2]) return false;
+          const deepest = candidates[0]?.canonical.length;
+          const deepestRoots = new Set(candidates.filter(project => project.canonical.length === deepest).map(project => project.canonical));
+          if (deepestRoots.size !== 1 || !deepestRoots.has(root)) return false;
+          // Session.create resolves locations natively. Re-read that exact,
+          // ledger-pinned root immediately before POST so a stale inventory ID
+          // cannot create in a replacement project sharing the same directory.
+          const locationResponse = await fetch(new URL('/api/location?' + new URLSearchParams({ 'location[directory]': directory }), endpoint.url), { headers, redirect: 'manual', signal: AbortSignal.timeout(5000) });
+          if (!locationResponse.ok) return false;
+          const location = await boundedJSON(locationResponse);
+          if (location?.directory !== directory || location?.project?.id !== row[2] || location.project?.canonical !== root) return false;
           const rootHash = body.metadata?.workrelayProjectRootHash;
           const scopedNativeRoot = rootHash !== undefined && root !== '/' && directory === root &&
             rootHash === createHash('sha256').update(root).digest('hex');

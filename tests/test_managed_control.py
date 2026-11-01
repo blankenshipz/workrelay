@@ -872,6 +872,17 @@ class CreationTests(unittest.TestCase):
     def request(self, method, path, body=None):
         self.calls.append((method, path, copy.deepcopy(body)))
         if path == '/api/project': return getattr(self, 'project_records', [{'id': 'project', 'canonical': self.directory}])
+        if path.startswith('/api/location?'):
+            from urllib.parse import parse_qs, urlsplit
+            directory = parse_qs(urlsplit(path).query)['location[directory]'][0]
+            projects = getattr(self, 'project_records', [{'id': 'project', 'canonical': self.directory}])
+            current_id = getattr(self, 'location_projects', {}).get(directory)
+            if current_id is not None:
+                current = next((p for p in projects if p.get('id') == current_id), None)
+                if current is not None: return {'directory': directory, 'project': {**copy.deepcopy(current), 'directory': directory}}
+            matches = [p for p in projects if p.get('canonical') == directory]
+            if len(matches) != 1: return {'directory': directory, 'project': None}
+            return {'directory': directory, 'project': {**copy.deepcopy(matches[0]), 'directory': directory}}
         if method == 'GET':
             session = self.sessions.get(path.split('/')[-1])
             return {'data': copy.deepcopy(session)} if session else None
@@ -879,7 +890,9 @@ class CreationTests(unittest.TestCase):
         self.assertNotIn('permissions', body); self.assertNotIn('parentID', body)
         projects = getattr(self, 'project_records', [{'id': 'project', 'canonical': self.directory}])
         matches = [p for p in projects if Path(body['location']['directory']).is_relative_to(Path(p['canonical']))]
-        selected = max(matches, key=lambda p: len(p['canonical']))
+        current_id = getattr(self, 'location_projects', {}).get(body['location']['directory'])
+        selected = next((p for p in matches if p.get('id') == current_id), None) if current_id else max(matches, key=lambda p: len(p['canonical']))
+        self.assertIsNotNone(selected)
         self.sessions[body['id']] = {**copy.deepcopy(body), 'projectID': selected['id']}
         if self.timeout: raise TimeoutError()
         return {'data': copy.deepcopy(self.sessions[body['id']])}
@@ -1035,6 +1048,54 @@ class CreationTests(unittest.TestCase):
         self.assertEqual(self.native_create()['phase'], 'denied')
         self.assertEqual(self.db.execute('SELECT * FROM managed_operations').fetchall(), before)
         self.assertFalse(any(m == 'POST' for m, _, _ in self.calls))
+
+    def test_stale_shared_root_is_typed_denial_and_is_immutable(self):
+        # project.list can expose an old ID after the native resolver has moved
+        # the same canonical directory to a replacement project.
+        self.project_records = [{'id': 'stale', 'canonical': self.directory}, {'id': 'current', 'canonical': self.directory}]
+        original = self.request
+        def request(method, path, body=None):
+            if path.startswith('/api/location?'):
+                return {'directory': self.directory, 'project': {'id': 'current', 'directory': self.directory, 'canonical': self.directory}}
+            return original(method, path, body)
+        self.request = request
+        with self.assertRaises(BridgeError) as caught:
+            create_session(self.db, self.config, self, self.authorize, 'stale-root', title='Fixture', project_id='stale', authorize_native_projects=self.authorize)
+        failure = classified_failure(self.db, self.authorize, 'stale-root', None, caught.exception)
+        self.assertEqual(failure.control_details['reason'], 'PROJECT_WORKSPACE_MISMATCH')
+        self.assertEqual(self.db.execute("SELECT phase,denial_code FROM managed_operations WHERE operation='stale-root'").fetchone(), ('denied', 'CREATE_PROJECT_WORKSPACE_MISMATCH'))
+        before = self.db.execute("SELECT * FROM managed_operations WHERE operation='stale-root'").fetchall()
+        self.assertEqual(create_session(self.db, self.config, self, self.authorize, 'stale-root', title='Fixture', project_id='stale', authorize_native_projects=self.authorize)['phase'], 'denied')
+        self.assertEqual(self.db.execute("SELECT * FROM managed_operations WHERE operation='stale-root'").fetchall(), before)
+        self.assertFalse(any(method == 'POST' for method, _, _ in self.calls))
+
+    def test_current_shared_root_succeeds_in_either_inventory_order(self):
+        for index, records in enumerate((
+                [{'id': 'stale', 'canonical': self.directory}, {'id': 'current', 'canonical': self.directory}],
+                [{'id': 'current', 'canonical': self.directory}, {'id': 'stale', 'canonical': self.directory}])):
+            with self.subTest(order=index):
+                self.project_records = records
+                self.location_projects = {self.directory: 'current'}
+                result = create_session(self.db, self.config, self, self.authorize, 'current-tied-' + str(index), title='Fixture', project_id='current', authorize_native_projects=self.authorize)
+                self.assertEqual(self.sessions[result['session_id']]['projectID'], 'current')
+                self.assertEqual(sum(method == 'POST' for method, _, _ in self.calls), index + 1)
+
+    def test_nested_current_project_is_allowed_only_when_location_agrees(self):
+        nested = Path(self.directory) / 'nested'; nested.mkdir()
+        self.project_records = [{'id': 'outer', 'canonical': self.directory}, {'id': 'inner', 'canonical': str(nested)}]
+        result = create_session(self.db, self.config, self, self.authorize, 'nested', title='Fixture', project_id='inner', authorize_native_projects=self.authorize)
+        self.assertEqual(self.sessions[result['session_id']]['projectID'], 'inner')
+        self.assertEqual(self.sessions[result['session_id']]['location']['directory'], str(nested))
+
+    def test_nested_workspace_location_is_the_attempted_directory(self):
+        workspace = Path(self.directory) / 'nested-workspace'; workspace.mkdir()
+        self.project_records = [{'id': 'outer', 'canonical': self.directory}]
+        self.config['managed_allowed_directories'] = [str(workspace)]
+        self.location_projects = {str(workspace): 'outer'}
+        result = create_session(self.db, self.config, self, self.authorize, 'nested-workspace', title='Fixture', project_id='outer', directory=str(workspace), authorize_native_projects=self.authorize)
+        self.assertEqual(self.sessions[result['session_id']]['location']['directory'], str(workspace))
+        locations = [path for _, path, _ in self.calls if path.startswith('/api/location?')]
+        self.assertTrue(locations and all(str(workspace).replace('/', '%2F') in path for path in locations))
 
     def test_native_uncertain_creation_not_replayed(self):
         self.setup_native_projects(); self.timeout = True

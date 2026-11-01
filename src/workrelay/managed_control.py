@@ -11,6 +11,7 @@ import os
 import math
 import time
 from pathlib import Path
+from urllib.parse import urlencode
 
 from .cli import admission, BridgeError, require, GuardFailure, CONTROL_DENIAL_CODES, ATTESTATION_CHECK_IDS
 from .supervision import redact_text
@@ -631,8 +632,13 @@ def validated_create_target(config, binding, operation_id, directory, title, pro
             raise GuardFailure('CREATE_PROJECT_WORKSPACE_MISMATCH')
         roots = [p for p in projects if isinstance(p, dict) and isinstance(p.get('canonical'), str) and
                  Path(directory).is_relative_to(Path(p['canonical']))]
-        require(roots and max(roots, key=lambda p: len(p['canonical'])).get('id') == project_id,
-                'workspace belongs to a different native project')
+        deepest = max((len(p['canonical']) for p in roots), default=-1)
+        # Historical IDs may share one canonical root.  That is not an
+        # ambiguity once the exact native location resolves the selected ID;
+        # distinct deepest roots remain an authority failure.
+        deepest_roots = {p['canonical'] for p in roots if len(p['canonical']) == deepest}
+        if not (len(deepest_roots) == 1 and project_root in deepest_roots):
+            raise GuardFailure('CREATE_PROJECT_WORKSPACE_MISMATCH')
     elif directory is None:
         directory = config.get('directory')
     body = create_body(config, binding, operation_id, directory, title,
@@ -725,10 +731,17 @@ def create_session(db, config, client, authorize, operation_id, *, directory=Non
                 isinstance(p.get('canonical'), str) and Path(directory).is_relative_to(Path(p['canonical'])) for p in projects)):
             raise GuardFailure('CREATE_PROJECT_WORKSPACE_MISMATCH')
         if authorize_native_projects is not None:
-            require(authorize_native_projects() == binding and any(isinstance(p, dict) and p.get('id') == project_id and
+            # The body is now durable, so the constrained transport can permit
+            # only this ledger-pinned, actual attempted directory read.
+            location = get('/api/location?' + urlencode({'location[directory]': directory}))
+            current = location.get('project') if isinstance(location, dict) else None
+            if not (authorize_native_projects() == binding and any(isinstance(p, dict) and p.get('id') == project_id and
                     p.get('canonical') == project_root for p in projects) and
-                    str(Path(project_root).resolve()) == project_root and str(Path(directory).resolve()) == directory,
-                    'native project identity changed')
+                    isinstance(location, dict) and location.get('directory') == directory and
+                    isinstance(current, dict) and current.get('id') == project_id and
+                    current.get('canonical') == project_root and
+                    str(Path(project_root).resolve()) == project_root and str(Path(directory).resolve()) == directory):
+                raise GuardFailure('CREATE_PROJECT_WORKSPACE_MISMATCH')
         require(get('/api/session/' + sid) is None, 'creation identity already exists')
         check()
     except Exception as exc:

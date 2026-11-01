@@ -57,6 +57,12 @@ class CreationPreflightTests(unittest.TestCase):
         self.assertEqual(method, 'GET', 'no native POST may be reached')
         if path == '/api/project':
             return copy.deepcopy(self.projects)
+        if path.startswith('/api/location?'):
+            from urllib.parse import parse_qs, urlsplit
+            directory = parse_qs(urlsplit(path).query)['location[directory]'][0]
+            matches = [p for p in self.projects if p.get('canonical') == directory]
+            if len(matches) != 1: return {'directory': directory, 'project': None}
+            return {'directory': directory, 'project': {**copy.deepcopy(matches[0]), 'directory': directory}}
         self.assertTrue(path.startswith('/api/session/'))
         return self.session
 

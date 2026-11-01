@@ -214,6 +214,12 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
       { id: 'project', name: 'Useful project', canonical: dir, directory: '/PRIVATE', commands: { start: 'SECRET' } },
       { id: 'empty-project', name: 'Empty project token=SECRET', canonical: '/outside-authorized-workspace' }
     ]));
+    if (req.url.startsWith('/api/location?')) {
+      const directory = new URL(req.url, 'http://fixture').searchParams.get('location[directory]');
+      return res.end(JSON.stringify(directory === '/outside-authorized-workspace' ?
+        { directory, project: { id: 'empty-project', directory, canonical: directory } } :
+        { directory: dir, project: { id: 'project', directory: dir, canonical: dir } }));
+    }
     if (req.url === '/api/agent') return res.end(JSON.stringify({ location: { directory: '/PRIVATE' }, data: [
       { id: 'reviewer', name: 'Review helper', description: 'Review code token=SECRET', mode: 'subagent', hidden: false, system: 'HIDDEN', request: { password: 'SECRET' }, permissions: {} }
     ] }));

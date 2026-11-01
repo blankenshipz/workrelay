@@ -258,18 +258,42 @@ export function createManagedReader(expected, readBinding, { loadService = path 
         }), limitation: 'Inventory load state is not activation-barrier readiness. Pending hold owners are unavailable.' };
     }
     if (action === 'internal') return value;
+    const currentLocation = async root => {
+      if (typeof root !== 'string' || !isAbsolute(root) || root.length > 4096 || /[\x00-\x1f\x7f\\]/.test(root)) deny();
+      const response = await fetcher(new URL('/api/location?' + new URLSearchParams({ 'location[directory]': root }), endpoint.url), {
+        method: 'GET', headers: { ...service.headers(endpoint), 'content-type': 'application/json' }, redirect: 'manual', signal: AbortSignal.timeout(10000) });
+      if (!response.ok) { await response.body?.cancel(); deny(); }
+      const stream = response.body.getReader(); const chunks = []; let size = 0;
+      try { while (true) { const part = await stream.read(); if (part.done) break; size += part.value.length; if (size > 2000000) deny(); chunks.push(part.value); } }
+      finally { await stream.cancel(); }
+      let location; try { location = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { deny(); }
+      if (JSON.stringify(readBinding()) !== JSON.stringify(binding) || canonical(binding.service_registration) !== binding.service_registration) deny();
+      const current = stat(binding.service_registration);
+      if (current.dev !== registration.dev || current.ino !== registration.ino || current.mtimeMs !== registration.mtimeMs) deny();
+      const project = location?.project;
+      if (location?.directory !== root || typeof project?.id !== 'string' || !project.id || project.id.length > 160 ||
+          project.directory !== root || project.canonical !== root) deny();
+      return project;
+    };
     if (action === 'creation_target') {
       if (!Array.isArray(value) || value.length > 10000 || typeof input.directory !== 'string' || !isAbsolute(input.directory)) deny();
       const directory = canonical(input.directory);
-      const matches = value.filter(project => {
+      const candidates = value.filter(project => {
         if (typeof project?.id !== 'string' || !project.id.length || project.id.length > 160 || typeof project.canonical !== 'string' || !isAbsolute(project.canonical)) return false;
+        if (input.project_id !== undefined && ('project_' + createHash('sha256').update(project.id).digest('hex')) !== input.project_id) return false;
         const distance = relative(project.canonical, directory);
         return distance === '' || distance !== '..' && !distance.startsWith('../') && !isAbsolute(distance);
       }).sort((a, b) => b.canonical.length - a.canonical.length);
-      if (!matches.length || matches.length > 1 && matches[0].canonical === matches[1].canonical) return { available: false,
+      const matches = input.project_id === undefined ? candidates : value.filter(project => typeof project?.id === 'string' &&
+        'project_' + createHash('sha256').update(project.id).digest('hex') === input.project_id);
+      const deepest = Math.max(...matches.map(project => typeof project?.canonical === 'string' ? project.canonical.length : -1));
+      const deepestRoots = new Set(matches.filter(project => project?.canonical?.length === deepest).map(project => project.canonical));
+      if (!matches.length || deepestRoots.size !== 1) return { available: false,
         reason: 'NO_UNAMBIGUOUS_APPROVED_PROJECT', guidance: 'Operator must align the configured creation workspace with a registered project. Discovery is not creation authorization.' };
-      return { available: true, target: 'configured_default_workspace', project_id: 'project_' + createHash('sha256').update(matches[0].id).digest('hex'),
-        label: managedText(matches[0].name, 200).text || 'Configured creation project',
+      const root = [...deepestRoots][0];
+      const current = await currentLocation(root);
+      return { available: true, target: input.project_id === undefined ? 'configured_default_workspace' : 'registered_project_root', project_id: 'project_' + createHash('sha256').update(current.id).digest('hex'),
+        label: managedText(matches.find(project => project.canonical === root)?.name, 200).text || 'Configured creation project',
         guidance: 'Optional default-project helper, not the only allowed project. Omit directory to select this native project canonical root, which may differ from the configured workspace subdirectory. Other discovered native projects remain selectable by the pinned server-wide principal. Never change arguments on a denied operation ID; native checks still apply.' };
     }
     if (action === 'resolve_project') {
@@ -277,7 +301,10 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       const match = value.find(project => typeof project?.id === 'string' && project.id.length <= 160 &&
         'project_' + createHash('sha256').update(project.id).digest('hex') === input.project_id);
       if (!match) deny();
-      return { project_id: match.id }; // Internal CLI handoff only, never a registered read tool.
+      // Creation itself owns the durable attempted-argument receipt and the
+      // current native location check.  Do not remap here: doing so would let a
+      // later inventory read bypass an existing denied/uncertain receipt.
+      return { project_id: match.id };
     }
     if (action === 'projects' || action === 'agents') {
       // Native project.list is an array; agent.list is a location-scoped envelope.
@@ -285,12 +312,15 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       const records = action === 'projects' ? value : value.data;
       const limit = input.limit ?? 20;
       if (!Array.isArray(records) || records.length > 10000 || !Number.isInteger(limit) || limit < 1 || limit > 50) deny();
+      const canonicalCounts = action === 'projects' ? new Map(records.filter(record => typeof record?.canonical === 'string').map(record => [record.canonical, 0])) : null;
+      if (canonicalCounts) for (const record of records) if (typeof record?.canonical === 'string') canonicalCounts.set(record.canonical, canonicalCounts.get(record.canonical) + 1);
       const items = records.map(record => {
         if (!record || typeof record.id !== 'string' || !record.id.length || record.id.length > 160) deny();
         const id = (action === 'projects' ? 'project_' : 'agent_') + createHash('sha256').update(record.id).digest('hex');
         return action === 'projects' ? { project_id: id, label: managedText(record.name, 200).text || `Project ${id.slice(-8)}`,
-          actions: [{ tool: 'workrelay_server_create', arguments: { project_id: id }, requires: ['operation_id', 'title'],
-            guidance: 'Omit directory for the verified native project root. Creation remains subject to current managed authority, financial admission and native permissions.' }] } :
+          ...(canonicalCounts.get(record.canonical) > 1 ? { guidance: 'This canonical root has multiple historical native project IDs. Resolve a current replacement handle before creating.',
+            actions: [{ tool: 'workrelay_server_creation_target', arguments: { project_id: id }, requires: [], guidance: 'Resolve this registered root to its current native project handle, then create with that returned handle.' }] } :
+            { actions: [{ tool: 'workrelay_server_create', arguments: { project_id: id }, requires: ['operation_id', 'title'], guidance: 'Omit directory for the verified native project root. Creation remains subject to current managed authority, financial admission and native permissions.' }] }) } :
           { agent_id: id, label: managedText(record.name, 200).text || `Agent ${id.slice(-8)}`, description: managedText(record.description, 1000),
             mode: ['primary', 'subagent', 'all'].includes(record.mode) ? record.mode : 'unknown', hidden: record.hidden === true,
             kind: 'agent_definition', execution: false };

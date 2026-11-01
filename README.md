@@ -30,6 +30,16 @@ complete. A failed historical idle outcome is not a failure of a currently runni
 execution. Unknown or uncertain delivery is never permission to replay a message or
 create a replacement worker.
 
+## Select the current project before creating a conversation
+
+Native project inventory can retain historical IDs for the same directory.
+For duplicate roots, discovery points to `workrelay_server_creation_target` with
+an opaque `project_id`. The read-only helper returns the project OpenCode currently
+resolves; it exposes no filesystem path and starts no work. Use its returned
+handle with a new operation ID after a denied attempt. Creation checks that exact
+native identity before POST; it never silently switches projects or replays a
+previous denial.
+
 ## From goal to useful outcome
 
 1. **Connect your assistant once.** Set up an authenticated remote MCP connection to Workrelay. OpenCode remains loopback-only; a user-controlled HTTPS route reaches the Workrelay gateway, not OpenCode. For managed-server access, enable the private capability bound to the exact ChatGPT principal and one local server.
