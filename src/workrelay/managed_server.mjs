@@ -3,6 +3,7 @@ import { realpathSync, lstatSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { dirname, relative, isAbsolute } from 'node:path';
 import { createHash } from 'node:crypto';
+import { nativeActivity } from './native_activity.mjs';
 
 const sid = /^ses[A-Za-z0-9_-]{1,160}$/;
 const deny = () => { throw Error('managed server access unavailable'); };
@@ -361,7 +362,10 @@ export function createManagedReader(expected, readBinding, { loadService = path 
           omitted_content: 'Non-text content, reasoning, provider state and tool input/output are excluded.' };
         return { ...base, omission: 'Non-user/assistant message excluded.' };
       });
-      return { items, next_cursor: next, order: 'newest_first',
+      // The complete route/session/message envelope has been checked above;
+      // derive activity only from that same in-memory page.
+      const activity = nativeActivity(value.data);
+      return { items, activity, next_cursor: next, order: 'newest_first',
         visible_results: { message_ids: items.filter(item => item.role === 'assistant' && item.text).map(item => item.message_id),
           scope: 'this_page_only', verification: 'unverified', guidance: 'These IDs reference visible assistant text above, not independently verified task results. Follow older pages even when this page has no visible text.' },
         next_action: next ? { tool: 'workrelay_server_read', arguments: { session_id: input.session_id, include_messages: true, limit: input.limit ?? 10, cursor: next } } : null,

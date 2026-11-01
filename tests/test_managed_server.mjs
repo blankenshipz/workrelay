@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createManagedReader, managedText } from '../src/workrelay/managed_server.mjs';
+import { nativeActivity } from '../src/workrelay/native_activity.mjs';
 import { ATTESTATION_CHECK_IDS, createGateway, safeControlFailure } from '../src/workrelay/mcp.mjs';
 import { catalogShape } from '../src/workrelay/mcp_observation.mjs';
 import { createServer } from 'node:http';
@@ -60,7 +61,9 @@ test('managed registration read boundary is pinned, revoked, bounded and sanitiz
         return new Response(JSON.stringify({ data: [
           // Actual public SessionMessage.Base: id/time, no sessionID.
           { id: 'msg_user', time: { created: 1 }, ...(foreign ? { sessionID: 'ses_other' } : {}), type: 'user', text: surfaceText ?? 'Please repair navigation token=SECRET', files: [{ content: 'SECRET_FILE' }] },
-          { id: 'msg_assistant', time: { created: 2 }, type: 'assistant', content: [{ type: 'text', text: surfaceText ?? 'Implemented navigation; live acceptance pending.', state: { encrypted: 'HIDDEN' } }, { type: 'reasoning', text: 'HIDDEN' }, { type: 'encrypted_reasoning', data: 'HIDDEN' }, { type: 'tool', output: 'SECRET_FILE' }] },
+          { id: 'msg_assistant', time: { created: 2, completed: 3 }, type: 'assistant', content: [{ type: 'text', text: surfaceText ?? 'Implemented navigation; live acceptance pending.', state: { encrypted: 'HIDDEN' } }, { type: 'reasoning', text: 'HIDDEN' }, { type: 'encrypted_reasoning', data: 'HIDDEN' },
+            { type: 'tool', id: 'call_safe', name: 'shell', command: 'PRIVATE_COMMAND', input: { token: 'SECRET' }, output: 'SECRET_FILE', state: { status: 'running', time: { created: 4, ran: 5, completed: 6 }, metadata: { exit: 0, timeout: true, provider: 'PRIVATE_PROVIDER' } } },
+            { type: 'tool', id: 'call_unknown', name: 'PRIVATE_TOOL_NAME', state: { status: 'completed', time: { completed: 8 }, metadata: { exit: 7, output: 'SECRET_OUTPUT' } } }] },
           { id: 'msg_system', time: { created: 3 }, type: 'system', text: 'HIDDEN' }
         ], cursor: { next: 'older' } }));
       }
@@ -96,7 +99,9 @@ test('managed registration read boundary is pinned, revoked, bounded and sanitiz
   assert.equal((await reader('events', { server_id: page.server_id, session_id: root }, claims)).items[0].state, 'needs_input',
     'a pending form must outrank a concurrent active drain');
   nativeForms = []; nativeActive = {};
+  const callsBeforeContext = calls;
   const context = (await reader('read', { session_id: root, include_messages: true, limit: 3 }, claims)).context;
+  assert.equal(calls - callsBeforeContext, 3, 'activity is projected from the existing session, active, and message reads only');
   assert.equal(context.next_cursor, 'older');
   assert.equal(context.items[0].text, 'Please repair navigation token=[REDACTED]');
   assert.equal(context.items[1].text, 'Implemented navigation; live acceptance pending.');
@@ -104,6 +109,14 @@ test('managed registration read boundary is pinned, revoked, bounded and sanitiz
   assert.deepEqual(context.visible_results.message_ids, ['msg_assistant']);
   assert.equal(context.visible_results.verification, 'unverified');
   assert.equal(context.visible_results.scope, 'this_page_only');
+  assert.deepEqual(context.activity, {
+    scope: 'this_page_only', temporal_scope: 'historical_message_page', current_state: 'unknown', truncated: false,
+    items: [
+      { message_id: 'msg_assistant', tool_id: 'call_safe', tool: 'shell', status: 'running', message_created_at: 2, message_completed_at: 3, created_at: 4, ran_at: 5, completed_at: 6, exit_code: 0, timed_out: true },
+      { message_id: 'msg_assistant', tool_id: 'call_unknown', tool: 'other', status: 'completed', message_created_at: 2, message_completed_at: 3, completed_at: 8, exit_code: 7 },
+    ],
+    limitation: 'Historical tool observations from this fetched message page only. A running status is not evidence that a tool is currently running; completion is not verified task progress.',
+  });
   assert.deepEqual(context.next_action, { tool: 'workrelay_server_read', arguments: { session_id: root, include_messages: true, limit: 3, cursor: 'older' } });
   const older = await reader('read', context.next_action.arguments, claims);
   assert.equal(Object.hasOwn(older.return_action.arguments, 'cursor'), false, 'return starts at newest state, not stale historical cursor');
@@ -111,7 +124,11 @@ test('managed registration read boundary is pinned, revoked, bounded and sanitiz
   assert.equal(older.progress.verification, 'unverified');
   const searched = await reader('discover', { search: 'release notes', limit: 1 }, claims);
   assert.deepEqual(searched.next_action.arguments, { cursor: 'page2', limit: 1, search: 'release notes' });
-  assert.doesNotMatch(JSON.stringify(context), /SECRET|HIDDEN/);
+  assert.doesNotMatch(JSON.stringify(context), /SECRET|HIDDEN|PRIVATE_COMMAND|PRIVATE_PROVIDER|PRIVATE_TOOL_NAME/);
+  const callsBeforeMetadataOnly = calls;
+  const metadataOnly = await reader('read', { session_id: root }, claims);
+  assert.equal(calls - callsBeforeMetadataOnly, 2, 'include_messages:false retains its session-and-active-only reads');
+  assert.deepEqual(metadataOnly.context, { omission: 'Request include_messages:true for visible context.' });
   // Synthetic established formats, independently exercised through every public text surface.
   for (const credential of ['Basic dGVzdDpmaXh0dXJl', 'AKIA' + 'A'.repeat(16),
     ...['ghp_', 'gho_', 'ghu_', 'ghs_', 'ghr_', 'github_pat_'].map(prefix => prefix + 'SyntheticFixture123')]) {
@@ -157,6 +174,17 @@ test('managed registration read boundary is pinned, revoked, bounded and sanitiz
   await assert.rejects(reader('read', { session_id: '../root' }, claims));
   assert.equal(calls, before);
   during = () => { binding.revoked = true; }; await assert.rejects(reader('discover', {}, claims));
+});
+
+test('native activity uses native streaming state fields and bounds projection', () => {
+  const content = Array.from({ length: 21 }, (_, index) => ({ type: 'tool', id: `call_${index}`, name: 'shell',
+    command: 'PRIVATE_COMMAND', input: { token: 'SECRET' }, output: 'SECRET_OUTPUT', state: { status: 'completed',
+      time: { created: index, ran: index + 1, completed: index + 2 }, metadata: { exit: index, timeout: false, provider: 'PRIVATE_PROVIDER' } } }));
+  const activity = nativeActivity([{ id: 'msg_many', type: 'assistant', time: { created: 10, completed: 11 }, content }]);
+  assert.equal(activity.items.length, 20); assert.equal(activity.truncated, true);
+  assert.deepEqual(activity.items[0], { message_id: 'msg_many', tool_id: 'call_0', tool: 'shell', status: 'completed',
+    message_created_at: 10, message_completed_at: 11, created_at: 0, ran_at: 1, completed_at: 2, exit_code: 0 });
+  assert.doesNotMatch(JSON.stringify(activity), /PRIVATE_COMMAND|SECRET|PRIVATE_PROVIDER/);
 });
 
 test('real MCP facade passes verified client identity to opt-in managed reads', async t => {
