@@ -532,6 +532,8 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
     assert.equal(handed.length, count);
   }
   const full = await integratedCall('workrelay_server_capabilities');
+  assert.deepEqual(full.structuredContent.supported_write_providers, ['openai', 'anthropic']);
+  assert.match(full.structuredContent.provider_route_admission, /guarded OAuth attestation/i);
   const until = async condition => { for (let attempt = 0; attempt < 150; attempt++) { if (await condition()) return; await new Promise(resolve => setTimeout(resolve, 30)); } assert.fail('bounded native-source observation missing'); };
   assert.equal(sourceConnections, 0, 'no stream before active managed subscription');
   const eventToken = await new SignJWT({ scope: 'workrelay:tasks', client_id: client }).setProtectedHeader({ alg: 'RS256', kid: 'test' })

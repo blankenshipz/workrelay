@@ -138,6 +138,40 @@ class ManagedControlTests(unittest.TestCase):
         self.assertEqual(self.posts(), [])
 
     @patch('workrelay.managed_control.admission')
+    def test_existing_anthropic_child_queue_and_steer_preserve_native_identity(self, admit):
+        original = copy.deepcopy(self.session)
+        native_model = {'providerID': 'anthropic', 'id': 'claude-fixture', 'variant': 'sonnet'}
+        self.session['model'] = native_model
+        self.session['parentID'] = 'ses_parent'; self.session['projectID'] = 'project_child'
+        self.session['metadata'] = {'taskIntent': 'unchanged', 'scope': 'child'}
+        expected = copy.deepcopy(self.session)
+        for operation, steer in (('anthropic-queue', False), ('anthropic-steer', True)):
+            with self.subTest(operation=operation):
+                result = self.run_control(operation, text='continue bounded work', steer=steer)
+                self.assertEqual(result['phase'], 'steering' if steer else 'queued')
+                self.assertEqual(admit.call_args.args[0]['model'], native_model)
+        self.assertEqual(self.session, expected)
+        self.assertNotEqual(self.session['model'], original['model'])
+        self.assertEqual(len(self.posts()), 2)
+
+    def test_preledger_model_mismatch_is_finite_without_receipt_or_post_proof(self):
+        self.session['model'] = {'providerID': 'other', 'id': 'unsupported'}
+        with self.assertRaises(GuardFailure) as caught:
+            self.run_control('preledger-model-mismatch', text='hello')
+        self.assertEqual(caught.exception.denial_code, 'MODEL_MISMATCH')
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM managed_operations').fetchone()[0], 0)
+        failure = classified_failure(self.db, self.authorize, 'preledger-model-mismatch', self.sid, caught.exception)
+        details = failure.control_details
+        self.assertEqual(details['code'], 'CONTROL_AUTHORIZATION_OR_VALIDATION_DENIED')
+        self.assertEqual(details['effect'], 'not_established')
+        self.assertFalse(details['replay_permitted'])
+        self.assertEqual(details['denial_code'], 'MODEL_MISMATCH')
+        self.assertIsNone(details['denied_at_ms']); self.assertIsNone(details['attestation_check_id'])
+        for field in ('phase', 'session_id', 'message_id', 'receipt', 'reason'):
+            self.assertNotIn(field, details)
+        self.assertNotIn('unsupported', str(failure)); self.assertFalse(self.posts())
+
+    @patch('workrelay.managed_control.admission')
     def test_interrupt_only_exact_session_no_inference(self, admit):
         first = self.run_control(interrupt=True)
         self.assertEqual(first['phase'], 'idle_noop')

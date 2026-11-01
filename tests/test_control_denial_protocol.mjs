@@ -64,6 +64,17 @@ test('every finite denial code and sentinel survive errors and status with safe 
   }
 });
 
+test('pre-ledger closed guard denial preserves its finite marker without manufacturing a receipt', () => {
+  const result = safeControlFailure({ error: 'PRIVATE native error', code: 'CONTROL_AUTHORIZATION_OR_VALIDATION_DENIED',
+    effect: 'not_established', replay_permitted: false, denial_code: 'MODEL_MISMATCH', denied_at_ms: null,
+    denial_stage: 'receipt_unverified', session_id: 'PRIVATE', receipt: 'PRIVATE', stack: 'PRIVATE' });
+  assert.equal(result.code, 'CONTROL_AUTHORIZATION_OR_VALIDATION_DENIED'); assert.equal(result.effect, 'not_established');
+  assert.equal(result.replay_permitted, false); assert.equal(result.denial_code, 'MODEL_MISMATCH');
+  assert.equal(result.denied_at_ms, null);
+  for (const key of ['phase', 'session_id', 'receipt', 'stack']) assert.equal(result[key], undefined);
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE/);
+});
+
 test('legacy denied operation stays unknown/null without backfill; unaffected statuses unchanged', () => {
   const legacy = { phase: 'denied', recorded_phase: 'denied', effect: 'not_applied' };
   assert.deepEqual(safeControlResult(legacy), { ...legacy, denial_code: 'DENIAL_REASON_NOT_RECORDED', denied_at_ms: null, attestation_check_id: null });

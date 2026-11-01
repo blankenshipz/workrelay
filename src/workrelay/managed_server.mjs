@@ -92,11 +92,11 @@ export function createManagedReader(expected, readBinding, { loadService = path 
     if (action === 'events' && input.server_id !== managedServerID(binding)) deny();
     let pluginSession;
     const metadataRoutes = {
-      '/__managed/attestation-provider': '/api/provider/openai',
-      '/__managed/attestation-integration': '/api/integration/openai',
+      '/__managed/attestation-provider': 'provider',
+      '/__managed/attestation-integration': 'integration',
       '/__managed/attestation-models': '/api/model',
     };
-    const metadataRoute = action === 'attestation_metadata' && Object.hasOwn(metadataRoutes, input.path) ? metadataRoutes[input.path] : undefined;
+    let metadataRoute = action === 'attestation_metadata' && Object.hasOwn(metadataRoutes, input.path) ? metadataRoutes[input.path] : undefined;
     const sessionBound = action === 'plugin_inventory' || action === 'attestation_plugin' || action === 'attestation_metadata';
     if (sessionBound) {
       // Internal, finite operation: never accept caller routing context or headers.
@@ -112,7 +112,13 @@ export function createManagedReader(expected, readBinding, { loadService = path 
           /[\x00-\x1f\x7f\\]/.test(directory) || directory.split('/').some(part => part === '.' || part === '..')) deny();
       const identity = stat(directory);
       if (!identity.isDirectory() || identity.isSymbolicLink() || canonical(directory) !== directory) deny();
-      pluginSession = { id: session.id, projectID: session.projectID, directory, dev: identity.dev, ino: identity.ino };
+      const model = session.model;
+      if (action === 'attestation_metadata') {
+        if (!model || !['openai', 'anthropic'].includes(model.providerID)) deny();
+        if (metadataRoute === 'provider' || metadataRoute === 'integration') metadataRoute = `/api/${metadataRoute}/${model.providerID}`;
+      }
+      pluginSession = { id: session.id, projectID: session.projectID, directory, dev: identity.dev, ino: identity.ino,
+        model: JSON.stringify(model) };
       if (JSON.stringify(readBinding()) !== JSON.stringify(binding)) deny();
       const before = stat(binding.service_registration);
       if (canonical(binding.service_registration) !== binding.service_registration ||
@@ -124,7 +130,7 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       if (!identity.isDirectory() || identity.isSymbolicLink() || canonical(pluginSession.directory) !== pluginSession.directory ||
           identity.dev !== pluginSession.dev || identity.ino !== pluginSession.ino) deny();
       if (after?.id !== pluginSession.id || after.projectID !== pluginSession.projectID ||
-          after.location?.directory !== pluginSession.directory || JSON.stringify(readBinding()) !== JSON.stringify(binding)) deny();
+          after.location?.directory !== pluginSession.directory || JSON.stringify(after.model) !== pluginSession.model || JSON.stringify(readBinding()) !== JSON.stringify(binding)) deny();
       const finalRegistration = stat(binding.service_registration);
       if (canonical(binding.service_registration) !== binding.service_registration || finalRegistration.dev !== registration.dev || finalRegistration.ino !== registration.ino ||
           finalRegistration.mtimeMs !== registration.mtimeMs) deny();

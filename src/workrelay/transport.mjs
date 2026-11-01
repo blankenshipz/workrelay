@@ -9,7 +9,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { createManagedReader } from './managed_server.mjs';
 import { readManagedCapability } from './mcp.mjs';
 
-const rootRoutes = new Set(['/api/plugin', '/api/integration/openai', '/api/provider/openai', '/api/model']);
+const rootRoutes = new Set(['/api/plugin', '/api/integration/openai', '/api/provider/openai', '/api/integration/anthropic', '/api/provider/anthropic', '/api/model']);
 const sessionPath = /^\/api\/session\/(ses_bridge_[0-9a-f]{32})(?:\/(prompt|message\/(msg_[0-9a-f]{32})|inbox(?:\/(msg_[0-9a-f]{32}))?|interrupt\?resume=false))?$/;
 const resultReadPath = /^\/api\/session\/(ses_bridge_[0-9a-f]{32})\/(permission|message\?[^#]+)$/;
 const fields = (value, expected) => value !== null && typeof value === 'object' && !Array.isArray(value) &&

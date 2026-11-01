@@ -82,13 +82,14 @@ def load_config(path):
     state = Path(config["state_dir"]).expanduser().resolve()
     require(state.is_dir() and state.stat().st_uid == os.getuid() and state.stat().st_mode & 0o077 == 0,
             "private state directory missing, foreign-owned or permissions too broad")
-    require(config.get("model", {}).get("providerID") == "openai" and config["model"].get("id"),
-            "model must explicitly use OpenAI OAuth; no fallback")
+    require(config.get("model", {}).get("providerID") in ("openai", "anthropic") and config["model"].get("id"),
+            "model must explicitly use supported OpenAI or Anthropic OAuth; no fallback")
     require(config.get("agent", "quick-builder") in ("quick-builder", "builder", "harness-router"),
             "coding agent must be an enabled scoped builder or harness-router")
     require(bool(re.fullmatch(r"[A-Za-z0-9_-]{1,80}", config.get("authorized_owner", ""))),
             "private configuration must declare one authorized owner")
-    require(Path(config["quota_command"]).is_file(), "quota admission command missing")
+    if config["model"]["providerID"] == "openai":
+        require(Path(config["quota_command"]).is_file(), "quota admission command missing")
     require(config.get("guard_entry") and isinstance(config.get("guard_file_hashes"), dict),
             "pinned installed guard identity missing; execution disabled")
     return config, token, directory, state
@@ -128,7 +129,7 @@ class InstalledClient:
         self.script = str(Path(__file__).with_name("transport.mjs"))
 
     def request(self, method, path, body=None):
-        provider_request = method == 'GET' and path == '/api/provider/openai'
+        provider_request = method == 'GET' and path in ('/api/provider/openai', '/api/provider/anthropic')
         if provider_request:
             self._provider_http_status = None
         try:
@@ -139,6 +140,8 @@ class InstalledClient:
             if method == 'GET' and 'managed' in self.config.get('_supervision_authority', {}):
                 path = {'/api/provider/openai': '/__managed/attestation-provider',
                         '/api/integration/openai': '/__managed/attestation-integration',
+                        '/api/provider/anthropic': '/__managed/attestation-provider',
+                        '/api/integration/anthropic': '/__managed/attestation-integration',
                         '/api/model': '/__managed/attestation-models'}.get(path, path)
             result = subprocess.run([self.config["node_executable"], self.script, self.config["_private_path"]],
                 input=json.dumps({"method": method, "path": path, "body": body,
@@ -165,15 +168,23 @@ class InstalledClient:
 
 
 def admission(config, client):
-    try:
-        result = subprocess.run([config["quota_command"], "--check"],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
-    except (OSError, subprocess.TimeoutExpired):
-        raise GuardFailure('QUOTA_UNAVAILABLE') from None
-    if result.returncode == 1:
-        raise GuardFailure('QUOTA_DENIED')
-    if result.returncode != 0:
-        raise GuardFailure('QUOTA_UNAVAILABLE')
+    provider = config.get('model', {}).get('providerID')
+    require(provider in ('openai', 'anthropic'), 'unsupported guarded provider')
+    # Codex quota is not an admission pool for Claude. Its pinned native guard
+    # enforces the operator-selected Claude policy at every actual model request.
+    if provider == 'openai':
+        quota_command = config.get('quota_command')
+        if not isinstance(quota_command, str) or not quota_command:
+            raise GuardFailure('QUOTA_UNAVAILABLE')
+        try:
+            result = subprocess.run([quota_command, "--check"],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            raise GuardFailure('QUOTA_UNAVAILABLE') from None
+        if result.returncode == 1:
+            raise GuardFailure('QUOTA_DENIED')
+        if result.returncode != 0:
+            raise GuardFailure('QUOTA_UNAVAILABLE')
     from .attestor import AttestationError, verify
     try:
         verify(config, client)

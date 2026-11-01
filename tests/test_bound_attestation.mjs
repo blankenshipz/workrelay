@@ -11,7 +11,7 @@ test('actual Python client -> release transport -> native fixtures isolates sele
   const project = dirname(dirname(fileURLToPath(import.meta.url)));
   const dir = await fs.mkdtemp(join(project, 'tests/.bound-attestation-'));
   await fs.chmod(dir, 0o700); t.after(() => fs.rm(dir, { recursive: true, force: true }));
-  const locations = { ses_one: join(dir, 'a b&%encoded'), ses_two: join(dir, 'two') };
+  const locations = { ses_one: join(dir, 'a b&%encoded'), ses_two: join(dir, 'two'), ses_claude: join(dir, 'claude') };
   for (const path of Object.values(locations)) await fs.mkdir(path);
   const files = { entry: join(dir, 'runtime/plugins/subscription-guard/index.mjs'),
     implementation: join(dir, 'runtime/plugins/subscription-guard.mjs'), financial: join(dir, 'config/guard-validation.mjs') };
@@ -20,6 +20,8 @@ test('actual Python client -> release transport -> native fixtures isolates sele
     await fs.mkdir(dirname(path), { recursive: true }); await fs.writeFile(path, '// fixture');
     pins[key] = createHash('sha256').update('// fixture').digest('hex');
   }
+  const anthropicPins={};
+  for(const [name,rel] of Object.entries({subscription:'plugins/v2/anthropic-subscription.mjs',financial_policy:'plugins/v2/anthropic-financial-policy.mjs',quota_cache:'plugins/v2/quota-cache.mjs',paths:'plugins/v2/paths.mjs',auth_entry:'plugins/v2/claude-auth/index.mjs'})){const file=join(dir,rel);await fs.mkdir(dirname(file),{recursive:true});await fs.writeFile(file,'// fixture');anthropicPins[name]=createHash('sha256').update('// fixture').digest('hex');}
   let mode = 'active', posts = 0, unscoped = 0;
   const selected = [];
   const metadataLocations = [];
@@ -27,14 +29,14 @@ test('actual Python client -> release transport -> native fixtures isolates sele
     if (req.method !== 'GET') { posts++; res.statusCode = 405; return res.end('{}'); }
     const url = new URL(req.url, 'http://fixture');
     const location = url.searchParams.get('location[directory]');
-    if (['/api/provider/openai', '/api/integration/openai', '/api/model'].includes(url.pathname)) {
+    if (['/api/provider/openai', '/api/integration/openai', '/api/provider/anthropic', '/api/integration/anthropic', '/api/model'].includes(url.pathname)) {
       if (!location) { unscoped++; res.statusCode = 404; return res.end('PRIVATE_CANARY'); }
       metadataLocations.push([url.pathname, location]);
     }
     let value;
     if (url.pathname.startsWith('/api/session/')) {
       const id = url.pathname.split('/').at(-1);
-      value = { data: locations[id] ? { id, projectID: 'project', location: { directory: locations[id] } } : null };
+      value = { data: locations[id] ? { id, projectID: 'project', model:{providerID:id==='ses_claude'?'anthropic':'openai',id:id==='ses_claude'?'claude-fixture':id==='ses_two'?'fixture_two':'fixture'}, location: { directory: locations[id] } } : null };
     } else if (url.pathname === '/api/plugin') {
       const location = url.searchParams.get('location[directory]');
       if (!location) { unscoped++; value = { data: [] }; }
@@ -43,7 +45,7 @@ test('actual Python client -> release transport -> native fixtures isolates sele
         if (mode === 'denied') { res.statusCode = 403; return res.end('PRIVATE'); }
         const guard = { id: 'subscription.guard', state: { status: mode === 'inactive' ? 'failed' : 'active' }, source: { type: 'local', path: files.entry } };
         value = { location: { directory: mode === 'wrong_location' ? locations.ses_two : location }, data:
-          mode === 'missing' ? [] : mode === 'duplicate' ? [guard, guard] : mode === 'malformed' ? [null] : [guard] };
+          mode === 'missing' ? [] : mode === 'duplicate' ? [guard, guard] : mode === 'malformed' ? [null] : [guard,{id:'griffinmartin.claude-auth',state:{status:'active'},source:{type:'local',path:join(dir,'plugins/v2/claude-auth/index.mjs')}}] };
       }
     } else if (url.pathname === '/api/provider/openai') {
       if (mode === 'provider404' || mode === 'provider403') { res.statusCode = mode === 'provider404' ? 404 : 403; return res.end('PRIVATE_CANARY'); }
@@ -54,6 +56,9 @@ test('actual Python client -> release transport -> native fixtures isolates sele
         { location: attribution, data: { id: mode === 'provider_wrong_id' ? 'foreign' : 'openai', package: location === locations.ses_two ? '@opencode/ai/providers/openai/responses' : '@opencode/ai/providers/openai' } };
     }
     else if (url.pathname === '/api/integration/openai') value = { location: { directory: location }, data: { id: 'openai', connections: [{ type: 'credential', method: 'oauth' }] } };
+    else if (url.pathname === '/api/provider/anthropic') value={location:{directory:location},data:{id:'anthropic',package:'@opencode/ai/providers/anthropic'}};
+    else if (url.pathname === '/api/integration/anthropic') value={location:{directory:location},data:{id:'anthropic',methods:[{id:'claude-code',type:'oauth'}],connections:[{type:'credential',method:'oauth'}]}};
+    else if (url.pathname === '/api/model' && location === locations.ses_claude) value={location:{directory:location},data:[{id:'claude-fixture',providerID:'anthropic',package:'@opencode/ai/providers/anthropic'}]};
     else if (url.pathname === '/api/model') value = { location: { directory: location }, data: [{ id: location === locations.ses_two ? 'fixture_two' : 'fixture', providerID: 'openai', package: '@opencode/ai/providers/openai' }] };
     else { res.statusCode = 404; value = {}; }
     res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(value));
@@ -70,11 +75,11 @@ test('actual Python client -> release transport -> native fixtures isolates sele
   const base = { server: origin, service_registration: registration, client_service_module: module, managed_supervisor_file: capability,
     managed_server: { server: origin, service_registration: registration, client_service_module: module },
     managed_identity: { issuer: binding.issuer, audience: binding.audience, principal: binding.subject },
-    node_executable: process.execPath, model: { providerID: 'openai', id: 'fixture' }, guard_entry: files.entry, guard_file_hashes: pins };
+    node_executable: process.execPath, model: { providerID: 'openai', id: 'fixture' }, guard_entry: files.entry, guard_file_hashes: pins, provider_guard_file_hashes:{anthropic:anthropicPins} };
   const configPath = join(dir, 'bridge.json');
   await fs.writeFile(configPath, JSON.stringify(base), { mode: 0o600 });
   const run = async session => {
-    const config = { ...base, model: { ...base.model, id: session === 'ses_two' ? 'fixture_two' : 'fixture' }, _fixture_diagnostic: mode.startsWith('provider'), _private_path: configPath, _supervision_authority: { managed: {
+    const config = { ...base, model: { providerID:session==='ses_claude'?'anthropic':'openai', id: session==='ses_claude'?'claude-fixture':session === 'ses_two' ? 'fixture_two' : 'fixture' }, _fixture_diagnostic: mode.startsWith('provider'), _private_path: configPath, _supervision_authority: { managed: {
       claims: { iss: binding.issuer, aud: binding.audience, sub: binding.subject, client_id: client }, session_id: session, operation_id: 'fixture-read-only' } } };
     return new Promise((resolve, reject) => {
       const child = spawn(process.env.WORKRELAY_TEST_PYTHON || 'python3', ['-c',
@@ -88,7 +93,10 @@ test('actual Python client -> release transport -> native fixtures isolates sele
   await fs.writeFile(capability, JSON.stringify(binding), { mode: 0o600 });
   assert.equal(await run('ses_one'), 'passed'); assert.equal(await run('ses_two'), 'passed');
   assert.deepEqual(selected, [locations.ses_one, locations.ses_two]);
-  assert.deepEqual(metadataLocations, Object.values(locations).flatMap(location => ['/api/provider/openai', '/api/integration/openai', '/api/model', '/api/provider/openai', '/api/integration/openai'].map(path => [path, location])));
+  assert.deepEqual(metadataLocations, [locations.ses_one,locations.ses_two].flatMap(location => ['/api/provider/openai', '/api/integration/openai', '/api/model', '/api/provider/openai', '/api/integration/openai'].map(path => [path, location])));
+  assert.equal(await run('ses_claude'),'passed');
+  assert.ok(metadataLocations.some(([path,location])=>path==='/api/provider/anthropic'&&location===locations.ses_claude));
+  assert.ok(!metadataLocations.some(([path,location])=>path==='/api/provider/openai'&&location===locations.ses_claude));
   for (mode of ['missing', 'inactive', 'duplicate', 'malformed']) assert.equal(await run('ses_one'), 'GUARD_PLUGIN_STATE');
   for (mode of ['denied', 'wrong_location']) assert.equal(await run('ses_one'), 'PLUGIN_READ_UNAVAILABLE');
   assert.equal(await run('ses_missing'), 'PLUGIN_READ_UNAVAILABLE');

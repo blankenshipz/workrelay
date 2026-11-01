@@ -17,6 +17,9 @@ from .cli import admission, BridgeError, require, GuardFailure, CONTROL_DENIAL_C
 from .supervision import redact_text
 
 
+SUPPORTED_EXISTING_SESSION_WRITE_PROVIDERS = frozenset(('openai', 'anthropic'))
+
+
 def initialize(db):
     db.execute("""CREATE TABLE IF NOT EXISTS managed_operations (
       binding TEXT NOT NULL, session TEXT NOT NULL, operation TEXT NOT NULL,
@@ -335,7 +338,7 @@ def settle_question(db, config, client, authorize, session_id, operation_id, for
         session_data = session.get('data') if isinstance(session, dict) else None
         require(identity(session_data, session_id) == current, 'session identity changed')
         model = session_data.get('model') if isinstance(session_data, dict) else None
-        require(isinstance(model, dict) and model.get('providerID') == 'openai' and set(model) <= {'providerID', 'id', 'variant'} and
+        require(isinstance(model, dict) and model.get('providerID') in SUPPORTED_EXISTING_SESSION_WRITE_PROVIDERS and set(model) <= {'providerID', 'id', 'variant'} and
                 isinstance(model.get('id'), str) and model['id'], 'native model unavailable')
         admission({**config, 'model': model}, client)
         require(authorize() == binding, 'authority changed')
@@ -490,7 +493,7 @@ def control(db, config, client, authorize, session_id, operation_id, *, text=Non
             raise GuardFailure('SESSION_READ_FAILED')
         if not interrupt:
             model = session.get('model')
-            if not (isinstance(model, dict) and model.get('providerID') == 'openai' and
+            if not (isinstance(model, dict) and model.get('providerID') in SUPPORTED_EXISTING_SESSION_WRITE_PROVIDERS and
                     set(model) <= {'providerID', 'id', 'variant'} and isinstance(model.get('id'), str) and model['id']):
                 raise GuardFailure('MODEL_MISMATCH')
             if route_model is None:
@@ -799,11 +802,14 @@ class ControlFailure(BridgeError):
 
 def classified_failure(db, authorize, operation_id, session_id, error):
     """Safe diagnostics based on durable phase, never upstream exception bodies."""
-    details = {'code': 'CONTROL_AUTHORIZATION_OR_VALIDATION_DENIED', 'effect': 'not_established'}
+    details = {'code': 'CONTROL_AUTHORIZATION_OR_VALIDATION_DENIED', 'effect': 'not_established',
+               'replay_permitted': False}
+    durable_receipt = False
     if isinstance(operation_id, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,80}', operation_id):
         details['operation_id'] = operation_id
     try:
         _, sid, row = resolve_operation(db, authorize, operation_id, session_id)
+        durable_receipt = True
         phase = row[3]
         details.update(session_id=sid, phase=phase)
         if phase in ('reserved', 'denied'):
@@ -815,6 +821,11 @@ def classified_failure(db, authorize, operation_id, session_id, error):
             details.update(code='CONTROL_RECONCILE_EXISTING', effect='recorded_existing_operation')
     except Exception:
         pass  # No global lookup or guessed session if authority/identity is unknown.
+    # No verified receipt may mean pre-reservation failure OR lost authority.
+    # Surface only the finite guard type; infer no phase, timestamp or POST fact.
+    if isinstance(error, GuardFailure) and not durable_receipt:
+        details.update(denial_stage='receipt_unverified', denial_code=error.denial_code, denied_at_ms=None,
+                       attestation_check_id=error.attestation_check_id)
     if isinstance(error, GuardFailure) and error.denial_code == 'CREATE_PROJECT_WORKSPACE_MISMATCH':
         details['reason'] = 'PROJECT_WORKSPACE_MISMATCH'
     elif isinstance(error, GuardFailure) and error.denial_code == 'OPERATION_ARGUMENT_CONFLICT':

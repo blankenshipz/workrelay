@@ -273,10 +273,12 @@ export function safeControlFailure(value) {
   const output = { error: 'Managed control denied or uncertain; inspect the original operation ID.' };
   const allowed = { code: ['CONTROL_AUTHORIZATION_OR_VALIDATION_DENIED', 'CONTROL_NOT_SENT', 'CONTROL_UNCERTAIN', 'CONTROL_RECONCILE_EXISTING', ...CONTROL_LOOKUP_CODES],
     effect: ['not_established', 'no_post_permitted', 'may_have_been_applied', 'recorded_existing_operation'],
-    reason: ['PROJECT_WORKSPACE_MISMATCH', 'OPERATION_ARGUMENT_CONFLICT'] };
+    reason: ['PROJECT_WORKSPACE_MISMATCH', 'OPERATION_ARGUMENT_CONFLICT'],
+    replay_permitted: [false] };
   for (const [key, values] of Object.entries(allowed)) if (values.includes(value?.[key])) output[key] = value[key];
   if (CONTROL_LOOKUP_CODES.includes(value?.code)) return { error: 'Operation receipt lookup is unresolved within the current authenticated binding.', ...scopedLookupFields(value) };
   if (value?.code === 'CONTROL_NOT_SENT' || value?.phase === 'denied' || value?.recorded_phase === 'denied') Object.assign(output, controlDenialFields(value));
+  if (value?.denial_stage === 'receipt_unverified' && value?.code === 'CONTROL_AUTHORIZATION_OR_VALIDATION_DENIED' && value?.effect === 'not_established' && value?.replay_permitted === false && value?.phase === undefined && CONTROL_DENIAL_CODES.includes(value?.denial_code)) Object.assign(output, {denial_stage:'receipt_unverified',...controlDenialFields({...value,denied_at_ms:null})});
   return output;
 }
 function bridge(config, command, input) {
@@ -364,6 +366,8 @@ function mcp(config, invoke, events, managedReader, eventTools) {
         }
         const output = action === 'capabilities' ? { ...await managedReader('authorize', {}, ctx.http?.authInfo?.extra?.managedClaims),
           tools: catalog, events_protocol: events ? ['events/list', 'events/subscribe', 'events/unsubscribe'] : [],
+          supported_write_providers: ['openai', 'anthropic'],
+          provider_route_admission: 'Each provider route requires guarded OAuth attestation; this is not active availability.',
           guidance: 'Use tools/list for exact schemas. Existing read includes bounded visible results, not verified task completion. Projects and agent definitions do not authorize execution. Native approvals and financial admission still apply.',
           unsupported: ['verified harness task outcome through native session metadata'],
           journey: [

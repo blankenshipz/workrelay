@@ -98,7 +98,45 @@ The required scoped-work fields are:
 }
 ```
 
-This is a template, not a ready-to-run config: replace each placeholder with a path or value verified from this installation. The workspace and state directory must already exist; `server` must be an uncredentialed loopback HTTP origin. `authorized_owner` is only a local routing label, not human authentication. `agent` must be an enabled `harness-router` or scoped builder (`quick-builder` or `builder`). Use `harness-router` with its discovered model/variant to let the installed harness delegate, pace its enabled subscription pools, and decide when review is useful. Workrelay attests the OpenAI entry route; delegated requests remain subject to the harness's own provider, permission and financial checks. Native builders remain an explicit configuration option for installations without the harness. Changing the creation default does not retarget existing conversations. Old create retries retain their argument/model identity and may report an argument conflict after a default change; inspect the original receipt and continue its existing session instead of creating a replacement. Get the model ID from the authenticated native model catalog; do not invent an ID or substitute a provider. Locate the actual active `subscription.guard` entry in the installed service, review and trust all three guard files, then compute their individual SHA-256 values with `shasum -a 256`; the files are the entry, its sibling `../subscription-guard.mjs`, and the project-root `config/guard-validation.mjs`. Store those exact digests in the matching fields—never use sample or stale pins. The attestor checks that the guard is active and those installed files match; it does not read credentials or guarantee billing behavior. OpenAI may retain several saved logins after re-authentication. Attestation follows the native selected first connection and requires that connection to be stored OAuth; it never searches later entries for an acceptable alternative. Historical connections do not by themselves block admission, and a connection change during the check invalidates it.
+This is a template, not a ready-to-run config: replace each placeholder with a path or value verified from this installation. The workspace and state directory must already exist; `server` must be an uncredentialed loopback HTTP origin. `authorized_owner` is only a local routing label, not human authentication. `agent` must be an enabled `harness-router` or scoped builder (`quick-builder` or `builder`). Use `harness-router` with its discovered model/variant to let the installed harness delegate, pace its enabled subscription pools, and decide when review is useful. Workrelay attests the selected supported OAuth entry route (OpenAI or Anthropic); delegated requests remain subject to the harness's own provider, permission and financial checks. Native builders remain an explicit configuration option for installations without the harness. Changing the creation default does not retarget existing conversations. Old create retries retain their argument/model identity and may report an argument conflict after a default change; inspect the original receipt and continue its existing session instead of creating a replacement. Get the model ID from the authenticated native model catalog; do not invent an ID or substitute a provider. Locate the actual active `subscription.guard` entry in the installed service, review and trust all three guard files, then compute their individual SHA-256 values with `shasum -a 256`; the files are the entry, its sibling `../subscription-guard.mjs`, and the project-root `config/guard-validation.mjs`. Store those exact digests in the matching fields—never use sample or stale pins. The attestor checks that the guard is active and those installed files match; it does not read credentials or guarantee billing behavior. OpenAI may retain several saved logins after re-authentication. Attestation follows the native selected first connection and requires that connection to be stored OAuth; it never searches later entries for an acceptable alternative. Historical connections do not by themselves block admission, and a connection change during the check invalidates it.
+
+Existing-session message, steer and resume operations preserve the session's exact
+native provider, model and effort. OpenAI and Anthropic are supported; other
+providers remain denied. The same rule applies to question actions that can
+resume inference. Discovery/reads are not proof of write admission.
+
+OpenAI retains its Codex quota command and subscription financial guard. Claude
+admission does not consume or check the Codex pool: it requires the active native
+Claude OAuth route and pinned guard, which enforces Claude's configured policy at
+every actual model request. A Claude-only configuration may omit `quota_command`.
+Preflight does not resolve tokens, prove a paid-credit balance, or certify billing.
+
+For Anthropic writes, additionally review and pin these installed code files under
+`provider_guard_file_hashes.anthropic` (paths are relative to the OpenCode root
+inferred from the existing guard entry):
+
+| Key | File |
+| --- | --- |
+| `subscription` | `plugins/v2/anthropic-subscription.mjs` |
+| `financial_policy` | `plugins/v2/anthropic-financial-policy.mjs` |
+| `quota_cache` | `plugins/v2/quota-cache.mjs` |
+| `paths` | `plugins/v2/paths.mjs` |
+| `auth_entry` | `plugins/v2/claude-auth/index.mjs` |
+
+Each value is the reviewed file's SHA-256, not a sample digest. Missing or changed
+pins fail closed. The active `griffinmartin.claude-auth` plugin must use that local
+entry and expose the `claude-code` OAuth method. Native credential resolution and
+the credential's subscription marker remain the runtime guard's responsibility;
+Workrelay never reads them. Provider metadata is fetched only for the exact
+session's native provider/location and revalidated against model changes. API-key,
+auth-token, endpoint and model-body overrides remain prohibited.
+
+A typed guard failure without a verified durable receipt exposes a finite
+`denial_code` and `denial_stage: receipt_unverified`. It retains
+`effect: not_established` and `replay_permitted: false`; it does not invent a
+receipt, timestamp or delivery conclusion. Inspect the original operation and
+correct the underlying route; do not replay a failed write merely because lookup
+finds no receipt.
 
 After installing the Python adapter, run its read-only check with the config you just created:
 
