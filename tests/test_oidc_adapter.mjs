@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { privateTmpdir as tmpdir } from './support/private_tmp.mjs';
 import { join } from 'node:path';
 import { createIssuerAdapter } from '../src/workrelay/oidc_adapter.mjs';
 import { validateConfig } from '../src/workrelay/mcp.mjs';

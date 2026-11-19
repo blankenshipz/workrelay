@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash, generateKeyPairSync, randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
 import { promises as fs } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { privateTmpdir as tmpdir } from './support/private_tmp.mjs';
 import { join } from 'node:path';
 import { createIssuerAdapter } from '../src/workrelay/oidc_adapter.mjs';
 import { createUnexposedIssuerPolicy, validateRefreshBinding, restrictedClientDocument, CHATGPT_CIMD_ID,

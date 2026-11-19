@@ -430,7 +430,7 @@ test('production local-only loopback gateway requires provisioned state and reje
   }
   const tokenFlood = await hammer('/token', 40);
   const revokeFlood = await hammer('/token/revocation', 20);
-  assert.ok(tokenFlood.includes(429), 'token exchange is admitted before provider');
+  assert.ok(tokenFlood.includes(429), `token exchange is admitted before provider: ${tokenFlood}`);
   assert.ok(revokeFlood.includes(429), 'revoke is admitted before provider');
   assert.ok(tokenFlood.some(status => status !== 429) && revokeFlood.some(status => status !== 429),
     'provider gets requests within available budget');
@@ -585,7 +585,7 @@ db.execute('PRAGMA wal_checkpoint(TRUNCATE)');db.close()`, join(directory, 'issu
   });
   const checkGatewayClass = async (headers, expected, expectedOrigin = 'absent') => {
     const id = await armDiagnostic();
-    const result = await rawStatus(`POST /interaction/synthetic HTTP/${headers ? '1.1' : '1.0'}\r\n${headers}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
+    const result = await rawStatus(`POST /interaction/synthetic HTTP/${headers ? '1.1' : '1.0'}\r\n${headers}Content-Length: 0\r\nConnection: close\r\n\r\n`);
     assert.equal(result, 400);
     const receipt = await diagnosticResult();
     assert.equal(receipt.attemptId, id);

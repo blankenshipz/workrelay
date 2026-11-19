@@ -1,9 +1,9 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { generateKeyPairSync } from 'node:crypto';
-import { mkdtemp, mkdir, readFile, readdir, writeFile, stat, chmod, symlink } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { mkdtemp, mkdir, readFile, readdir, writeFile, stat, chmod, symlink, rm } from 'node:fs/promises';
+import { privateTmpdir as tmpdir } from './support/private_tmp.mjs';
 import { join } from 'node:path';
 import { SignJWT, exportJWK } from 'jose';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
@@ -11,7 +11,9 @@ import { createGateway, validateConfig, CONTROL_DENIAL_CODES, ATTESTATION_CHECK_
 import { auditSettings, auditEntry, auditOutcome, createToolAudit, AUDIT_DEFAULT_MAX_BYTES } from '../src/workrelay/tool_audit.mjs';
 
 const codes = { denialCodes: CONTROL_DENIAL_CODES, checkIds: ATTESTATION_CHECK_IDS };
-const privateDir = async () => { const dir = await mkdtemp(join(tmpdir(), 'tool-audit-')); await chmod(dir, 0o700); return dir; };
+const fixtureDirs = [];
+after(() => Promise.all(fixtureDirs.map(dir => rm(dir, { recursive: true, force: true }))));
+const privateDir = async () => { const dir = await mkdtemp(join(tmpdir(), 'tool-audit-')); await chmod(dir, 0o700); fixtureDirs.push(dir); return dir; };
 const lines = async path => (await readFile(path, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
 const FIELDS = ['client_id', 'duration_ms', 'operation_key', 'session_id', 'status', 'tool', 'ts'];
 

@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import { EventEmitter } from 'node:events';
 import { promises as fs } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { privateTmpdir as tmpdir } from './support/private_tmp.mjs';
 import { join } from 'node:path';
 import argon2 from 'argon2';
 import { createManagedReader, harnessTaskOutcome, HARNESS_UNREADABLE } from '../src/workrelay/managed_server.mjs';

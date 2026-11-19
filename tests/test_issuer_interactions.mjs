@@ -5,7 +5,7 @@ import { createServer, request as httpsRequest } from 'node:https';
 import { createServer as createHttpServer, request as httpRequest } from 'node:http';
 import { execFileSync, spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { privateTmpdir as tmpdir } from './support/private_tmp.mjs';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';

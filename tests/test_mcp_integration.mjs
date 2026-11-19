@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { generateKeyPairSync, createHmac } from 'node:crypto';
 import { promises as fs } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { privateTmpdir as tmpdir } from './support/private_tmp.mjs';
 import { join } from 'node:path';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';

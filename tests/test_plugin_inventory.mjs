@@ -35,6 +35,7 @@ function fixture(change = {}) {
       }
       sessions++;
       return new Response(JSON.stringify({ data: change.missing ? null : { id: 'ses_example', projectID: 'project',
+        model: 'model' in change ? change.model : { providerID: 'openai', id: 'fixture' },
         location: { directory: change.directory ?? (change.move && sessions > 1 ? '/OTHER' : '/PRIVATE/a b&c') } } }));
     },
   });
@@ -54,7 +55,8 @@ test('internal client protocol derives encoded location, returns safe inventory,
 test('private metadata context uses same identity refusals and closed finite routes', async () => {
   for (const change of [{ missing: true }, { move: true }, { revoke: true }, { revoked: true }, { responseLocation: '/foreign' },
     { directory: '/a/../private' }, { directory: 'relative' }, { symlink: true }, { alias: true }, { notDirectory: true },
-    { canonicalChanged: true }, { deviceChanged: true }, { inodeChanged: true }, { registrationChanged: true }, { status: 401 }, { status: 403 }]) {
+    { canonicalChanged: true }, { deviceChanged: true }, { inodeChanged: true }, { registrationChanged: true }, { status: 401 }, { status: 403 },
+    { model: null }, { model: { providerID: 'foreign', id: 'fixture' } }]) {
     const f = fixture({ ...change, metadata: true });
     await assert.rejects(f.reader('attestation_metadata', { ...f.input, path: '/__managed/attestation-provider' }, f.claims));
   }

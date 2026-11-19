@@ -1,6 +1,8 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
+import { join } from 'node:path';
+import { privateTmpdir as tmpdir } from './support/private_tmp.mjs';
 import { createEventsService } from '../src/workrelay/events.mjs';
 const server = 'srv_' + 'a'.repeat(64), session = 'ses_ready_fixture';
 const secret = 'whsec_' + Buffer.alloc(32, 8).toString('base64');
@@ -8,8 +10,10 @@ const params = (extra = {}) => ({ name: 'session.needs_input', arguments: { serv
 const page = (items = [], next_cursor = null) => ({ server_id: server, items, next_cursor });
 const item = { session_id: session, state: 'needs_input', decisions: ['per_ready_fixture'] };
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
+const fixtureDirs = [];
+after(() => Promise.all(fixtureDirs.map(dir => fs.rm(dir, { recursive: true, force: true }))));
 async function fixture(observe) {
-  const dir = await fs.mkdtemp('/private/tmp/opencode/managed-ready-test-'); await fs.chmod(dir, 0o700);
+  const dir = await fs.mkdtemp(join(tmpdir(), 'managed-ready-test-')); await fs.chmod(dir, 0o700); fixtureDirs.push(dir);
   const path = dir + '/events.json'; let authorized = true, delivered = 0;
   const events = createEventsService({ statePath: path, principal: 'ready-owner', authorize: async () => authorized,
     observeManaged: observe, transport: async (_url, request) => { const value = JSON.parse(request.body); if (!value.type) delivered++; return { status: 200, body: JSON.stringify({ challenge: value.challenge }) }; } });

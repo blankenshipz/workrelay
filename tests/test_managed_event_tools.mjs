@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
+import { privateTmpdir as tmpdir } from './support/private_tmp.mjs';
 import { createHmac } from 'node:crypto';
 import { createEventsService } from '../src/workrelay/events.mjs';
 import { createManagedEventTools, managedEventToolDefinitions } from '../src/workrelay/managed_event_tools.mjs';
@@ -12,7 +13,7 @@ const claims = { iss: identity.issuer, aud: identity.audience, sub: identity.pri
 const secret = 'whsec_' + Buffer.alloc(32, 27).toString('base64');
 const subscription = (name = 'session.progress', sid = session) => ({ name, arguments: { server_id: server, ...(sid ? { session_id: sid } : {}) }, delivery: { mode: 'webhook', url: 'https://receiver.example/callback?token=SYNTHETIC_PRIVATE_TOKEN', secret } });
 async function fixture(t) {
-  const dir = await fs.mkdtemp('/private/tmp/opencode/workrelay-event-tools-'); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const dir = await fs.mkdtemp(join(tmpdir(), 'workrelay-event-tools-')); await fs.chmod(dir, 0o700); t.after(() => fs.rm(dir, { recursive: true, force: true }));
   let active = true, time = Date.now(), phase = 'running', response = 200; const calls = [];
   const config = { statePath: join(dir, 'events.json'), principal: 'alice', now: () => time,
     authorize: async (principal, _task, _name, filter) => active && principal === 'alice' && filter?.server_id === server,

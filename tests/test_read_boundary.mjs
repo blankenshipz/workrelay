@@ -72,6 +72,12 @@ test('native stages retain failure location without changing results, errors or 
         if (mode === 'shape') return Response.json({ data: [{ id: 'PRIVATE' }] });
         return Response.json({ data: [{ id: 'msg_fixture', type: 'user', text: 'Visible fixture' }] });
       }
+      // read also consults the native active map, per-session permissions and
+      // the child-session listing; answer each route with its own native shape.
+      if (url.pathname === '/api/session/active') return Response.json({ data: {} });
+      if (url.pathname === '/api/session/ses_fixture/permission') return Response.json({ data: [] });
+      if (url.pathname === '/api/session') return Response.json({ data: [], cursor: {} });
+      assert.equal(url.pathname, '/api/session/ses_fixture');
       return Response.json({ data: { id: 'ses_fixture', projectID: 'fixture', title: 'Fixture', time: { idle: 1 } } });
     },
   });
