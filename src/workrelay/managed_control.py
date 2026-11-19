@@ -18,6 +18,12 @@ from .supervision import redact_text
 
 
 SUPPORTED_EXISTING_SESSION_WRITE_PROVIDERS = frozenset(('openai', 'anthropic'))
+SUPPORTED_CREATE_PROVIDERS = SUPPORTED_EXISTING_SESSION_WRITE_PROVIDERS
+CREATE_AGENTS = ('quick-builder', 'builder', 'harness-router')
+# 'agent_default' (default): stamp the target agent's own configured native
+# model; the profile `model` is used only when the agent defines none.
+# 'profile': explicit operator opt-in to force the profile `model`.
+CREATE_MODEL_SOURCES = ('agent_default', 'profile')
 
 
 def initialize(db):
@@ -156,7 +162,8 @@ def native_waits(client, authorize, session_id, *, limit=20):
     The installed V2 schema provides session.permission.list/get/reply, but no
     question list/reply/reject route. Do not manufacture question responses by
     treating ordinary owner messages as native decisions. Human permission
-    decisions stay in the native approval UI; no model-supplied approval boolean.
+    decisions stay with a human operator (operator approval page or native UI);
+    no model-supplied approval boolean.
     """
     require(isinstance(session_id, str) and bool(re.fullmatch(r'ses[A-Za-z0-9_-]{1,160}', session_id)), 'invalid session')
     require(type(limit) is int and 1 <= limit <= 50, 'invalid wait limit')
@@ -187,7 +194,7 @@ def native_waits(client, authorize, session_id, *, limit=20):
                           'resources_omitted': max(0, len(item['resources']) - 3),
                           'content_trust': 'untrusted_native_request_text',
                           'requires_explicit_human_decision': True,
-                          'respond_via': 'native_opencode_or_openchamber_permission_ui'})
+                          'respond_via': 'human_operator_approval_page_or_native_ui'})
     forms = get(f'/api/session/{session_id}/form')
     require(isinstance(forms, dict) and isinstance(forms.get('data'), list) and len(forms['data']) <= 1000,
             'native form state unavailable or exceeds bound')
@@ -220,7 +227,7 @@ def native_waits(client, authorize, session_id, *, limit=20):
             'pending_question_count': len(questions), 'questions': questions,
             'truncated': len(seen) > len(items) or len(question_ids) > len(questions), 'inference_started': False,
             'native_permission_reply_exposed': False, 'native_question_reply_exposed': True,
-            'guidance': 'Permission requests remain native-UI-only in the native approval UI. For a listed core question form, use the exact explicit question reply/cancel action; queued text never answers it. Messages, resume, and server-wide authorization do not approve permission requests. No blanket approval is available.',
+            'guidance': 'Permission requests require a human operator decision in the workrelay operator approval page (/operator/permissions, when enabled) or a native OpenCode UI; the operator may be notified automatically. This caller cannot approve them. Pending requests of child sessions appear in workrelay_server_read. For a listed core question form, use the exact explicit question reply/cancel action; queued text never answers it. Messages, resume, and server-wide authorization do not approve permission requests. No blanket approval is available.',
             'ordinary_follow_up': 'Use same-session message/steer for normal visible conversation only, not as a native permission/question reply.',
             'task_outcome': 'unverified'}
 
@@ -597,19 +604,66 @@ def creation_session_id(binding, operation_id):
     return 'ses_workrelay_' + hashlib.sha256((binding + '\0create\0' + operation_id).encode()).hexdigest()[:32]
 
 
-def create_body(config, binding, operation_id, directory, title, *, verified_project_root=None):
+def create_route_model(model):
+    """Same exact-reference shape the attestor accepts, restricted to create providers."""
+    return (isinstance(model, dict) and set(model) <= {'providerID', 'id', 'variant'} and
+            {'providerID', 'id'} <= set(model) and model['providerID'] in SUPPORTED_CREATE_PROVIDERS and
+            all(isinstance(value, str) and 0 < len(value) <= 200 and value.isprintable() for value in model.values()))
+
+
+def anthropic_pins_configured(config):
+    from .attestor import ANTHROPIC_PIN_PATHS
+    pins = config.get('provider_guard_file_hashes')
+    pins = pins.get('anthropic') if isinstance(pins, dict) else None
+    return (isinstance(pins, dict) and set(pins) == set(ANTHROPIC_PIN_PATHS) and
+            all(isinstance(value, str) and re.fullmatch(r'[0-9a-f]{64}', value) for value in pins.values()))
+
+
+def create_model(config, directory, get):
+    """Resolve the model stamped on a new managed session (no inference).
+
+    By default this is the target agent's own native configured model at the
+    creation location, so a harness agent runs on the model its operator
+    configured for it. The profile `model` is only a fallback for an agent
+    without one, or an explicit override with managed_create_model='profile'.
+    An unavailable/foreign agent definition fails closed; it never silently
+    falls back. The result is validated by create_body and later attested.
+    """
+    source = config.get('managed_create_model', 'agent_default')
+    require(source in CREATE_MODEL_SOURCES, 'invalid creation model policy')
+    if source == 'profile':
+        return config.get('model')
+    agent = config.get('agent', 'quick-builder')
+    require(agent in CREATE_AGENTS, 'invalid attested create route')
+    found = get(f'/api/agent/{agent}?' + urlencode({'location[directory]': directory}))
+    data = found.get('data') if isinstance(found, dict) else None
+    require(isinstance(data, dict) and data.get('id') == agent, 'target agent definition unavailable')
+    return config.get('model') if data.get('model') is None else data['model']
+
+
+def check_create_workspace(config, directory, title, verified_project_root=None):
     require(isinstance(directory, str) and Path(directory).is_dir() and str(Path(directory).resolve()) == directory,
             'canonical existing workspace required')
     allowed = config.get('managed_allowed_directories', [config.get('directory')])
     require(isinstance(allowed, list) and (directory in allowed or directory == verified_project_root), 'workspace not authorized for creation')
     require(isinstance(title, str) and 0 < len(title.strip()) <= 160 and not any(ord(c) < 32 for c in title), 'invalid title')
-    require(config.get('agent', 'quick-builder') in ('quick-builder', 'builder', 'harness-router') and
-            isinstance(config.get('model'), dict) and config['model'].get('providerID') == 'openai', 'invalid attested create route')
+
+
+def create_body(config, binding, operation_id, directory, title, *, verified_project_root=None, model=None):
+    model = config.get('model') if model is None else model
+    check_create_workspace(config, directory, title, verified_project_root)
+    require(config.get('agent', 'quick-builder') in CREATE_AGENTS and create_route_model(model), 'invalid attested create route')
+    # Creation starts no inference. Anthropic sessions are created only for a
+    # profile with the complete provider-bound Claude guard pin set (the same
+    # shape attestation requires); create_session also hash-checks the files.
+    # Every later message/steer/resume still runs full admission.
+    if model['providerID'] == 'anthropic':
+        require(anthropic_pins_configured(config), 'invalid attested create route')
     metadata = {'workrelayOperation': operation_id, 'workrelayBinding': binding}
     if verified_project_root is not None:
         metadata['workrelayProjectRootHash'] = hashlib.sha256(verified_project_root.encode()).hexdigest()
     return {'id': creation_session_id(binding, operation_id), 'title': title,
-            'location': {'directory': directory}, 'model': config['model'],
+            'location': {'directory': directory}, 'model': model,
             'agent': config.get('agent', 'quick-builder'),
             'metadata': metadata}
 
@@ -644,8 +698,17 @@ def validated_create_target(config, binding, operation_id, directory, title, pro
             raise GuardFailure('CREATE_PROJECT_WORKSPACE_MISMATCH')
     elif directory is None:
         directory = config.get('directory')
-    body = create_body(config, binding, operation_id, directory, title,
-                       verified_project_root=project_root if project_root != '/' else None)
+    verified_root = project_root if project_root != '/' else None
+    # Only an already-authorized canonical workspace is used as the agent location.
+    check_create_workspace(config, directory, title, verified_root)
+    model = create_model(config, directory, get)
+    body = create_body(config, binding, operation_id, directory, title, verified_project_root=verified_root, model=model)
+    if body['model']['providerID'] == 'anthropic':
+        from .attestor import AttestationError, verify_local_pins
+        try:
+            verify_local_pins(config, 'anthropic')
+        except AttestationError as error:
+            raise GuardFailure('ATTESTATION_FAILED', attestation_check_id=error.check_id) from None
     return body, project_root, directory
 
 

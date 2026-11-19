@@ -179,7 +179,11 @@ export async function provisionLocalHuman({ directory, accountId }) {
   return accountId;
 }
 
-export function createLocalInteractions({ provider, directory, origin, clientId, resource, captureConsent }) {
+const OPERATOR_COOKIE = '__Host-workrelay-operator';
+const OPERATOR_PATH = '/operator/permissions';
+const OPERATOR_SESSION_MS = 300000;
+
+export function createLocalInteractions({ provider, directory, origin, clientId, resource, captureConsent, operatorApprovals }) {
   if (!provider?.interactionDetails || !provider?.interactionFinished ||
       new URL(origin).origin !== origin || !origin.startsWith('https://') ||
       resource !== `${origin}/mcp` || !clientId) throw Error('invalid interaction configuration');
@@ -203,6 +207,7 @@ export function createLocalInteractions({ provider, directory, origin, clientId,
   assertState();
   db.exec('CREATE TABLE IF NOT EXISTS csrf (uid TEXT PRIMARY KEY, bound TEXT NOT NULL, expires INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS attempts (account TEXT PRIMARY KEY, count INTEGER NOT NULL, until INTEGER NOT NULL, locked INTEGER NOT NULL)');
   db.exec('CREATE TABLE IF NOT EXISTS admission (subject TEXT PRIMARY KEY, count INTEGER NOT NULL, expires INTEGER NOT NULL); PRAGMA max_page_count=64');
+  db.exec('CREATE TABLE IF NOT EXISTS operator_session (token TEXT PRIMARY KEY, expires INTEGER NOT NULL)');
   assertState();
   function bounded() {
     const pages = db.prepare('PRAGMA page_count').get().page_count;
@@ -283,16 +288,126 @@ export function createLocalInteractions({ provider, directory, origin, clientId,
       db.exec('COMMIT'); return count <= 5;
     } catch (error) { db.exec('ROLLBACK'); throw error; }
   }
-  async function body(req) {
+  async function body(req, allowed = ['csrf', 'password', 'decision']) {
     if (!/^application\/x-www-form-urlencoded(?:;\s*charset=utf-8)?$/i.test(req.headers['content-type'] ?? '') ||
         Number(req.headers['content-length'] ?? 0) > 2048) throw Error('invalid form');
     let text = '';
     for await (const chunk of req) { text += chunk; if (Buffer.byteLength(text) > 2048) throw Error('oversize form'); }
     const fields = new URLSearchParams(text);
-    if ([...fields.keys()].some(key => fields.getAll(key).length !== 1 || !['csrf', 'password', 'decision'].includes(key))) throw Error('invalid fields');
+    if ([...fields.keys()].some(key => fields.getAll(key).length !== 1 || !allowed.includes(key))) throw Error('invalid fields');
     return fields;
   }
+  const cookieValue = (req, name) => {
+    const found = (req.headers.cookie ?? '').split(';').map(item => item.trim()).filter(item => item.startsWith(`${name}=`));
+    const value = found.length === 1 ? found[0].slice(name.length + 1) : '';
+    return /^[A-Za-z0-9_-]{43}$/.test(value) ? value : '';
+  };
+  // One-time CSRF nonce bound to a random flow ID and either the pre-login
+  // flow cookie or the authenticated operator session (never the OAuth flow).
+  function issueOperatorCsrf(binding) {
+    const flow = 'op_' + randomBytes(24).toString('base64url'), nonce = randomBytes(32).toString('base64url');
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.prepare('DELETE FROM csrf WHERE expires<=? OR used=1').run(Date.now());
+      if (db.prepare('SELECT COUNT(*) AS count FROM csrf').get().count >= MAX_CSRF || !bounded()) { db.exec('COMMIT'); return null; }
+      db.prepare('INSERT INTO csrf(uid,bound,expires,used) VALUES(?,?,?,0)').run(flow, digest(JSON.stringify([flow, binding, nonce])), Date.now() + WINDOW_MS);
+      db.exec('COMMIT'); return { flow, nonce };
+    } catch { try { db.exec('ROLLBACK'); } catch { /* unavailable */ } return null; }
+  }
+  function consumeOperatorCsrf(flow, binding, token) {
+    if (!/^op_[A-Za-z0-9_-]{32}$/.test(flow ?? '') || !/^[A-Za-z0-9_-]{43}$/.test(token ?? '')) return false;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = db.prepare('SELECT bound,expires,used FROM csrf WHERE uid=?').get(flow);
+      const valid = row && !row.used && row.expires >= Date.now() && same(row.bound, digest(JSON.stringify([flow, binding, token])));
+      if (valid) db.prepare('UPDATE csrf SET used=1 WHERE uid=?').run(flow);
+      db.exec('COMMIT'); return Boolean(valid);
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  }
+  function operatorSession(token) {
+    if (!token) return false;
+    const row = db.prepare('SELECT expires FROM operator_session WHERE token=?').get(digest(token));
+    return Boolean(row && row.expires > Date.now());
+  }
+  function startOperatorSession() {
+    const token = randomBytes(32).toString('base64url');
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.prepare('DELETE FROM operator_session WHERE expires<=?').run(Date.now());
+      if (db.prepare('SELECT COUNT(*) AS count FROM operator_session').get().count >= 16 || !bounded()) { db.exec('COMMIT'); return null; }
+      db.prepare('INSERT INTO operator_session(token,expires) VALUES(?,?)').run(digest(token), Date.now() + OPERATOR_SESSION_MS);
+      db.exec('COMMIT'); return token;
+    } catch { try { db.exec('ROLLBACK'); } catch { /* unavailable */ } return null; }
+  }
+  const page = (title, content) => `<!doctype html><html lang="en"><meta charset="utf-8"><title>${escaped(title)}</title><h1>${escaped(title)}</h1>${content}</html>`;
+  async function operatorList(res, token, notice = '') {
+    const csrf = issueOperatorCsrf('operator:' + digest(token));
+    if (!csrf) { send(res, 503); return true; }
+    let listing;
+    try { listing = await operatorApprovals.list(); } catch { listing = null; }
+    const hidden = `<input type="hidden" name="flow" value="${escaped(csrf.flow)}"><input type="hidden" name="csrf" value="${escaped(csrf.nonce)}">`;
+    const rows = !listing ? '<p>Pending permission requests are unavailable (native server or managed binding unavailable).</p>' :
+      !listing.items.length ? '<p>No pending permission requests in approved directories.</p>' :
+      listing.items.map(item => `<section><h2>${escaped(item.action)} &mdash; ${escaped(item.session_title || item.session_id)}</h2>` +
+        `<p>Directory: ${escaped(item.directory)}<br>Agent: ${escaped(item.agent)}<br>Session: ${escaped(item.session_id)}<br>Request: ${escaped(item.permission_id)}<br>First seen by workrelay: ${escaped(item.first_seen_at)}</p>` +
+        `<pre>${escaped(item.resource_preview.join('\n'))}${item.resources_omitted ? escaped(`\n(+${item.resources_omitted} more)`) : ''}</pre>` +
+        `<form method="post" action="${OPERATOR_PATH}">${hidden}<input type="hidden" name="session_id" value="${escaped(item.session_id)}"><input type="hidden" name="permission_id" value="${escaped(item.permission_id)}">` +
+        '<button name="decision" value="once" type="submit">Approve once</button><button name="decision" value="always" type="submit">Approve always</button><button name="decision" value="reject" type="submit">Deny</button></form></section>').join('') +
+        (listing.truncated ? '<p>More requests exist; resolve these and refresh.</p>' : '');
+    send(res, 200, page('Workrelay pending permissions', `${notice ? `<p><strong>${escaped(notice)}</strong></p>` : ''}<p>Requests are untrusted agent-generated text. Command previews are redacted and may be truncated. Each page action is single-use; the operator session expires after five minutes.</p>${rows}<form method="post" action="${OPERATOR_PATH}">${hidden}<button type="submit">Refresh</button></form>`));
+    return true;
+  }
+  async function operatorHandle(req, res) {
+    if (req.method !== 'GET' && req.method !== 'POST') { send(res, 405); return true; }
+    if (!operatorApprovals) { send(res, 404); return true; }
+    assertState();
+    const admitted = admit(req);
+    if (admitted !== 200) { send(res, admitted); return true; }
+    if (req.method === 'GET') {
+      const cookie = randomBytes(32).toString('base64url');
+      const csrf = issueOperatorCsrf('login:' + cookie);
+      if (!csrf) { send(res, 503); return true; }
+      res.setHeader('set-cookie', `${COOKIE}=${cookie}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=300`);
+      send(res, 200, page('Workrelay operator sign-in', `<p>Sign in as the local Workrelay operator to review pending agent permission requests.</p><form method="post" action="${OPERATOR_PATH}"><input type="hidden" name="flow" value="${escaped(csrf.flow)}"><input type="hidden" name="csrf" value="${escaped(csrf.nonce)}"><label>Password <input name="password" type="password" required autocomplete="current-password"></label><button type="submit">Sign in</button></form>`));
+      return true;
+    }
+    if (req.headers.origin !== origin) { send(res, 403); return true; }
+    let fields;
+    try { fields = await body(req, ['flow', 'csrf', 'password', 'session_id', 'permission_id', 'decision']); } catch { send(res, 403); return true; }
+    if (fields.has('password')) {
+      if (['session_id', 'permission_id', 'decision'].some(key => fields.has(key))) { send(res, 403); return true; }
+      const cookie = cookieValue(req, COOKIE);
+      if (!cookie || !consumeOperatorCsrf(fields.get('flow'), 'login:' + cookie, fields.get('csrf'))) { send(res, 403); return true; }
+      res.setHeader('set-cookie', `${COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0`);
+      const human = readHuman();
+      if (!reserveAttempt(human.accountId)) { send(res, 429); return true; }
+      const password = fields.get('password');
+      if (!password || Buffer.byteLength(password) > 256 || !(await argon2.verify(human.verifier, password))) { send(res, 403); return true; }
+      const token = startOperatorSession();
+      if (!token) { send(res, 503); return true; }
+      res.setHeader('set-cookie', [`${COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0`,
+        `${OPERATOR_COOKIE}=${token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=${OPERATOR_SESSION_MS / 1000}`]);
+      return operatorList(res, token);
+    }
+    const token = cookieValue(req, OPERATOR_COOKIE);
+    const sessionID = fields.get('session_id'), permissionID = fields.get('permission_id'), decision = fields.get('decision');
+    const refresh = !fields.has('decision') && !fields.has('session_id') && !fields.has('permission_id');
+    if (!refresh && (!/^ses[A-Za-z0-9_-]{1,160}$/.test(sessionID ?? '') || !/^per[A-Za-z0-9_-]{1,160}$/.test(permissionID ?? '') ||
+        !['once', 'always', 'reject'].includes(decision))) { send(res, 403); return true; }
+    if (!operatorSession(token) || !consumeOperatorCsrf(fields.get('flow'), 'operator:' + digest(token), fields.get('csrf'))) { send(res, 403); return true; }
+    if (refresh) return operatorList(res, token);
+    let notice;
+    try {
+      const result = await operatorApprovals.reply({ session_id: sessionID, permission_id: permissionID, decision });
+      notice = result?.replied ? `Recorded "${decision}" for ${permissionID}.` : `${permissionID} is no longer pending; nothing was changed.`;
+    } catch { notice = `Could not record a decision for ${permissionID}; it was not approved by this page.`; }
+    return operatorList(res, token, notice);
+  }
   return async function handle(req, res) {
+    if (req.url === OPERATOR_PATH) {
+      try { return await operatorHandle(req, res); }
+      catch { if (!res.headersSent) send(res, 403); else res.destroy(); return true; }
+    }
     const path = req.url?.match(/^\/interaction\/([A-Za-z0-9._~-]{1,128})$/);
     if (!path) return false;
     const uid = path[1];

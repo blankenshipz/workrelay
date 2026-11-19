@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Managed create allows Anthropic routes only when the complete `provider_guard_file_hashes.anthropic` pin set is configured, and the pinned guard files currently match before the session is created. Incomplete, malformed or mismatched pins deny the create. Later writes still run full attestation.
+- Managed create now stamps the target agent's own configured native model (`GET /api/agent/<agent>` at the creation location) instead of always forcing the profile `model`. The profile model is a fallback only for agents without a model, or an explicit override via `managed_create_model: "profile"`. An unavailable agent definition denies the create; there is no silent fallback. The guarded transport independently re-resolves the model before the native POST. Resolved models pass the same exact-reference, provider and pin checks.
+- Read surfaces pending native permission requests across the session tree (per-session lists; the location-scoped global list is not used): `blocked_on_permission`, sanitized `pending_permissions`, `children` with running/idle/blocked status, and an `aggregate_status` that never reports a finished tree while children run or are blocked. Discover adds a compact per-session `tree` summary.
+- Optional `harness_state_dir`: read reports the opencode-usage-harness task intent and per-check status (self-reported) for the root session; otherwise the reason states the checks are not readable by workrelay.
+- Human-only permission approval page at `/operator/permissions` (`operator_approvals`), behind the operator password, single-use CSRF, Origin checks and rate limits. No MCP tool can approve. Optional deduplicated, non-blocking notification hook (`notify_command` / `notify_webhook_url`) sends summary fields only.
+- Gateway tool-call audit log (`audit_log`): one JSON line per tool call with ids, duration and a closed status/error category only. Defaults to `<issuer_state_dir>/tool-audit.jsonl`, `0600`, with bounded rotation. Write failures never affect calls.
+
 ## 0.2.0 — 2026-11-19
 
 ### Native questions and observed delivery

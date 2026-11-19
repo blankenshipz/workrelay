@@ -62,6 +62,7 @@ test('managed location reads require a durable bound create body', async () => {
   const server = createServer(async (req, res) => {
     if (req.url.startsWith('/api/location?')) { locations++; res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ directory, project: { id: nativeProject, directory, canonical: directory } })); }
     if (req.url === '/api/project') { res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify([{ id: 'stale', canonical: directory }, { id: 'current', canonical: directory }])); }
+    if (req.url.startsWith('/api/agent/quick-builder?')) { res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ location: { directory }, data: { id: 'quick-builder' } })); }
     if (req.url === '/api/session' && req.method === 'POST') { posts++; let text = ''; for await (const chunk of req) text += chunk; return res.end(JSON.stringify({ data: { ...JSON.parse(text), projectID: nativeProject } })); }
     res.statusCode = 404; res.end();
   });
@@ -101,5 +102,86 @@ test('managed location reads require a durable bound create body', async () => {
     for (const bad of [`http://managed.local${input.path}`, `//managed.local${input.path}`]) {
       input.path = bad; const deniedAlias = await invoke(); assert.equal(deniedAlias.code, 2); assert.equal(locations, beforePhase);
     }
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
+
+test('managed create model is the target agent default, independently re-resolved before POST', async () => {
+  const receipts = join(homedir(), '.workrelay-test-receipts'); await mkdir(receipts, { recursive: true, mode: 0o700 });
+  const root = await realpath(await mkdtemp(join(receipts, 'managed-agent-model-fixture-')));
+  const directory = root + '/workspace'; await mkdir(directory, { mode: 0o700 });
+  const other = root + '/other'; await mkdir(other, { mode: 0o700 });
+  const profileModel = { providerID: 'anthropic', id: 'claude-haiku-5-5', variant: 'default' };
+  const opus = { providerID: 'anthropic', id: 'claude-opus-5-5', variant: 'high' };
+  let agentModel = opus, agentID = 'harness-router', agentStatus = 200, posts = 0;
+  const agentReads = [];
+  const server = createServer(async (req, res) => {
+    res.setHeader('content-type', 'application/json');
+    if (req.url.startsWith('/api/location?')) return res.end(JSON.stringify({ directory, project: { id: 'current', directory, canonical: directory } }));
+    if (req.url === '/api/project') return res.end(JSON.stringify([{ id: 'current', canonical: directory }]));
+    if (req.url.startsWith('/api/agent/')) {
+      agentReads.push(req.url);
+      if (agentStatus !== 200) { res.statusCode = agentStatus; return res.end(); }
+      return res.end(JSON.stringify({ location: { directory }, data: { id: agentID, ...(agentModel === undefined ? {} : { model: agentModel }) } }));
+    }
+    if (req.url === '/api/session' && req.method === 'POST') { posts++; let text = ''; for await (const chunk of req) text += chunk; return res.end(JSON.stringify({ data: { ...JSON.parse(text), projectID: 'current' } })); }
+    res.statusCode = 404; res.end();
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const binding = { enabled: true, revoked: false, issuer: 'https://fixture.test', audience: 'https://fixture.test/mcp', subject: 'fixture', client_id: 'https://chatgpt.com/oauth/client.json', server: `http://127.0.0.1:${server.address().port}`, service_registration: root + '/service.json', client_service_module: root + '/client.mjs' };
+    await writeFile(binding.service_registration, JSON.stringify({ url: binding.server }), { mode: 0o600 });
+    await writeFile(binding.client_service_module, `import {readFileSync} from 'node:fs'; export const discover=async ({file})=>({...JSON.parse(readFileSync(file)),auth:{fixture:true}}); export const headers=()=>({});`, { mode: 0o600 });
+    await writeFile(root + '/capability.json', JSON.stringify(binding), { mode: 0o600 });
+    const config = { ...binding, state_dir: root, model: profileModel, agent: 'harness-router', managed_allowed_directories: [directory], managed_server: binding, managed_identity: { issuer: binding.issuer, audience: binding.audience, principal: binding.subject }, managed_supervisor_file: root + '/capability.json' };
+    const writeConfig = extra => writeFile(root + '/config.json', JSON.stringify({ ...config, ...extra }), { mode: 0o600 });
+    await writeConfig({});
+    const bindingID = createHash('sha256').update(JSON.stringify(binding)).digest('hex');
+    const sid = 'ses_agent_model_fixture', operation = 'agentmodelfixture';
+    const ledger = sql => { const db = new DatabaseSync(join(root, 'managed-control.sqlite')); try { sql(db); } finally { db.close(); } };
+    ledger(db => {
+      db.exec('CREATE TABLE managed_operations(binding TEXT,session TEXT,operation TEXT,kind TEXT,digest TEXT,message TEXT,phase TEXT,identity TEXT)');
+      db.prepare('INSERT INTO managed_operations VALUES(?,?,?,?,?,?,?,?)').run(bindingID, sid, operation, 'create', 'args-v2:fixture', 'current', 'reserved', '{}');
+    });
+    const claims = { iss: binding.issuer, aud: binding.audience, sub: binding.subject, client_id: binding.client_id };
+    const invoke = input => new Promise(resolve => {
+      const child = spawn(process.execPath, [fileURLToPath(new URL('../src/workrelay/transport.mjs', import.meta.url)), root + '/config.json'], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, NODE_NO_WARNINGS: '1' } });
+      let out = ''; child.stdout.on('data', chunk => { out += chunk; });
+      child.stdin.end(JSON.stringify({ ...input, managed: { session_id: sid, operation_id: operation, claims } })); child.on('close', code => resolve({ code, out }));
+    });
+    const agentGet = (dir, agent = 'harness-router') => ({ method: 'GET', body: null, path: `/api/agent/${agent}?` + new URLSearchParams({ 'location[directory]': dir }) });
+
+    // Reserved create: exact configured agent at an authorized location only.
+    const read = await invoke(agentGet(directory)); assert.equal(read.code, 0); assert.deepEqual(JSON.parse(read.out).data.data.model, opus);
+    const reads = agentReads.length;
+    for (const denied of [agentGet(other), agentGet(directory, 'harness-builder'), agentGet('relative'),
+      { ...agentGet(directory), path: agentGet(directory).path + '&location%5Bdirectory%5D=' + encodeURIComponent(other) },
+      { ...agentGet(directory), path: `http://managed.local${agentGet(directory).path}` }]) {
+      assert.equal((await invoke(denied)).code, 2, denied.path);
+    }
+    assert.equal(agentReads.length, reads, 'denied agent reads never reach native');
+
+    // POST: body model must equal the agent's model resolved now, not the profile pin.
+    const body = model => ({ id: sid, title: 'Fixture', location: { directory }, model, agent: 'harness-router', metadata: { workrelayBinding: bindingID, workrelayOperation: operation } });
+    const post = async model => {
+      ledger(db => db.prepare("UPDATE managed_operations SET identity=?,phase='sending'").run(JSON.stringify(body(model))));
+      return (await invoke({ method: 'POST', path: '/api/session', body: body(model) })).code;
+    };
+    assert.equal(await post(profileModel), 2); assert.equal(posts, 0, 'profile pin no longer overrides agent model');
+    assert.equal(await post(opus), 0); assert.equal(posts, 1);
+    agentModel = { ...opus, variant: 'low' }; assert.equal(await post(opus), 2, 'agent model drift blocks POST'); agentModel = opus;
+    agentStatus = 404; assert.equal(await post(opus), 2); assert.equal(await post(profileModel), 2, 'unavailable agent never falls back'); agentStatus = 200;
+    agentID = 'other'; assert.equal(await post(opus), 2, 'foreign agent definition denied'); agentID = 'harness-router';
+    agentModel = undefined; assert.equal(await post(profileModel), 0, 'agent without model falls back to profile'); assert.equal(posts, 2);
+    agentModel = opus;
+    await writeConfig({ managed_create_model: 'profile' });
+    const before = agentReads.length;
+    assert.equal(await post(opus), 2); assert.equal(await post(profileModel), 0, 'explicit profile override'); assert.equal(posts, 3);
+    assert.equal(agentReads.length, before, 'profile override needs no agent read');
+    await writeConfig({ managed_create_model: 'bogus' }); assert.equal(await post(profileModel), 2); assert.equal(await post(opus), 2);
+    await writeConfig({ agent: '../session' }); assert.equal(await post(opus), 2);
+    assert.equal(posts, 3);
+    // A non-reserved create cannot read agent definitions.
+    await writeConfig({});
+    assert.equal((await invoke(agentGet(directory))).code, 2);
   } finally { await new Promise(resolve => server.close(resolve)); }
 });

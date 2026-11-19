@@ -891,6 +891,14 @@ class ManagedControlTests(unittest.TestCase):
             self.db.execute("UPDATE managed_operations SET attestation_check_id='non-enum-private' ")
 
 
+def agent_fixture(path, model=None):
+    """Native agent.get envelope; no model means the agent defines none."""
+    from urllib.parse import urlsplit
+    agent = urlsplit(path).path.removeprefix('/api/agent/')
+    return {'location': {'directory': '/PRIVATE'}, 'data': {'id': agent, 'name': agent, 'mode': 'primary', 'hidden': False,
+            'request': {'settings': {}, 'headers': {}, 'body': {}}, 'permissions': [], **({'model': copy.deepcopy(model)} if model else {})}}
+
+
 class CreationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
@@ -906,6 +914,8 @@ class CreationTests(unittest.TestCase):
     def request(self, method, path, body=None):
         self.calls.append((method, path, copy.deepcopy(body)))
         if path == '/api/project': return getattr(self, 'project_records', [{'id': 'project', 'canonical': self.directory}])
+        if method == 'GET' and path.startswith('/api/agent/'):
+            return agent_fixture(path, getattr(self, 'agent_model', None))
         if path.startswith('/api/location?'):
             from urllib.parse import parse_qs, urlsplit
             directory = parse_qs(urlsplit(path).query)['location[directory]'][0]
@@ -1249,7 +1259,10 @@ class NativeWaitTests(unittest.TestCase):
         self.assertTrue(result['items'][0]['requires_explicit_human_decision'])
         self.assertFalse(result['native_permission_reply_exposed'])
         self.assertTrue(result['native_question_reply_exposed'])
-        self.assertIn('approval UI', result['guidance'])
+        # Headless servers have no native UI: point at the human-only operator page.
+        self.assertIn('/operator/permissions', result['guidance'])
+        self.assertIn('cannot approve', result['guidance'])
+        self.assertEqual(result['items'][0]['respond_via'], 'human_operator_approval_page_or_native_ui')
         for secret in ('synthetic-sensitive', 'synthetic-private-token', 'never-expose'):
             self.assertNotIn(secret, str(result))
         self.assertEqual(self.session, before); admit.assert_not_called()

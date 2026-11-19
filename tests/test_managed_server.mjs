@@ -40,13 +40,15 @@ test('managed registration read boundary is pinned, revoked, bounded and sanitiz
   const expected = { issuer: b.issuer, audience: b.audience, principal: b.subject, managed_server: { ...b } };
   const claims = { iss: b.issuer, aud: b.audience, sub: b.subject, client_id: client };
   let binding = { ...b }, endpoint = b.server, moved = false, calls = 0, during, foreign = false, messageRevocation = false, surfaceText, wrongSelection = false, nativeActive = {}, nativeForms = [];
+  let nativeChildren = {}, nativePermissions = {};
   const reader = createManagedReader(expected, () => ({ ...binding }), {
     canonical: path => moved ? '/replacement' : path,
     stat: () => ({ isFile: () => true, isDirectory: () => true, isSymbolicLink: () => false, uid: process.getuid(), mode: 0o600, dev: 1, ino: 1, mtimeMs: 1 }),
     loadService: async () => ({ discover: async args => { assert.equal(args.file, b.service_registration); return { url: endpoint, auth: {} }; }, headers: () => ({}) }),
     fetcher: async (url, options) => {
       calls++; assert.equal(options.method, 'GET'); assert.equal(options.redirect, 'manual');
-      if (url.pathname.endsWith('/permission')) return new Response(JSON.stringify({ data: [] }));
+      if (url.pathname.endsWith('/permission')) return new Response(JSON.stringify({ data: nativePermissions[url.pathname.split('/')[3]] ?? [] }));
+      if (url.pathname === '/api/session' && url.searchParams.has('parentID')) return new Response(JSON.stringify({ data: nativeChildren[url.searchParams.get('parentID')] ?? [], cursor: {} }));
       if (url.pathname.endsWith('/form')) return new Response(JSON.stringify({ data: nativeForms }));
       if (url.pathname === '/api/session/active') return new Response(JSON.stringify({ data: nativeActive }));
       if (url.searchParams.has('search')) assert.equal(url.searchParams.get('search'), 'release notes');
@@ -101,7 +103,7 @@ test('managed registration read boundary is pinned, revoked, bounded and sanitiz
   nativeForms = []; nativeActive = {};
   const callsBeforeContext = calls;
   const context = (await reader('read', { session_id: root, include_messages: true, limit: 3 }, claims)).context;
-  assert.equal(calls - callsBeforeContext, 3, 'activity is projected from the existing session, active, and message reads only');
+  assert.equal(calls - callsBeforeContext, 5, 'activity is projected from the existing session, active, permission, child-list and message reads only');
   assert.equal(context.next_cursor, 'older');
   assert.equal(context.items[0].text, 'Please repair navigation token=[REDACTED]');
   assert.equal(context.items[1].text, 'Implemented navigation; live acceptance pending.');
@@ -127,7 +129,7 @@ test('managed registration read boundary is pinned, revoked, bounded and sanitiz
   assert.doesNotMatch(JSON.stringify(context), /SECRET|HIDDEN|PRIVATE_COMMAND|PRIVATE_PROVIDER|PRIVATE_TOOL_NAME/);
   const callsBeforeMetadataOnly = calls;
   const metadataOnly = await reader('read', { session_id: root }, claims);
-  assert.equal(calls - callsBeforeMetadataOnly, 2, 'include_messages:false retains its session-and-active-only reads');
+  assert.equal(calls - callsBeforeMetadataOnly, 4, 'include_messages:false reads session, active, own permissions and direct children only');
   assert.deepEqual(metadataOnly.context, { omission: 'Request include_messages:true for visible context.' });
   // Synthetic established formats, independently exercised through every public text surface.
   for (const credential of ['Basic dGVzdDpmaXh0dXJl', 'AKIA' + 'A'.repeat(16),
@@ -281,6 +283,7 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
       { type: 'tool', id: formMessage.metadata.tool.id, name: 'question', state: { status: 'running' } }
     ] } }));
     if (req.url.includes('/message/')) { res.statusCode = 404; return res.end('{}'); }
+    if (req.url.startsWith('/api/session?') && new URL(req.url, 'http://fixture').searchParams.has('parentID')) return res.end(JSON.stringify({ data: [], cursor: {} }));
     if (req.url.startsWith('/api/session?')) {
       if (listMode === 'empty') return res.end(JSON.stringify({ data: [], cursor: {} }));
       if (listMode === 'partial') {
@@ -401,7 +404,7 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
   const integratedReserve = createServer(); await listen(integratedReserve);
   const integratedPort = integratedReserve.address().port; await close(integratedReserve);
   const delivered = [];
-  const integrated = createGateway({ ...config, port: integratedPort, events_enabled: true, events_state_path: join(dir, 'events.sqlite'), revocation_file: revocation }, {
+  const integrated = createGateway({ ...config, port: integratedPort, events_enabled: true, events_state_path: join(dir, 'events.sqlite'), revocation_file: revocation, audit_log: { path: join(dir, 'tool-audit.jsonl') } }, {
     testIssuer: true, eventIntervalMs: 50, eventReadinessTimeoutMs: 1500, eventTransport: async (_url, request) => {
       const body = JSON.parse(request.body); delivered.push(body); return { status: 200, body: JSON.stringify({ challenge: body.challenge }) };
     }, invoke: async (_config, command, payload) => {
@@ -418,7 +421,7 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
       }
       if (payload.action === 'waits') return { session_id: payload.session_id, pending_permission_count: 1,
         items: [{ request_id: 'per_fixture', action: 'read', resource_preview: ['sanitized fixture'], requires_explicit_human_decision: true,
-          respond_via: 'native_opencode_or_openchamber_permission_ui' }], inference_started: false,
+          respond_via: 'human_operator_approval_page_or_native_ui' }], inference_started: false,
         native_permission_reply_exposed: false, native_question_reply_exposed: false };
       if (payload.action === 'inspect' && payload.operation_id === 'dot-acceptance-create-20261017-0220') return {
         phase: 'denied', recorded_phase: 'denied', kind: 'create', exact_session_exists: false, effect: 'not_applied', task_outcome: 'unverified' };
@@ -534,6 +537,20 @@ test('real MCP facade passes verified client identity to opt-in managed reads', 
   const full = await integratedCall('workrelay_server_capabilities');
   assert.deepEqual(full.result.structuredContent.supported_write_providers, ['openai', 'anthropic']);
   assert.match(full.result.structuredContent.provider_route_admission, /guarded OAuth attestation/i);
+  // Structured audit: one line per managed tool call, ids and closed outcome only.
+  const auditRaw = await fs.readFile(join(dir, 'tool-audit.jsonl'), 'utf8');
+  assert.equal((await fs.stat(join(dir, 'tool-audit.jsonl'))).mode & 0o777, 0o600);
+  assert.doesNotMatch(auditRaw, /PRIVATE|Bounded continuation|Native project idle session|outside-selected-project|whsec_|Bearer/);
+  const audited = auditRaw.trim().split('\n').map(line => JSON.parse(line));
+  const auditedCreate = audited.find(entry => entry.tool === 'workrelay_server_create' && entry.operation_key === nondefault.operation_id);
+  assert.equal(auditedCreate.status, 'ok'); assert.equal(auditedCreate.client_id, client); assert.ok(Number.isInteger(auditedCreate.duration_ms));
+  const auditedDenied = audited.find(entry => entry.operation_key === 'explicit-bad-path');
+  assert.equal(auditedDenied.status, 'error'); assert.equal(auditedDenied.tool, 'workrelay_server_create');
+  assert.ok(['denied', 'unavailable_or_denied'].includes(auditedDenied.error_category));
+  const auditedSteer = audited.filter(entry => entry.tool === 'workrelay_server_steer');
+  assert.ok(auditedSteer.some(entry => entry.session_id === root && entry.status === 'ok' && entry.client_id === client));
+  assert.ok(auditedSteer.some(entry => entry.session_id === root && entry.status === 'error' && entry.client_id === 'other'), 'wrong-client calls are audited as errors');
+  assert.equal(audited.at(-1).tool, 'workrelay_server_capabilities');
   const until = async condition => { for (let attempt = 0; attempt < 150; attempt++) { if (await condition()) return; await new Promise(resolve => setTimeout(resolve, 30)); } assert.fail('bounded native-source observation missing'); };
   assert.equal(sourceConnections, 0, 'no stream before active managed subscription');
   const eventToken = await new SignJWT({ scope: 'workrelay:tasks', client_id: client }).setProtectedHeader({ alg: 'RS256', kid: 'test' })

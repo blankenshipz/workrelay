@@ -86,6 +86,8 @@ def load_config(path):
             "model must explicitly use supported OpenAI or Anthropic OAuth; no fallback")
     require(config.get("agent", "quick-builder") in ("quick-builder", "builder", "harness-router"),
             "coding agent must be an enabled scoped builder or harness-router")
+    require(config.get("managed_create_model", "agent_default") in ("agent_default", "profile"),
+            "managed_create_model must be agent_default or profile")
     require(bool(re.fullmatch(r"[A-Za-z0-9_-]{1,80}", config.get("authorized_owner", ""))),
             "private configuration must declare one authorized owner")
     if config["model"]["providerID"] == "openai":

@@ -123,6 +123,59 @@ def payload(client, path):
     return response["data"]
 
 
+def verify_guard_pins(config, entry):
+    """Hash-check the three subscription guard files; return the install root."""
+    root = entry.parent.parent.parent.parent
+    files = {"entry": entry, "implementation": entry.parent.parent / "subscription-guard.mjs",
+             "financial": root / "config" / "guard-validation.mjs"}
+    hashes = config.get("guard_file_hashes")
+    check(isinstance(hashes, dict) and set(hashes) == set(files), 'GUARD_PIN_CONFIG')
+    for name, path in files.items():
+        expected_hash = hashes[name]
+        check(isinstance(expected_hash, str) and bool(re.fullmatch(r"[0-9a-f]{64}", expected_hash)), 'GUARD_PIN_CONFIG')
+        try:
+            check(path.is_file() and path.stat().st_uid == os.getuid() and
+                   hashlib.sha256(path.read_bytes()).hexdigest() == expected_hash,
+                  {'entry': 'GUARD_ENTRY_PIN', 'implementation': 'GUARD_IMPLEMENTATION_PIN',
+                   'financial': 'GUARD_FINANCIAL_PIN'}[name])
+        except OSError:
+            raise AttestationError(check_id='GUARD_FILE_UNAVAILABLE') from None
+    return root
+
+
+def verify_provider_pins(config, root, provider_id):
+    """Hash-check provider-bound guard files (Anthropic: the Claude OAuth guard)."""
+    if provider_id != 'anthropic':
+        return
+    provider_pins = config.get('provider_guard_file_hashes')
+    check(isinstance(provider_pins, dict), 'GUARD_PIN_CONFIG')
+    pins = provider_pins.get('anthropic')
+    check(isinstance(pins, dict) and set(pins) == set(ANTHROPIC_PIN_PATHS), 'GUARD_PIN_CONFIG')
+    for name, relative in ANTHROPIC_PIN_PATHS.items():
+        path = root / relative
+        expected_hash = pins[name]
+        check(isinstance(expected_hash, str) and bool(re.fullmatch(r'[0-9a-f]{64}', expected_hash)), 'GUARD_PIN_CONFIG')
+        try:
+            check(path.is_file() and path.stat().st_uid == os.getuid() and hashlib.sha256(path.read_bytes()).hexdigest() == expected_hash, 'GUARD_IMPLEMENTATION_PIN')
+        except OSError:
+            raise AttestationError(check_id='GUARD_FILE_UNAVAILABLE') from None
+
+
+def verify_local_pins(config, provider_id):
+    """Service-free subset of verify(): configured guard files match their pins.
+
+    Used before a managed session exists (no session-bound native read is
+    possible). It does not prove the guard is active; every later write runs
+    the full verify() against the created session's exact model.
+    """
+    raw = config.get('guard_entry')
+    check(isinstance(raw, str) and bool(raw), 'GUARD_PIN_CONFIG')
+    entry = Path(raw).expanduser().resolve()
+    check(entry.name == "index.mjs" and entry.parent.name == "subscription-guard", 'GUARD_SOURCE')
+    verify_provider_pins(config, verify_guard_pins(config, entry), provider_id)
+    return True
+
+
 def verify(config, client):
     """Check route metadata and pinned local guard files; never return raw metadata."""
     ref = config.get('model')
@@ -155,22 +208,7 @@ def verify(config, client):
     entry = Path(unquote(parsed.path)).resolve()
     expected = Path(config["guard_entry"]).expanduser().resolve()
     check(entry == expected and entry.name == "index.mjs" and entry.parent.name == "subscription-guard", 'GUARD_SOURCE')
-    root = entry.parent.parent.parent.parent
-    files = {"entry": entry, "implementation": entry.parent.parent / "subscription-guard.mjs",
-             "financial": root / "config" / "guard-validation.mjs"}
-    hashes = config["guard_file_hashes"]
-    check(set(hashes) == set(files), 'GUARD_PIN_CONFIG')
-    for name, path in files.items():
-        expected_hash = hashes[name]
-        check(isinstance(expected_hash, str) and bool(re.fullmatch(r"[0-9a-f]{64}", expected_hash)), 'GUARD_PIN_CONFIG')
-        try:
-            check(path.is_file() and path.stat().st_uid == os.getuid() and
-                   hashlib.sha256(path.read_bytes()).hexdigest() == expected_hash,
-                  {'entry': 'GUARD_ENTRY_PIN', 'implementation': 'GUARD_IMPLEMENTATION_PIN',
-                   'financial': 'GUARD_FINANCIAL_PIN'}[name])
-        except OSError:
-            raise AttestationError(check_id='GUARD_FILE_UNAVAILABLE') from None
-
+    root = verify_guard_pins(config, entry)
     if provider_id == 'anthropic':
         auth_plugins = [p for p in guard if p.get('id') == 'griffinmartin.claude-auth']
         check(len(auth_plugins) == 1 and isinstance(auth_plugins[0].get('state'), dict) and auth_plugins[0]['state'].get('status') == 'active', 'OAUTH_CONNECTION')
@@ -178,18 +216,7 @@ def verify(config, client):
         check(isinstance(auth_source, dict) and auth_source.get('type') == 'local' and isinstance(auth_source.get('path'), str), 'OAUTH_CONNECTION')
         auth_url = urlsplit(auth_source['path'])
         check(auth_url.scheme in ('', 'file') and not auth_url.netloc and not auth_url.query and not auth_url.fragment and Path(unquote(auth_url.path)).resolve() == (root / ANTHROPIC_PIN_PATHS['auth_entry']).resolve(), 'OAUTH_CONNECTION')
-        provider_pins = config.get('provider_guard_file_hashes')
-        check(isinstance(provider_pins, dict), 'GUARD_PIN_CONFIG')
-        pins = provider_pins.get('anthropic')
-        check(isinstance(pins, dict) and set(pins) == set(ANTHROPIC_PIN_PATHS), 'GUARD_PIN_CONFIG')
-        for name, relative in ANTHROPIC_PIN_PATHS.items():
-            path = root / relative
-            expected_hash = pins[name]
-            check(isinstance(expected_hash, str) and bool(re.fullmatch(r'[0-9a-f]{64}', expected_hash)), 'GUARD_PIN_CONFIG')
-            try:
-                check(path.is_file() and path.stat().st_uid == os.getuid() and hashlib.sha256(path.read_bytes()).hexdigest() == expected_hash, 'GUARD_IMPLEMENTATION_PIN')
-            except OSError:
-                raise AttestationError(check_id='GUARD_FILE_UNAVAILABLE') from None
+        verify_provider_pins(config, root, provider_id)
 
     provider_path = '/api/provider/' + provider_id
     integration_path = '/api/integration/' + provider_id

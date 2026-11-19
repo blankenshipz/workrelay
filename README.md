@@ -111,6 +111,31 @@ Claude OAuth route and pinned guard, which enforces Claude's configured policy a
 every actual model request. A Claude-only configuration may omit `quota_command`.
 Preflight does not resolve tokens, prove a paid-credit balance, or certify billing.
 
+### Managed creation model
+
+`workrelay_server_create` takes no model argument. By default
+(`"managed_create_model": "agent_default"`) a new managed session is stamped with
+the target `agent`'s own configured native model, read from OpenCode's
+`GET /api/agent/<agent>` at the creation location (for example
+`agents.harness-router.model: "anthropic/claude-opus-5-5#high"` in
+`opencode.json`). The profile `model` is used only when that agent defines no
+model. Set `"managed_create_model": "profile"` to explicitly force the profile
+`model` for every new managed session instead. An unknown value, or an agent
+definition that is unavailable (for example while OpenCode reloads its config)
+or does not match the configured agent, denies the create; it never silently
+falls back to the profile model. The CLI resolves the model after reserving the
+operation, and the guarded transport independently re-resolves it immediately
+before the native POST. A changed agent model in between denies the POST.
+
+The resolved model must pass the same create route checks as the profile model:
+an exact `{providerID, id, variant?}` reference for a supported provider
+(OpenAI or Anthropic). An Anthropic-resolved create also requires the complete
+`provider_guard_file_hashes.anthropic` pin set below, and the pinned guard files
+must currently hash to those pins. Creation starts no inference. Every later
+message, steer or resume still runs full admission/attestation against that
+session's exact model. The legacy `start` command and existing sessions are
+unaffected.
+
 For Anthropic writes, additionally review and pin these installed code files under
 `provider_guard_file_hashes.anthropic` (paths are relative to the OpenCode root
 inferred from the existing guard entry):
@@ -123,8 +148,8 @@ inferred from the existing guard entry):
 | `paths` | `plugins/v2/paths.mjs` |
 | `auth_entry` | `plugins/v2/claude-auth/index.mjs` |
 
-Each value is the reviewed file's SHA-256, not a sample digest. Missing or changed
-pins fail closed. The active `griffinmartin.claude-auth` plugin must use that local
+Each value is the reviewed file's SHA-256, not a sample digest. Missing, incomplete or changed
+pins fail closed, including for managed create. The active `griffinmartin.claude-auth` plugin must use that local
 entry and expose the `claude-code` OAuth method. Native credential resolution and
 the credential's subscription marker remain the runtime guard's responsibility;
 Workrelay never reads them. Provider metadata is fetched only for the exact
@@ -154,7 +179,7 @@ node src/workrelay/mcp.mjs /absolute/path/to/private-mcp.json
 
 Connect the client to `https://<your-configured-host>/mcp` through OAuth. Use only the approved `workrelay:tasks` scope and, for the pinned ChatGPT OIDC flow, its authorized `openid` addition. The private, default-off `issuer_preapprove_chatgpt` option skips only redundant consent after login; it does not bypass PKCE, CSRF, Origin, redirect/resource checks, or revocation.
 
-Before enabling server-wide access, follow [managed-server setup](docs/mcp-local.md#explicit-managed-server-supervisor). It binds one authenticated principal/client to one canonical local server. Existing-session inference is admitted only when the session's current native model-catalog resolution and actual integration resolve to the guarded OpenAI OAuth route. Newly created sessions use the configured creation-model default. In both cases, credentials, quota, guard, identity, and native permissions remain authoritative.
+Before enabling server-wide access, follow [managed-server setup](docs/mcp-local.md#explicit-managed-server-supervisor). It binds one authenticated principal/client to one canonical local server. Existing-session inference is admitted only when the session's current native model-catalog resolution and actual integration resolve to the guarded OpenAI OAuth route. Newly created sessions use the target agent's configured model (see [Managed creation model](#managed-creation-model)). In both cases, credentials, quota, guard, identity, and native permissions remain authoritative.
 
 ## Everyday supervision
 

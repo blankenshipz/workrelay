@@ -57,6 +57,9 @@ class CreationPreflightTests(unittest.TestCase):
         self.assertEqual(method, 'GET', 'no native POST may be reached')
         if path == '/api/project':
             return copy.deepcopy(self.projects)
+        if path.startswith('/api/agent/'):
+            agent = path.split('?')[0].removeprefix('/api/agent/')
+            return {'data': {'id': agent, 'name': agent}}  # defines no model: profile fallback
         if path.startswith('/api/location?'):
             from urllib.parse import parse_qs, urlsplit
             directory = parse_qs(urlsplit(path).query)['location[directory]'][0]

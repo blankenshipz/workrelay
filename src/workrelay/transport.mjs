@@ -173,6 +173,29 @@ async function allow(input, config, endpoint, headers) {
   return false;
 }
 
+const createAgent = config => {
+  const agent = config.agent ?? 'quick-builder';
+  return ['quick-builder', 'builder', 'harness-router'].includes(agent) ? agent : undefined;
+};
+
+// Independently re-resolve the creation model immediately before POST, with the
+// same policy as managed_control.create_model: the target agent's native model
+// at this location, else the profile model; 'profile' forces the profile model.
+// Unknown policy or unavailable/foreign agent yields undefined (deny).
+async function expectedCreateModel(config, directory, endpoint, headers) {
+  const source = config.managed_create_model ?? 'agent_default';
+  if (source === 'profile') return config.model;
+  if (source !== 'agent_default') return undefined;
+  const agent = createAgent(config);
+  if (agent === undefined) return undefined;
+  const response = await fetch(new URL(`/api/agent/${agent}?` + new URLSearchParams({ 'location[directory]': directory }), endpoint.url),
+    { headers, redirect: 'manual', signal: AbortSignal.timeout(5000) });
+  if (!response.ok) { await response.body?.cancel(); return undefined; }
+  const data = (await boundedJSON(response))?.data;
+  if (!data || typeof data !== 'object' || data.id !== agent) return undefined;
+  return data.model ?? config.model;
+}
+
 async function managedRequest(input, config, observe) {
   const authority = input.managed;
   if (!fields(authority, ['claims', 'session_id', 'operation_id']) ||
@@ -198,6 +221,25 @@ print(json.dumps(r))`;
           { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }));
         if (!row) return false;
         if (request.method === 'GET' && request.body === null) {
+          if (row[0] === 'create' && typeof request.path === 'string' && request.path.startsWith('/api/agent/')) {
+            // Creation-model resolution: only the configured agent, only at a
+            // directory the profile allowlists or the ledger-pinned project root.
+            let agentURL;
+            try { agentURL = new URL(request.path, 'http://managed.local'); } catch { return false; }
+            const keys = [...agentURL.searchParams.keys()];
+            const directory = agentURL.searchParams.get('location[directory]');
+            if (row[3] !== 'reserved' || createAgent(config) === undefined || agentURL.origin !== 'http://managed.local' || agentURL.hash ||
+                agentURL.pathname !== `/api/agent/${createAgent(config)}` || keys.length !== 1 || keys[0] !== 'location[directory]' ||
+                agentURL.searchParams.getAll('location[directory]').length !== 1 || typeof directory !== 'string' || !isAbsolute(directory)) return false;
+            const allowed = config.managed_allowed_directories ?? [config.directory];
+            if (Array.isArray(allowed) && allowed.includes(directory)) return true;
+            const projectsResponse = await fetch(new URL('/api/project', endpoint.url), { headers, redirect: 'manual', signal: AbortSignal.timeout(5000) });
+            if (!projectsResponse.ok) { await projectsResponse.body?.cancel(); return false; }
+            const projects = await boundedJSON(projectsResponse);
+            return Array.isArray(projects) && projects.length <= 10000 &&
+              projects.filter(project => project?.id === row[2]).length === 1 &&
+              projects.find(project => project?.id === row[2]).canonical === directory;
+          }
           if (row[0] === 'create') {
             const body = JSON.parse(row[4]);
             const root = body.location?.directory;
@@ -262,9 +304,10 @@ print(json.dumps(r))`;
             rootHash === createHash('sha256').update(root).digest('hex');
           const scopedProfile = Array.isArray(allowed) && allowed.includes(directory) &&
             (rootHash === undefined || rootHash === createHash('sha256').update(root).digest('hex'));
+          const expectedModel = await expectedCreateModel(config, directory, endpoint, headers);
           return request.path === '/api/session' && body.id === sid &&
-            isDeepStrictEqual(request.body, body) && isDeepStrictEqual(body.model, config.model) &&
-            body.agent === (config.agent ?? 'quick-builder') && (scopedNativeRoot || scopedProfile) &&
+            isDeepStrictEqual(request.body, body) && expectedModel !== undefined && isDeepStrictEqual(body.model, expectedModel) &&
+            body.agent === createAgent(config) && (scopedNativeRoot || scopedProfile) &&
             fields(body, ['id', 'title', 'location', 'model', 'agent', 'metadata']) &&
             fields(body.location, ['directory']) && fields(body.metadata, rootHash === undefined ? ['workrelayBinding', 'workrelayOperation'] : ['workrelayBinding', 'workrelayOperation', 'workrelayProjectRootHash']) &&
             body.metadata.workrelayBinding === binding && body.metadata.workrelayOperation === authority.operation_id;

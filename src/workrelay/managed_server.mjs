@@ -1,7 +1,7 @@
 // Explicit managed-registration authority; no session mutation or inference routes.
-import { realpathSync, lstatSync } from 'node:fs';
+import { realpathSync, lstatSync, openSync, fstatSync, readSync, closeSync, constants as fsConstants } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { dirname, relative, isAbsolute } from 'node:path';
+import { dirname, relative, isAbsolute, join, resolve as resolvePath } from 'node:path';
 import { createHash } from 'node:crypto';
 import { nativeActivity } from './native_activity.mjs';
 
@@ -44,18 +44,94 @@ export function managedText(value, limit = 4000) {
     ...(safe.length > limit ? { omission: 'text_truncated', truncated: true } : {}) };
 }
 
-function projection(session, active = false) {
+const permissionIDPattern = /^per[A-Za-z0-9_-]{1,160}$/;
+const terminalOutcomes = ['succeeded', 'failed', 'interrupted'];
+const label = (value, pattern, fallback) => typeof value === 'string' && pattern.test(value) ? value : fallback;
+const agentLabel = value => label(value, /^[A-Za-z0-9_.:-]{1,80}$/, 'unknown');
+export const HARNESS_UNREADABLE = 'Harness task checks are not readable by workrelay';
+const unreadableOutcome = reason => ({ status: 'unknown', verification: 'unverified', source: 'none', reason });
+
+// Sanitized, bounded projection of one pending native permission request. The
+// native V2 request has no creation time; first_seen_at is workrelay's own
+// earliest observation in this gateway process.
+export function permissionSummary(request, firstSeenAt, previewLimit = 160) {
+  const resources = Array.isArray(request?.resources) ? request.resources.filter(item => typeof item === 'string') : [];
+  return { permission_id: request.id, session_id: request.sessionID, action: label(request.action, /^[A-Za-z0-9_.:-]{1,64}$/, 'other'),
+    resource_preview: resources.slice(0, 3).map(item => managedText(item, previewLimit).text), resources_omitted: Math.max(0, resources.length - 3),
+    first_seen_at: firstSeenAt, content_trust: 'untrusted_native_request_text' };
+}
+
+// Read-only view of the opencode-usage-harness dispatch registry for one
+// workspace: <state>/dispatch-ownership/sha256(workspace).json. All fields are
+// harness self-reports; nothing here is independently verified by workrelay.
+export function harnessTaskOutcome(stateDir, directory, rootID, { stat = lstatSync } = {}) {
+  if (!stateDir) return unreadableOutcome(`${HARNESS_UNREADABLE} (harness_state_dir not configured).`);
+  if (typeof directory !== 'string' || !isAbsolute(directory) || !sid.test(rootID ?? ''))
+    return unreadableOutcome(`${HARNESS_UNREADABLE} (session workspace unavailable).`);
+  const file = join(stateDir, 'dispatch-ownership', createHash('sha256').update(resolvePath(directory)).digest('hex') + '.json');
+  let state, fd;
+  try {
+    for (const path of [stateDir, dirname(file)]) {
+      const entry = stat(path);
+      if (!entry.isDirectory() || entry.isSymbolicLink() || ![0, process.getuid()].includes(entry.uid) || entry.mode & 0o022) throw Error('unsafe');
+    }
+    fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+    const entry = fstatSync(fd);
+    if (!entry.isFile() || ![0, process.getuid()].includes(entry.uid) || entry.mode & 0o022 || entry.size > 4000000) throw Error('unsafe');
+    const bytes = Buffer.alloc(entry.size + 1);
+    if (readSync(fd, bytes, 0, bytes.length, 0) !== entry.size) throw Error('changed');
+    state = JSON.parse(bytes.toString('utf8', 0, entry.size));
+  } catch (error) {
+    if (error.code === 'ENOENT') return { status: 'no_task_intent', verification: 'harness_self_reported', source: 'harness_dispatch_registry',
+      reason: 'No harness task intent is registered for this workspace.' };
+    return unreadableOutcome(`${HARNESS_UNREADABLE} (registry unreadable or unsafe).`);
+  } finally { if (fd !== undefined) closeSync(fd); }
+  const intents = Object.values(state?.intents && typeof state.intents === 'object' ? state.intents : {})
+    .filter(entry => entry?.rootID === rootID && Array.isArray(entry.intent?.checks)).slice(0, 5);
+  if (!intents.length) return { status: 'no_task_intent', verification: 'harness_self_reported', source: 'harness_dispatch_registry',
+    reason: 'No harness task intent is registered for this root session.' };
+  const records = Array.isArray(state.records) ? state.records : [];
+  const tasks = intents.map(entry => {
+    const evidence = state.intentEvidence?.[JSON.stringify([entry.rootID, entry.taskId])];
+    const current = evidence?.revision === entry.revision ? evidence : undefined;
+    const checks = entry.intent.checks.slice(0, 12).map(check => ({ check_id: managedText(check?.id, 128).text,
+      status: label(current?.checks?.[check?.id]?.status, /^[a-z_]{1,32}$/, 'pending') }));
+    const workers = records.filter(record => record?.rootID === rootID && record.taskId === entry.taskId);
+    const states = {};
+    for (const record of workers) { const key = label(record.state, /^[a-z_]{1,40}$/, 'unknown'); states[key] = (states[key] ?? 0) + 1; }
+    const passed = checks.filter(check => check.status === 'passed').length;
+    const reported = label(current?.lastStatus, /^[a-z_]{1,32}$/, null), scope = label(current?.lastScope, /^[a-z_]{1,32}$/, null);
+    return { task_id: managedText(entry.taskId, 128).text, intent_revision: Number.isSafeInteger(entry.revision) ? entry.revision : null,
+      checks, checks_passed: passed, checks_total: checks.length, last_reported_status: reported, last_reported_scope: scope,
+      workers: { total: workers.length, by_state: states },
+      status: checks.some(check => ['failed', 'blocked'].includes(check.status)) ? 'checks_failing' :
+        passed === checks.length && scope === 'task' && reported === 'completed' ? 'completed' : 'in_progress' };
+  });
+  const statuses = new Set(tasks.map(task => task.status));
+  return { status: statuses.size === 1 ? tasks[0].status : statuses.has('checks_failing') ? 'checks_failing' : 'in_progress',
+    verification: 'harness_self_reported', source: 'harness_dispatch_registry', tasks,
+    reason: 'Harness task intent and check evidence as self-reported by harness agents; not independently verified by workrelay.' };
+}
+
+function sessionStatus(session, active, pendingCount) {
+  return pendingCount > 0 ? 'blocked_on_permission' : active ? 'running' :
+    terminalOutcomes.includes(session.outcome) ? session.outcome : session.time?.idle ? 'idle' : 'unknown';
+}
+
+function projection(session, active = false, taskOutcome = unreadableOutcome(`${HARNESS_UNREADABLE}.`)) {
   if (!session || !sid.test(session.id) || typeof session.projectID !== 'string' || session.projectID.length > 160) deny();
   // Arbitrary metadata and location paths are never copied.
   const project = 'project_' + createHash('sha256').update(session.projectID).digest('hex');
   return { session_id: session.id, project_id: project,
     label: managedText(session.title, 200).text || `Session ${session.id.slice(-8)}`, title: managedText(session.title, 200), type: 'existing_session',
     owner: { session_id: session.id, parent_session_id: sid.test(session.parentID ?? '') ? session.parentID : null },
-    task_outcome: { status: 'unknown', verification: 'unverified', reason: 'No authoritative harness task checks available through this API.' },
+    task_outcome: taskOutcome,
     // `outcome` is explicitly the last completed drain.  It can coexist with a
     // new foreground drain, which only /session/active can establish.
-    runtime_status: active ? 'running' : ['succeeded', 'failed', 'interrupted'].includes(session.outcome) ? session.outcome :
-      session.time?.idle ? 'idle' : 'unknown',
+    // runtime_status is this session only; aggregate_status (when present)
+    // covers child sessions and pending permission requests.
+    runtime_status: active ? 'running' : terminalOutcomes.includes(session.outcome) ? session.outcome :
+      session.time?.idle ? 'idle' : 'unknown', runtime_scope: 'this_session_only',
     actions: [{ tool: 'workrelay_server_read', arguments: { session_id: session.id, include_messages: true } },
       { tool: 'workrelay_server_waits', arguments: { session_id: session.id } },
       { tool: 'workrelay_server_message', arguments: { session_id: session.id }, requires: ['operation_id', 'text'] },
@@ -67,7 +143,14 @@ function projection(session, active = false) {
 }
 
 export function createManagedReader(expected, readBinding, { loadService = path => import(pathToFileURL(path).href),
-  fetcher = fetch, canonical = realpathSync, stat = lstatSync, internalAuthorize } = {}) {
+  fetcher = fetch, canonical = realpathSync, stat = lstatSync, internalAuthorize, harnessStateDir,
+  operatorActions = false, onPendingPermissions } = {}) {
+  // Process-local earliest observation per native permission request (bounded).
+  const firstSeen = new Map();
+  const seen = id => {
+    if (!firstSeen.has(id)) { firstSeen.set(id, new Date().toISOString()); if (firstSeen.size > 5000) firstSeen.delete(firstSeen.keys().next().value); }
+    return firstSeen.get(id);
+  };
   const read = async (action, input, claims, selectedSession, observe) => {
     const stage = (name, status) => { try { observe?.(name, action, status); } catch { /* diagnostic only */ } };
     stage('binding');
@@ -94,6 +177,114 @@ export function createManagedReader(expected, readBinding, { loadService = path 
     const bindingID = createHash('sha256').update(JSON.stringify(binding)).digest('hex');
     if (action === 'authorize') return { binding_id: bindingID, server_id: managedServerID(binding) };
     if (action === 'events' && input.server_id !== managedServerID(binding)) deny();
+    const stillBound = () => {
+      if (JSON.stringify(readBinding()) !== JSON.stringify(binding) || canonical(binding.service_registration) !== binding.service_registration) deny();
+      const current = stat(binding.service_registration);
+      if (current.dev !== registration.dev || current.ino !== registration.ino || current.mtimeMs !== registration.mtimeMs) deny();
+    };
+    // Bounded native GET for read-only tree/permission projection.
+    const nativeJSON = async (path, maxBytes = 2000000, budget) => {
+      if (budget) { if (budget.remaining <= 0) throw budget.exhausted; budget.remaining--; }
+      const response = await fetcher(new URL(path, endpoint.url), { method: 'GET', headers: service.headers(endpoint), redirect: 'manual', signal: AbortSignal.timeout(10000) });
+      if (!response.ok) { await response.body?.cancel(); deny(); }
+      const stream = response.body.getReader(); const parts = []; let bytes = 0;
+      try { while (true) { const part = await stream.read(); if (part.done) break; bytes += part.value.length; if (bytes > maxBytes) deny(); parts.push(part.value); } }
+      finally { await stream.cancel(); }
+      try { return JSON.parse(Buffer.concat(parts).toString('utf8')); } catch { deny(); }
+    };
+    // Installed V2 permission.list is session-scoped. The global
+    // /api/permission/request list is location-scoped and misses other projects.
+    const pendingFor = async (sessionID, budget, previewLimit = 160) => {
+      const pending = (await nativeJSON(`/api/session/${sessionID}/permission`, 262144, budget))?.data;
+      if (!Array.isArray(pending) || pending.length > 1000 || pending.some(item => item?.sessionID !== sessionID || !permissionIDPattern.test(item.id ?? ''))) deny();
+      const items = pending.map(item => permissionSummary(item, seen(item.id), previewLimit));
+      if (items.length && onPendingPermissions) { try { onPendingPermissions(items.map(item => ({ ...item, resource_preview: undefined }))); } catch { /* notification never affects reads */ } }
+      return items;
+    };
+    // Breadth-first bounded walk of native child sessions (parentID filter).
+    const sessionTree = async (root, active, { maxDepth, maxSessions, budget }) => {
+      const pending = await pendingFor(root.id, budget);
+      const children = []; const queue = [[root.id, 0]]; const visited = new Set([root.id]); let truncated = false;
+      while (queue.length) {
+        const [parent, depth] = queue.shift();
+        if (depth >= maxDepth) continue; // reported as depth_limit
+        const page = (await nativeJSON('/api/session?' + new URLSearchParams({ parentID: parent, limit: '50', order: 'desc' }), 2000000, budget))?.data;
+        if (!Array.isArray(page) || page.length > 50) deny();
+        if (page.length === 50) truncated = true;
+        for (const child of page) {
+          if (!sid.test(child?.id ?? '') || child.parentID !== parent) deny();
+          if (visited.has(child.id)) continue;
+          if (children.length >= maxSessions) { truncated = true; break; }
+          visited.add(child.id);
+          const childPending = await pendingFor(child.id, budget);
+          children.push({ session_id: child.id, parent_session_id: parent, depth: depth + 1, agent: agentLabel(child.agent),
+            status: sessionStatus(child, active[child.id]?.type === 'running', childPending.length),
+            pending_permission_count: childPending.length, pending: childPending });
+          queue.push([child.id, depth + 1]);
+        }
+      }
+      return { pending, children, truncated, depth_limit: maxDepth };
+    };
+    const treeFields = (root, rootActive, tree, itemLimit = 20) => {
+      const pending = [...tree.pending, ...tree.children.flatMap(child => child.pending)];
+      const running = tree.children.filter(child => child.status === 'running').length;
+      const blocked = tree.children.filter(child => child.status === 'blocked_on_permission').length;
+      const own = sessionStatus(root, rootActive, 0);
+      return { blocked_on_permission: pending.length > 0,
+        aggregate_status: pending.length ? 'blocked_on_permission' : rootActive || running ? 'running' : tree.truncated ? 'unknown' : own,
+        pending_permissions: { count: pending.length, items: pending.slice(0, itemLimit), truncated: pending.length > itemLimit, decision: 'human_operator_only',
+          guidance: 'Pending native permission requests (including child sessions) can be approved or denied only by a human operator in the workrelay operator approval page (/operator/permissions) or a native OpenCode UI. No MCP tool, message, steer or resume can approve them.' },
+        children: { items: tree.children.map(({ pending: _omit, ...child }) => child), count: tree.children.length,
+          running_count: running, blocked_count: blocked, truncated: tree.truncated, depth_limit: tree.depth_limit } };
+    };
+    const taskOutcomeFor = async (session, { walk = true } = {}) => {
+      if (!harnessStateDir) return harnessTaskOutcome(undefined);
+      let root = session;
+      for (let hops = 0; sid.test(root.parentID ?? ''); hops++) {
+        if (!walk) return { status: 'see_root_session', verification: 'unverified', source: 'harness_dispatch_registry', reason: 'Harness task checks are reported on the root session of this child.' };
+        if (hops >= 8) return harnessTaskOutcome(harnessStateDir, null, null);
+        const parent = (await nativeJSON('/api/session/' + root.parentID))?.data;
+        if (parent?.id !== root.parentID) deny();
+        root = parent;
+      }
+      return harnessTaskOutcome(harnessStateDir, root.location?.directory, root.id);
+    };
+    if (action === 'pending_permissions' || action === 'permission_reply') {
+      // Human-operator approval surface only. Never reachable from MCP tools:
+      // the gateway constructs a separate reader with operatorActions enabled.
+      if (!operatorActions || !Array.isArray(input.directories) || !input.directories.length || input.directories.length > 100 ||
+          input.directories.some(root => typeof root !== 'string' || !isAbsolute(root) || resolvePath(root) !== root || root === '/')) deny();
+      const allowed = directory => typeof directory === 'string' && input.directories.some(root => directory === root || directory.startsWith(root + '/'));
+      if (action === 'permission_reply') {
+        if (!sid.test(input.session_id ?? '') || !permissionIDPattern.test(input.permission_id ?? '') || !['once', 'always', 'reject'].includes(input.decision)) deny();
+        const session = (await nativeJSON('/api/session/' + input.session_id))?.data;
+        if (session?.id !== input.session_id || !allowed(session.location?.directory)) deny();
+        if (!(await pendingFor(input.session_id)).some(item => item.permission_id === input.permission_id)) return { replied: false, reason: 'not_pending' };
+        stillBound();
+        const response = await fetcher(new URL(`/api/session/${input.session_id}/permission/${input.permission_id}/reply`, endpoint.url), {
+          method: 'POST', headers: { ...service.headers(endpoint), 'content-type': 'application/json' }, body: JSON.stringify({ decision: input.decision }),
+          redirect: 'manual', signal: AbortSignal.timeout(10000) });
+        await response.body?.cancel();
+        if (!response.ok) deny();
+        return { replied: true, session_id: input.session_id, permission_id: input.permission_id, decision: input.decision };
+      }
+      const recent = (await nativeJSON('/api/session?' + new URLSearchParams({ limit: '50', order: 'desc' })))?.data;
+      const running = (await nativeJSON('/api/session/active'))?.data;
+      if (!Array.isArray(recent) || recent.length > 50 || !running || typeof running !== 'object' || Array.isArray(running)) deny();
+      const sessions = new Map(recent.filter(session => sid.test(session?.id ?? '')).map(session => [session.id, session]));
+      for (const id of Object.keys(running).filter(id => sid.test(id) && !sessions.has(id)).slice(0, 50)) {
+        const session = (await nativeJSON('/api/session/' + id))?.data;
+        if (session?.id === id) sessions.set(id, session);
+      }
+      const items = [];
+      for (const session of sessions.values()) {
+        if (!allowed(session.location?.directory)) continue;
+        for (const item of await pendingFor(session.id, undefined, 2000))
+          items.push({ ...item, session_title: managedText(session.title, 200).text, directory: session.location.directory, agent: agentLabel(session.agent) });
+      }
+      stillBound();
+      return { items: items.slice(0, 100), truncated: items.length > 100, scanned_sessions: sessions.size };
+    }
     let pluginSession;
     const metadataRoutes = {
       '/__managed/attestation-provider': 'provider',
@@ -168,7 +359,7 @@ export function createManagedReader(expected, readBinding, { loadService = path 
         query.set('cursor', input.cursor);
       } else query.set('order', 'desc');
       path = `/api/session/${input.session_id}/message?${query}`;
-    } else if (action === 'read' || action === 'events' && input.session_id) {
+    } else if (action === 'read' || action === 'session_check' || action === 'events' && input.session_id) {
       if (!sid.test(input.session_id ?? '')) deny();
       path = '/api/session/' + input.session_id;
     } else if (action === 'discover' || action === 'events') {
@@ -381,12 +572,21 @@ export function createManagedReader(expected, readBinding, { loadService = path 
         next_action: next ? { tool: 'workrelay_server_read', arguments: { session_id: input.session_id, include_messages: true, limit: input.limit ?? 10, cursor: next } } : null,
         limitation: 'Visible text only; files, tool dumps, reasoning and system/synthetic messages excluded. Known credential patterns redacted; not an exhaustive secret detector.' };
     }
+    if (action === 'session_check') {
+      // Exact-session authorization for writes/subscriptions; no tree walk.
+      if (value.data?.id !== input.session_id) deny();
+      stillBound();
+      return projection(value.data);
+    }
     if (action === 'read') {
       if (value.data?.id !== input.session_id) deny();
       const active = await read('active', {}, claims, undefined, observe);
+      const rootActive = active[value.data.id]?.type === 'running';
+      const tree = await sessionTree(value.data, active, { maxDepth: 3, maxSessions: 25 });
+      const taskOutcome = await taskOutcomeFor(value.data);
       const context = input.include_messages === true ? await read('messages', input, claims, value.data.id, observe) : { omission: 'Request include_messages:true for visible context.' };
       if (JSON.stringify(readBinding()) !== JSON.stringify(binding)) deny();
-      return { ...projection(value.data, active[value.data.id]?.type === 'running'), server_id: managedServerID(binding), context,
+      return { ...projection(value.data, rootActive, taskOutcome), ...treeFields(value.data, rootActive, tree), server_id: managedServerID(binding), context,
         return_action: { tool: 'workrelay_server_read', arguments: { session_id: input.session_id, include_messages: true, limit: input.limit ?? 10 } },
         progress: { verification: 'unverified', source: 'native_session_metadata_and_requested_visible_text',
           limitation: 'Runtime success/idle and assistant text are not authoritative task checks. Permission/question decisions require the native request and an explicit supported decision action; continuation text never grants approval.' } };
@@ -395,7 +595,23 @@ export function createManagedReader(expected, readBinding, { loadService = path 
     const next = value.cursor?.next ?? null;
     if (next !== null && (typeof next !== 'string' || next.length > 4096 || /[\x00-\x1f\x7f]/.test(next))) deny();
     const active = await read('active', {}, claims, undefined, observe);
-    const items = value.data.map(session => projection(session, active[session.id]?.type === 'running'));
+    // Compact per-session tree summary under one shared native-call budget.
+    const budget = { remaining: 150, exhausted: Symbol('budget') };
+    const items = await Promise.all(value.data.map(async session => {
+      if (!sid.test(session?.id ?? '')) deny();
+      const isActive = active[session.id]?.type === 'running';
+      const outcome = await taskOutcomeFor(session, { walk: false });
+      const item = projection(session, isActive, { status: outcome.status, verification: outcome.verification, source: outcome.source, reason: outcome.reason,
+        ...(outcome.tasks ? { checks_passed: outcome.tasks.reduce((sum, task) => sum + task.checks_passed, 0), checks_total: outcome.tasks.reduce((sum, task) => sum + task.checks_total, 0) } : {}) });
+      let tree;
+      try { tree = await sessionTree(session, active, { maxDepth: 2, maxSessions: 10, budget }); }
+      catch (error) { if (error !== budget.exhausted) throw error; return { ...item, tree: { status: 'not_computed', reason: 'Discover tree budget exhausted; use read for this session.' } }; }
+      const fields = treeFields(session, isActive, tree, 0);
+      return { ...item, blocked_on_permission: fields.blocked_on_permission, aggregate_status: fields.aggregate_status,
+        tree: { pending_permission_count: fields.pending_permissions.count, child_count: fields.children.count, running_children: fields.children.running_count,
+          blocked_children: fields.children.blocked_count, truncated: fields.children.truncated } };
+    }));
+    stillBound();
     return { server_id: managedServerID(binding), items, projects: [...new Set(items.map(item => item.project_id))].map(id => ({ id, label: `Project ${id.slice(-8)}` })),
       next_cursor: next, next_action: next ? { tool: 'workrelay_server_discover', arguments: { cursor: next, limit: input.limit ?? 20,
         ...(input.search !== undefined ? { search: input.search } : {}) } } : null, access: 'managed_server_read',

@@ -13,12 +13,14 @@ import { z } from 'zod';
 import { createLocalJWKSet, createRemoteJWKSet, jwtVerify } from 'jose';
 import { createEventsService } from './events.mjs';
 import { createMcpObservation } from './mcp_observation.mjs';
+import { auditSettings, createToolAudit } from './tool_audit.mjs';
 import { createManagedEventTools, managedEventToolDefinitions } from './managed_event_tools.mjs';
 import { createManagedEventSource } from './managed_event_source.mjs';
 import { createManagedReader, managedServerID, managedClientID } from './managed_server.mjs';
 import { createIssuerAdapter } from './oidc_adapter.mjs';
 import { createUnexposedIssuerPolicy, createPreapprovalDiagnostic, createAuthorizationOutcomeDiagnostic, createTokenErrorDiagnostic } from './issuer_policy.mjs';
 import { createLocalInteractions, createOriginDiagnostic } from './issuer_interactions.mjs';
+import { createPermissionNotifier, validateNotifySettings } from './permission_notify.mjs';
 const loopback = new Set(['127.0.0.1', '::1']);
 const key = z.string().regex(/^[A-Za-z0-9_-]{1,80}$/);
 const grantId = z.string().regex(/^grant_[0-9a-f]{32}$/);
@@ -172,6 +174,11 @@ export function validateConfig(config, { testIssuer = false } = {}) {
     throw Error('private principal revocation file required for events');
   if (config.revocation_file && (typeof config.revocation_file !== 'string' ||
       !config.revocation_file.startsWith('/'))) throw Error('private revocation file path required');
+  auditSettings(config); // throws on an invalid explicit audit_log
+  validateNotifySettings(config.operator_approvals);
+  if (config.operator_approvals !== undefined && !config.managed_supervisor_file) throw Error('operator_approvals requires managed_supervisor_file');
+  if (config.harness_state_dir !== undefined && (typeof config.harness_state_dir !== 'string' || !config.harness_state_dir.startsWith('/') ||
+      resolve(config.harness_state_dir) !== config.harness_state_dir)) throw Error('invalid harness_state_dir');
   return { ...config, public_origin: origin.origin, issuer: issuer.href.replace(/\/$/, ''), jwks_uri: jwks.href };
 }
 
@@ -314,7 +321,7 @@ function bridge(config, command, input) {
   });
 }
 
-function mcp(config, invoke, events, managedReader, eventTools) {
+function mcp(config, invoke, events, managedReader, eventTools, audit) {
   const server = new McpServer({ name: 'workrelay', version: '0.1.0' },
     { ...(events ? { capabilities: { events: {} } } : {}),
       instructions: managedReader ? 'Start with workrelay_server_discover({}) for explicitly authorized managed-server access, or workrelay_discover({}) for ordinary scoped work. Server tools verify the pinned principal and client on every call. No enrollment is needed for approved server access. Message queues to the existing owner with native approvals and financial admission; interrupt is not rollback and does not cancel descendants. Reuse operation_id and identical inputs after uncertainty; do not blindly replay. When Events are enabled, session.completed/session.failed/session.needs_input accept the returned server_id and optional session_id; omitting session_id monitors the bound server. Events reconcile observed state, not transcript/history; idle is not completion and does not establish that a child completed before its parent became idle. Unsubscribe stops monitoring, not ordinary work.' :
@@ -324,7 +331,8 @@ function mcp(config, invoke, events, managedReader, eventTools) {
   const register = (name, definition, handler) => {
     catalog.push({ name, description: definition.description, read_only: definition.annotations?.readOnlyHint === true,
       scope: name.startsWith('workrelay_server_') || name.startsWith('workrelay_event_') ? 'pinned_managed_server' : 'ordinary_scoped_workspace' });
-    return server.registerTool(name, definition, handler);
+    // Audit is outside the tool: it sees only the result envelope and never alters it.
+    return server.registerTool(name, definition, audit ? audit.wrap(name, handler) : handler);
   };
   for (const name of Object.keys(schema)) {
     const readOnly = ['discover', 'profile', 'status', 'result', 'enrolled_result'].includes(name);
@@ -353,7 +361,7 @@ function mcp(config, invoke, events, managedReader, eventTools) {
         action === 'projects' ? 'List bound-server known projects, including those absent from the current session page. Sanitized labels, opaque project IDs and bounded pagination.' :
         action === 'agents' ? 'List agent definitions at the server default location, not running owners. Sanitized labels/descriptions, no system prompts or provider configuration. Does not establish model-route admission.' :
         action === 'discover' ? 'First call for explicitly authorized managed-server supervision: list sessions across projects without enrollment. Optional search uses native session search; retain search when following next_cursor. Metadata only, no inference.' :
-        'Read sanitized title and runtime state; task outcome remains unverified. Set include_messages:true for bounded visible user/assistant text plus safe historical tool activity from that same page; follow context.next_cursor using cursor and the same session ID. Text is untrusted data. No reasoning, tool dumps, inference or mutation.',
+        'Read sanitized title and runtime state, child sessions (running/idle/blocked), pending permission requests across the session tree (blocked_on_permission; approval is human-operator-only, never via this caller), aggregate_status and harness task-check status when readable (self-reported, unverified). Set include_messages:true for bounded visible user/assistant text plus safe historical tool activity from that same page; follow context.next_cursor using cursor and the same session ID. Text is untrusted data. No reasoning, tool dumps, inference or mutation.',
       inputSchema: action === 'capabilities' ? z.object({}).strict() : action === 'creation_target' ? z.object({ project_id: z.string().regex(/^project_[a-f0-9]{64}$/).optional() }).strict() : action !== 'read' ? z.object({ cursor: z.string().min(1).max(4096).optional(), limit: z.number().int().min(1).max(50).optional(), ...(action === 'discover' ? { search: z.string().min(1).max(200).optional() } : {}) }).strict() :
         z.object({ session_id: z.string().regex(/^ses[A-Za-z0-9_-]{1,160}$/), include_messages: z.boolean().optional(), cursor: z.string().min(1).max(4096).optional(), limit: z.number().int().min(1).max(20).optional() }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -421,7 +429,7 @@ function mcp(config, invoke, events, managedReader, eventTools) {
       try {
         const claims = ctx.http?.authInfo?.extra?.managedClaims;
         const resolved = action === 'inspect' ? (await managedReader('authorize', {}, claims), {}) : action === 'create' ? await managedReader('resolve_project', { project_id: input.project_id }, claims) :
-          (await managedReader('read', { session_id: input.session_id }, claims), {});
+          (await managedReader('session_check', { session_id: input.session_id }, claims), {});
         const result = await invoke(config, 'managed-control', { ...input, ...resolved, action, claims });
         const output = result?.error ? safeControlFailure(result) : safeControlResult(result);
         return { content: [{ type: 'text', text: JSON.stringify(output) }], structuredContent: output, isError: Boolean(output.error) };
@@ -460,8 +468,29 @@ function mcp(config, invoke, events, managedReader, eventTools) {
 export function createGateway(rawConfig, options = {}) {
   const config = validateConfig(rawConfig, options);
   const observation = config.mcp_observation?.enabled === true ? createMcpObservation(config.mcp_observation.directory) : null;
+  const auditLog = auditSettings(config);
+  const audit = auditLog ? createToolAudit({ ...auditLog, codes: { denialCodes: CONTROL_DENIAL_CODES, checkIds: ATTESTATION_CHECK_IDS } }) : null;
   const publicProxy = config.issuer_mode === 'self-hosted' && config.issuer_exposure === 'public-proxy';
   let issuerProvider = null, issuerInteraction = null, localJwks = null;
+  // Human-operator permission approvals. The MCP reader never gets
+  // operatorActions; only the password/CSRF-protected page and the
+  // notification poller use this separate instance.
+  const approvals = config.operator_approvals?.enabled === true ? config.operator_approvals : null;
+  const readManagedBinding = () => privateIssuerFile(dirname(config.managed_supervisor_file), basename(config.managed_supervisor_file));
+  const notifyPending = approvals ? createPermissionNotifier({ command: approvals.notify_command, webhookUrl: approvals.notify_webhook_url,
+    approvalUrl: config.issuer_mode === 'self-hosted' ? `${config.public_origin}/operator/permissions` : undefined }) : null;
+  const operatorReader = approvals ? createManagedReader(config, readManagedBinding, { operatorActions: true,
+    harnessStateDir: config.harness_state_dir, ...(notifyPending ? { onPendingPermissions: notifyPending } : {}) }) : null;
+  const approvalDirectories = () => {
+    if (approvals.directories) return approvals.directories;
+    const bridgeConfig = privateIssuerFile(dirname(config.bridge_config), basename(config.bridge_config), 131072);
+    return bridgeConfig.managed_allowed_directories ?? [bridgeConfig.directory];
+  };
+  const operatorClaims = () => ({ iss: config.issuer, aud: config.audience, sub: config.principal, client_id: managedClientID(config) });
+  const operatorApprovals = approvals ? {
+    list: () => operatorReader('pending_permissions', { directories: approvalDirectories() }, operatorClaims()),
+    reply: input => operatorReader('permission_reply', { ...input, directories: approvalDirectories() }, operatorClaims()),
+  } : undefined;
   if (config.issuer_mode === 'self-hosted') {
     const settings = privateIssuerFile(config.issuer_state_dir, 'issuer.json');
     const human = privateIssuerFile(config.issuer_state_dir, 'human.json', 4096);
@@ -496,7 +525,7 @@ export function createGateway(rawConfig, options = {}) {
     issuerInteraction = createLocalInteractions({ provider: issuerProvider,
       directory: config.issuer_state_dir, origin: config.public_origin,
       clientId: settings.clientId, resource: `${config.public_origin}/mcp`,
-      captureConsent: (req, res) => captureOrigin?.(req, res, 'consent') });
+      captureConsent: (req, res) => captureOrigin?.(req, res, 'consent'), operatorApprovals });
   }
   // Local-admin-only file. Any token hash revocation conservatively disables
   // this sole principal and its subscriptions until an explicit admin re-enable.
@@ -539,7 +568,7 @@ export function createGateway(rawConfig, options = {}) {
     if (_principal !== config.principal || !active() || !approved() || unsafeMarker || markerState() === 'pending') return false;
     if (name?.startsWith('session.')) {
       if (!managedReader || filter?.server_id !== managedServerID(config.managed_server)) return false;
-      try { await managedReader(filter.session_id ? 'read' : 'authorize', filter.session_id ? { session_id: filter.session_id } : {}, managedClaims); return true; } catch { return false; }
+      try { await managedReader(filter.session_id ? 'session_check' : 'authorize', filter.session_id ? { session_id: filter.session_id } : {}, managedClaims); return true; } catch { return false; }
     }
     if (!key.safeParse(task).success) return false;
     try {
@@ -650,13 +679,13 @@ export function createGateway(rawConfig, options = {}) {
     }
     return null;
   }
-  const managedReader = config.managed_supervisor_file ? createManagedReader(config, () =>
-    privateIssuerFile(dirname(config.managed_supervisor_file), basename(config.managed_supervisor_file))) : undefined;
+  const managedReader = config.managed_supervisor_file ? createManagedReader(config, readManagedBinding,
+    { harnessStateDir: config.harness_state_dir, ...(notifyPending ? { onPendingPermissions: notifyPending } : {}) }) : undefined;
   const eventTools = events && managedReader ? createManagedEventTools({ events, serverId: managedServerID(config.managed_server),
     identity: { issuer: config.issuer, audience: config.audience, principal: config.principal, client_id: managedClaims.client_id }, pinnedClientId: managedClientID(config),
     authorize: async (claims, scope) => {
       if (!active() || !approved() || unsafeMarker || markerState() === 'pending' || scope.server_id !== managedServerID(config.managed_server)) return false;
-      await managedReader(scope.session_id ? 'read' : 'authorize', scope.session_id ? { session_id: scope.session_id } : {}, claims);
+      await managedReader(scope.session_id ? 'session_check' : 'authorize', scope.session_id ? { session_id: scope.session_id } : {}, claims);
       return true;
     } }) : null;
   let ensureManagedReady;
@@ -672,7 +701,7 @@ export function createGateway(rawConfig, options = {}) {
     }
     return result;
   } } : null;
-  const handler = options.sdkHandler ?? createMcpHandler(() => mcp(config, invoke, servedEvents, managedReader, eventTools));
+  const handler = options.sdkHandler ?? createMcpHandler(() => mcp(config, invoke, servedEvents, managedReader, eventTools, audit));
   const jwks = localJwks ?? createRemoteJWKSet(new URL(config.jwks_uri), { timeoutDuration: 3000, cooldownDuration: 1000 });
   const metadataUrl = `${config.public_origin}/.well-known/oauth-protected-resource/mcp`;
   const resource = `${config.public_origin}/mcp`;
@@ -823,8 +852,8 @@ export function createGateway(rawConfig, options = {}) {
         path = url.pathname;
       } catch { return rejectIssuer(400, 'invalid_request'); }
       const methods = path === '/auth' || /^\/auth\/[A-Za-z0-9._~-]{1,128}$/.test(path) ||
-        /^\/interaction\/[A-Za-z0-9._~-]{1,128}$/.test(path) ?
-        (path.startsWith('/interaction/') ? ['GET', 'POST'] : ['GET']) :
+        /^\/interaction\/[A-Za-z0-9._~-]{1,128}$/.test(path) || path === '/operator/permissions' ?
+        (path.startsWith('/interaction/') || path === '/operator/permissions' ? ['GET', 'POST'] : ['GET']) :
         path === '/token' || path === '/token/revocation' ? ['POST', 'OPTIONS'] :
         ['/.well-known/oauth-authorization-server', '/.well-known/openid-configuration'].includes(path) ?
         ['GET', 'HEAD', 'OPTIONS'] : path === '/jwks' ? ['GET', 'OPTIONS'] : [];
@@ -841,7 +870,7 @@ export function createGateway(rawConfig, options = {}) {
         return rejectIssuer(415, 'unsupported_encoding');
       try {
         const kind = path === '/auth' || path.startsWith('/auth/') ? 'authorization' :
-          path.startsWith('/interaction/') ? 'interaction' :
+          path.startsWith('/interaction/') || path === '/operator/permissions' ? 'interaction' :
           path === '/token' ? 'token' : path === '/token/revocation' ? 'revocation' : 'discovery';
         const admitted = await admitIssuer(remote, kind); // socket IP, never forwarded IP
         if (admitted !== true) return rejectIssuer(admitted === false ? 429 : 503,
@@ -1075,6 +1104,18 @@ export function createGateway(rawConfig, options = {}) {
     server.stopEvents = async () => { stopped = true; clearInterval(timer); const run = sourceRun; run?.controller.abort(); await activeTick; await run?.promise; };
     server.on('close', () => { void server.stopEvents(); void handler.close?.(); });
   } else server.on('close', () => { void handler.close?.(); });
+  if (operatorReader && notifyPending) {
+    // Background discovery so a hook fires even when no agent is reading.
+    // Never overlaps, never blocks tool calls, errors are ignored.
+    let polling = false;
+    const timer = setInterval(() => {
+      if (polling || !active()) return;
+      polling = true;
+      operatorApprovals.list().catch(() => {}).finally(() => { polling = false; });
+    }, approvals.poll_interval_ms ?? 30000);
+    timer.unref?.();
+    server.on('close', () => clearInterval(timer));
+  }
   return server;
 }
 
