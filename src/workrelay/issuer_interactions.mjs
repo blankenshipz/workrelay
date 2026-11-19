@@ -182,6 +182,15 @@ export async function provisionLocalHuman({ directory, accountId }) {
 const OPERATOR_COOKIE = '__Host-workrelay-operator';
 const OPERATOR_PATH = '/operator/permissions';
 const OPERATOR_SESSION_MS = 300000;
+// The public HTTPS origin keeps __Host-/Secure cookies. The optional loopback
+// listener is a plain-HTTP origin reached through an SSH port-forward: Secure
+// (and so __Host-) cookies are not reliably accepted there by every browser,
+// so it uses distinct, host-only, path-scoped HttpOnly SameSite=Strict cookies.
+// Confidentiality on that path comes from the SSH tunnel and the loopback bind.
+const PUBLIC_OPERATOR_SITE = Object.freeze({ flowCookie: COOKIE, sessionCookie: OPERATOR_COOKIE, attributes: 'Path=/; Secure; HttpOnly; SameSite=Strict' });
+const LOOPBACK_OPERATOR_SITE = Object.freeze({ flowCookie: 'workrelay-operator-flow', sessionCookie: 'workrelay-operator-session',
+  attributes: `Path=${OPERATOR_PATH}; HttpOnly; SameSite=Strict` });
+const LOOPBACK_ORIGIN = /^http:\/\/(?:127\.0\.0\.1|localhost):(?:[1-9][0-9]{0,4})$/;
 
 export function createLocalInteractions({ provider, directory, origin, clientId, resource, captureConsent, operatorApprovals }) {
   if (!provider?.interactionDetails || !provider?.interactionFinished ||
@@ -359,7 +368,7 @@ export function createLocalInteractions({ provider, directory, origin, clientId,
     send(res, 200, page('Workrelay pending permissions', `${notice ? `<p><strong>${escaped(notice)}</strong></p>` : ''}<p>Requests are untrusted agent-generated text. Command previews are redacted and may be truncated. Each page action is single-use; the operator session expires after five minutes.</p>${rows}<form method="post" action="${OPERATOR_PATH}">${hidden}<button type="submit">Refresh</button></form>`));
     return true;
   }
-  async function operatorHandle(req, res) {
+  async function operatorHandle(req, res, site) {
     if (req.method !== 'GET' && req.method !== 'POST') { send(res, 405); return true; }
     if (!operatorApprovals) { send(res, 404); return true; }
     assertState();
@@ -369,29 +378,29 @@ export function createLocalInteractions({ provider, directory, origin, clientId,
       const cookie = randomBytes(32).toString('base64url');
       const csrf = issueOperatorCsrf('login:' + cookie);
       if (!csrf) { send(res, 503); return true; }
-      res.setHeader('set-cookie', `${COOKIE}=${cookie}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=300`);
+      res.setHeader('set-cookie', `${site.flowCookie}=${cookie}; ${site.attributes}; Max-Age=300`);
       send(res, 200, page('Workrelay operator sign-in', `<p>Sign in as the local Workrelay operator to review pending agent permission requests.</p><form method="post" action="${OPERATOR_PATH}"><input type="hidden" name="flow" value="${escaped(csrf.flow)}"><input type="hidden" name="csrf" value="${escaped(csrf.nonce)}"><label>Password <input name="password" type="password" required autocomplete="current-password"></label><button type="submit">Sign in</button></form>`));
       return true;
     }
-    if (req.headers.origin !== origin) { send(res, 403); return true; }
+    if (req.headers.origin !== site.origin) { send(res, 403); return true; }
     let fields;
     try { fields = await body(req, ['flow', 'csrf', 'password', 'session_id', 'permission_id', 'decision']); } catch { send(res, 403); return true; }
     if (fields.has('password')) {
       if (['session_id', 'permission_id', 'decision'].some(key => fields.has(key))) { send(res, 403); return true; }
-      const cookie = cookieValue(req, COOKIE);
+      const cookie = cookieValue(req, site.flowCookie);
       if (!cookie || !consumeOperatorCsrf(fields.get('flow'), 'login:' + cookie, fields.get('csrf'))) { send(res, 403); return true; }
-      res.setHeader('set-cookie', `${COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0`);
+      res.setHeader('set-cookie', `${site.flowCookie}=; ${site.attributes}; Max-Age=0`);
       const human = readHuman();
       if (!reserveAttempt(human.accountId)) { send(res, 429); return true; }
       const password = fields.get('password');
       if (!password || Buffer.byteLength(password) > 256 || !(await argon2.verify(human.verifier, password))) { send(res, 403); return true; }
       const token = startOperatorSession();
       if (!token) { send(res, 503); return true; }
-      res.setHeader('set-cookie', [`${COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0`,
-        `${OPERATOR_COOKIE}=${token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=${OPERATOR_SESSION_MS / 1000}`]);
+      res.setHeader('set-cookie', [`${site.flowCookie}=; ${site.attributes}; Max-Age=0`,
+        `${site.sessionCookie}=${token}; ${site.attributes}; Max-Age=${OPERATOR_SESSION_MS / 1000}`]);
       return operatorList(res, token);
     }
-    const token = cookieValue(req, OPERATOR_COOKIE);
+    const token = cookieValue(req, site.sessionCookie);
     const sessionID = fields.get('session_id'), permissionID = fields.get('permission_id'), decision = fields.get('decision');
     const refresh = !fields.has('decision') && !fields.has('session_id') && !fields.has('permission_id');
     if (!refresh && (!/^ses[A-Za-z0-9_-]{1,160}$/.test(sessionID ?? '') || !/^per[A-Za-z0-9_-]{1,160}$/.test(permissionID ?? '') ||
@@ -407,11 +416,13 @@ export function createLocalInteractions({ provider, directory, origin, clientId,
     } catch { notice = `Could not record a decision for ${permissionID}; it was not approved by this page.`; }
     return operatorList(res, token, notice);
   }
-  return async function handle(req, res) {
-    if (req.url === OPERATOR_PATH) {
-      try { return await operatorHandle(req, res); }
-      catch { if (!res.headersSent) send(res, 403); else res.destroy(); return true; }
-    }
+  async function operatorEntry(req, res, site) {
+    try { return await operatorHandle(req, res, site); }
+    catch { if (!res.headersSent) send(res, 403); else res.destroy(); return true; }
+  }
+  const publicSite = { ...PUBLIC_OPERATOR_SITE, origin };
+  async function handle(req, res) {
+    if (req.url === OPERATOR_PATH) return operatorEntry(req, res, publicSite);
     const path = req.url?.match(/^\/interaction\/([A-Za-z0-9._~-]{1,128})$/);
     if (!path) return false;
     const uid = path[1];
@@ -503,7 +514,16 @@ export function createLocalInteractions({ provider, directory, origin, clientId,
       await provider.interactionFinished(req, res, { consent: details.grantId ? {} : { grantId } }, { mergeWithLastSubmission: true });
       return true;
     } catch { diagnostic?.rejectedConsent('caught_failure'); if (!res.headersSent) send(res, 403); else res.destroy(); return true; }
+  }
+  // Loopback-only operator page (operator_approvals.local_listen). The caller
+  // has already verified the socket peer, exact Host and absent forwarding;
+  // localOrigin is that validated http://<loopback host>:<port>. Only the
+  // operator page is reachable here: never OAuth interactions.
+  handle.operatorLoopback = async (req, res, localOrigin) => {
+    if (typeof localOrigin !== 'string' || !LOOPBACK_ORIGIN.test(localOrigin) || req.url !== OPERATOR_PATH) { send(res, 404); return true; }
+    return operatorEntry(req, res, { ...LOOPBACK_OPERATOR_SITE, origin: localOrigin });
   };
+  return handle;
 }
 
 // Explicit local invocation: node issuer_interactions.mjs provision PRIVATE_DIR ACCOUNT_ID

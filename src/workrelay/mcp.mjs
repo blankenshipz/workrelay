@@ -177,6 +177,9 @@ export function validateConfig(config, { testIssuer = false } = {}) {
   auditSettings(config); // throws on an invalid explicit audit_log
   validateNotifySettings(config.operator_approvals);
   if (config.operator_approvals !== undefined && !config.managed_supervisor_file) throw Error('operator_approvals requires managed_supervisor_file');
+  if (config.operator_approvals?.local_listen !== undefined &&
+      (config.issuer_mode !== 'self-hosted' || config.operator_approvals.local_listen.port === config.port))
+    throw Error('operator_approvals.local_listen requires the self-hosted issuer and its own loopback port');
   if (config.harness_state_dir !== undefined && (typeof config.harness_state_dir !== 'string' || !config.harness_state_dir.startsWith('/') ||
       resolve(config.harness_state_dir) !== config.harness_state_dir)) throw Error('invalid harness_state_dir');
   return { ...config, public_origin: origin.origin, issuer: issuer.href.replace(/\/$/, ''), jwks_uri: jwks.href };
@@ -477,8 +480,10 @@ export function createGateway(rawConfig, options = {}) {
   // notification poller use this separate instance.
   const approvals = config.operator_approvals?.enabled === true ? config.operator_approvals : null;
   const readManagedBinding = () => privateIssuerFile(dirname(config.managed_supervisor_file), basename(config.managed_supervisor_file));
+  const localOperatorPort = approvals && config.issuer_mode === 'self-hosted' ? approvals.local_listen?.port : undefined;
   const notifyPending = approvals ? createPermissionNotifier({ command: approvals.notify_command, webhookUrl: approvals.notify_webhook_url,
-    approvalUrl: config.issuer_mode === 'self-hosted' ? `${config.public_origin}/operator/permissions` : undefined }) : null;
+    approvalUrl: config.issuer_mode !== 'self-hosted' ? undefined : localOperatorPort ?
+      `http://127.0.0.1:${localOperatorPort}/operator/permissions` : `${config.public_origin}/operator/permissions` }) : null;
   const operatorReader = approvals ? createManagedReader(config, readManagedBinding, { operatorActions: true,
     harnessStateDir: config.harness_state_dir, ...(notifyPending ? { onPendingPermissions: notifyPending } : {}) }) : null;
   const approvalDirectories = () => {
@@ -1104,6 +1109,38 @@ export function createGateway(rawConfig, options = {}) {
     server.stopEvents = async () => { stopped = true; clearInterval(timer); const run = sourceRun; run?.controller.abort(); await activeTick; await run?.promise; };
     server.on('close', () => { void server.stopEvents(); void handler.close?.(); });
   } else server.on('close', () => { void handler.close?.(); });
+  if (localOperatorPort && issuerInteraction) {
+    // Opt-in second listener for the human operator page only, reached via an
+    // SSH port-forward. Bound to 127.0.0.1 only; it never routes to MCP, OIDC,
+    // OAuth interactions, metadata or JWKS. Password, single-use CSRF, Origin
+    // check, rate limits and the operator session are the same as the public page.
+    const operatorServer = createServer(async (req, res) => {
+      const reject = (code, reason) => { res.setHeader('Connection', 'close'); req.resume(); return failure(res, code, reason); };
+      const names = req.rawHeaders.filter((_, index) => index % 2 === 0).map(name => name.toLowerCase());
+      const host = req.headers.host;
+      if (!loopback.has(req.socket.remoteAddress) || names.filter(name => name === 'host').length !== 1 ||
+          !['127.0.0.1', 'localhost'].map(name => `${name}:${localOperatorPort}`).includes(host) ||
+          ['origin', 'cookie', 'content-length', 'content-type', 'transfer-encoding'].some(name => names.filter(value => value === name).length > 1) ||
+          names.some(name => name === 'forwarded' || name === 'x-real-ip' || name.startsWith('x-forwarded-')))
+        return reject(400, 'invalid_origin');
+      if (req.url !== '/operator/permissions') return reject(404, 'not_found');
+      if (!['GET', 'POST'].includes(req.method)) return reject(405, 'not_allowed');
+      if (req.headers['transfer-encoding'] || req.headers['content-encoding']) return reject(400, 'invalid_request');
+      const length = req.headers['content-length'];
+      if (req.method === 'POST' ? length === undefined || !/^\d+$/.test(length) || Number(length) > MAX_ISSUER_BYTES :
+          length !== undefined && length !== '0') return reject(req.method === 'POST' ? 411 : 400, 'invalid_request');
+      if (publicProxy && !active()) return reject(503, 'issuer_unavailable');
+      try { await issuerInteraction.operatorLoopback(req, res, `http://${host}`); }
+      catch { if (!res.headersSent) failure(res, 403, 'denied'); else res.destroy(); }
+    });
+    operatorServer.on('error', () => process.stderr.write('operator loopback listener unavailable\n'));
+    server.operatorServer = operatorServer;
+    server.on('listening', () => {
+      // Same lifetime as the gateway; loopback only, never a public address.
+      operatorServer.listen(localOperatorPort, '127.0.0.1');
+    });
+    server.on('close', () => { operatorServer.close(); operatorServer.closeAllConnections?.(); });
+  }
   if (operatorReader && notifyPending) {
     // Background discovery so a hook fires even when no agent is reading.
     // Never overlaps, never blocks tool calls, errors are ignored.

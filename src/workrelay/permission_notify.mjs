@@ -7,13 +7,17 @@ import { spawn } from 'node:child_process';
 export function validateNotifySettings(value) {
   if (value === undefined) return;
   const ok = value && typeof value === 'object' && !Array.isArray(value) &&
-    Object.keys(value).every(key => ['enabled', 'directories', 'notify_command', 'notify_webhook_url', 'poll_interval_ms'].includes(key)) &&
+    Object.keys(value).every(key => ['enabled', 'directories', 'notify_command', 'notify_webhook_url', 'poll_interval_ms', 'local_listen'].includes(key)) &&
     value.enabled === true &&
     (value.directories === undefined || Array.isArray(value.directories) && value.directories.length >= 1 && value.directories.length <= 100 &&
       value.directories.every(dir => typeof dir === 'string' && dir.startsWith('/') && dir !== '/' && !dir.endsWith('/') && !dir.split('/').some(part => part === '.' || part === '..'))) &&
     (value.notify_command === undefined || Array.isArray(value.notify_command) && value.notify_command.length >= 1 && value.notify_command.length <= 32 &&
       value.notify_command.every(arg => typeof arg === 'string' && arg.length <= 4096 && !/[\x00]/.test(arg)) && value.notify_command[0].startsWith('/')) &&
-    (value.poll_interval_ms === undefined || Number.isSafeInteger(value.poll_interval_ms) && value.poll_interval_ms >= 5000 && value.poll_interval_ms <= 3600000);
+    (value.poll_interval_ms === undefined || Number.isSafeInteger(value.poll_interval_ms) && value.poll_interval_ms >= 5000 && value.poll_interval_ms <= 3600000) &&
+    // Optional loopback-only operator page listener: exactly { port }, off by default.
+    (value.local_listen === undefined || value.local_listen !== null && typeof value.local_listen === 'object' && !Array.isArray(value.local_listen) &&
+      Object.keys(value.local_listen).length === 1 && Number.isSafeInteger(value.local_listen.port) &&
+      value.local_listen.port >= 1024 && value.local_listen.port <= 65535);
   if (!ok) throw Error('invalid operator_approvals configuration');
   if (value.notify_webhook_url !== undefined) {
     let url;

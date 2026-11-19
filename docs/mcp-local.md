@@ -269,11 +269,21 @@ Because approving a stale request has no useful effect and `always` has broad si
   "directories": ["/abs/project"],
   "notify_command": ["/abs/notify-script", "--flag"],
   "notify_webhook_url": "https://hooks.example/…",
-  "poll_interval_ms": 30000
+  "poll_interval_ms": 30000,
+  "local_listen": { "port": 49381 }
 }
 ```
 
 `directories` defaults to the bridge's `managed_allowed_directories` (or its `directory`). A request is shown only if its session's location equals or is inside one of them. The page is `<public_origin>/operator/permissions`. It requires self-hosted issuer mode and is served through the same gateway route checks as `/interaction/*`: loopback listener, Host/Origin/forwarding checks, the same SQLite rate limits and password lockout, and the provisioned operator password (Argon2id). Every form carries a single-use CSRF nonce bound to a flow cookie (login) or to a 5-minute `__Host-` operator session cookie (`HttpOnly; Secure; SameSite=Strict`). POSTs must carry the exact public `Origin`. The page lists pending requests with longer (still redacted) previews and offers **Approve once**, **Approve always** or **Deny** for live requests. Stale requests (stopped sessions) are listed after live ones, labelled with the session's status, and offer only a dismissal (deny). Before replying (`POST /api/session/<id>/permission/<id>/reply {"decision": "once"|"always"|"reject"}`), the gateway re-checks that the request is still pending in an allowed directory.
+
+**Reaching the page from your browser (`local_listen`, optional, off by default).** When `public_origin` is not publicly routable (for example a `.invalid` placeholder host), set `"local_listen": { "port": <port> }` (an integer 1024–65535, different from the gateway `port`; requires self-hosted issuer mode). The gateway then opens a second listener bound only to `127.0.0.1:<port>`, opened and closed with the gateway. It serves exactly `GET`/`POST /operator/permissions` and nothing else: `/mcp`, OAuth/OIDC (`/auth`, `/token`, `/jwks`, `/.well-known/*`), `/interaction/*` and every other path return 404. Requests must come from a loopback peer with exactly one `Host` of `127.0.0.1:<port>` or `localhost:<port>`, and no `Forwarded`/`X-Forwarded-*`/`X-Real-IP` headers. Login, decisions and refresh use the same operator password, lockout, rate limits, single-use CSRF nonces and 5-minute operator session as the public page. POSTs must carry `Origin: http://<that Host>`; the public origin and other ports are refused. Because this is a plain-HTTP origin, its cookies are `workrelay-operator-flow`/`workrelay-operator-session` with `Path=/operator/permissions; HttpOnly; SameSite=Strict`. They have no `Secure` attribute and no `__Host-` prefix, since browsers do not reliably accept those over `http://127.0.0.1`. Confidentiality comes from the SSH tunnel. Cookies from the public page are not accepted here. From your workstation:
+
+```sh
+ssh -N -L 49381:127.0.0.1:49381 box      # keep running; use the same port on both sides
+# then open http://127.0.0.1:49381/operator/permissions
+```
+
+Use the same local and remote port: the Host and Origin must equal the configured port. When `local_listen` is set, notifications use `http://127.0.0.1:<port>/operator/permissions` as `approval_url`. Never expose this port with a public bind or proxy. The main gateway port and the public page are unchanged.
 
 **Notifications (optional).** With `notify_command` (absolute argv, no shell, `PATH=/usr/bin:/bin`, 10 s timeout) and/or `notify_webhook_url` (HTTPS, or HTTP to loopback; POST, no redirects, 5 s timeout), the gateway sends one JSON payload per new live pending request (stale requests on stopped sessions are not notified). Delivery is deduplicated by permission ID per gateway process, so a restart may notify again. The payload is `{"event": "workrelay.permission.pending", "permission_id", "session_id", "action", "first_seen_at", "approval_url", "guidance"}`, written to the command's stdin or sent as the webhook body. It never includes command/resource text, titles or directories. Pending requests are found by agent reads/discover and by a background poll every `poll_interval_ms` (default 30 s, minimum 5 s). The poll never overlaps itself and pauses while the gateway is revoked. Notification failures are ignored and never block or alter tool calls.
 
