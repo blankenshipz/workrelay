@@ -1,5 +1,6 @@
 // Lifecycle views/actions over the SAME createEventsService outbox; no second store,
 // callback registry or model-visible signing secrets. Shared MCP core owns registration.
+import { DEFAULT_MANAGED_CLIENT_ID } from './managed_server.mjs';
 const sid = '^ses[A-Za-z0-9_-]{1,160}$', subscriptionID = '^sub_[a-f0-9]{64}$';
 const string = { type: 'string' }, nullableTime = { type: ['string', 'null'] };
 const object = (properties, required = Object.keys(properties)) => ({ type: 'object', properties, required, additionalProperties: false });
@@ -35,8 +36,8 @@ function denied(reason = 'managed_events_denied', code = -32001) { return Object
  * Core must forward structured errors (especially retryable revocation_pending), and
  * merge descriptors into its catalog/router. No inference, network startup or timers here.
  */
-export function createManagedEventTools({ events, serverId, identity, authorize } = {}) {
-  if (!events || !/^srv_[a-f0-9]{64}$/.test(serverId) || !identity?.issuer || !identity.audience || !identity.principal || events.principal !== identity.principal || identity.client_id !== 'https://chatgpt.com/oauth/client.json' || typeof authorize !== 'function') throw denied('missing_bound_authority');
+export function createManagedEventTools({ events, serverId, identity, authorize, pinnedClientId = DEFAULT_MANAGED_CLIENT_ID } = {}) {
+  if (!events || !/^srv_[a-f0-9]{64}$/.test(serverId) || !identity?.issuer || !identity.audience || !identity.principal || events.principal !== identity.principal || identity.client_id !== pinnedClientId || typeof authorize !== 'function') throw denied('missing_bound_authority');
   const expected = Object.freeze({ ...identity });
   async function check(claims, scope) {
     if (!claims || claims.iss !== expected.issuer || claims.aud !== expected.audience || claims.sub !== expected.principal || claims.client_id !== expected.client_id) throw denied();

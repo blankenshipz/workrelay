@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased — native questions and observed delivery
+## 0.2.0 — 2026-11-19
+
+### Native questions and observed delivery
 
 - Recover only proven pre-send question reservations after a dead owner, retaining the same decision and all admission checks.
 
@@ -8,13 +10,11 @@
 - Expose pending questions and read-only native operation reconciliation separately from historical receipt inspection.
 - Distinguish current execution and wait state from historical idle outcomes and unverified task completion.
 
-
-## Unreleased
-
 - OAuth renewal/reconnect: documented the reviewed candidate's 300-second access-token and fixed 14-day refresh-family contract, binding checks before token consumption/replay, concurrent duplicate `invalid_grant` handling and atomic family revocation. Fresh consent using the same authorized client/browser can create a new `workrelay:tasks openid` grant after revocation; old grant tokens remain denied. Rotation is strict: lost-response/stale-token replay yields `invalid_grant` and family revocation; transparent retry/grace is not implemented. The intended recovery is explicit reconnect, not client remove/re-add.
 - Evidence boundary: isolated tests used a 60-second fixture and did not alter live lifetimes, credentials, scopes or monitoring. Focused groups of 15 and 14 passed. The final unchanged-source elapsed gate passed in 223.686 seconds, covering two expiry/refresh/MCP-read cycles, restart persistence, binding preservation, concurrent refresh/replay revocation, lost-response behavior, same-client fresh-consent recovery and explicit revoke/teardown. An earlier elapsed attempt was terminated before completion and is superseded by this pass. The source candidate based on `20936c6` remains unreleased; `0.1.0` remains immutable. Production deployment and real ChatGPT UI behavior remain unverified.
 
 - Clarify guarded inference routing: new managed sessions use the configured creation-model default; existing sessions are evaluated against their current native catalog resolution and actual pinned OpenAI OAuth integration, with credentials, quota, guard and identity rechecked. This documentation reflects reviewed source behavior but does not claim the current deployed installation or ChatGPT journey accepted the route clarification. Unsupported/ambiguous routes remain fail-closed; no universal model ID, API-key path or fallback is promised.
+- Managed client pin: optional `managed_client_id` selects the OAuth client allowed to use the managed tools. It defaults to ChatGPT's CIMD client, so existing bindings are unchanged. In self-hosted mode it must exactly equal the registered `clientId`, and the capability binding `client_id` must match that pin.
 
 ## 0.1.0 — reviewed checkpoint
 

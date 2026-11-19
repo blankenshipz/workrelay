@@ -15,7 +15,7 @@ import { createEventsService } from './events.mjs';
 import { createMcpObservation } from './mcp_observation.mjs';
 import { createManagedEventTools, managedEventToolDefinitions } from './managed_event_tools.mjs';
 import { createManagedEventSource } from './managed_event_source.mjs';
-import { createManagedReader, managedServerID } from './managed_server.mjs';
+import { createManagedReader, managedServerID, managedClientID } from './managed_server.mjs';
 import { createIssuerAdapter } from './oidc_adapter.mjs';
 import { createUnexposedIssuerPolicy, createPreapprovalDiagnostic, createAuthorizationOutcomeDiagnostic, createTokenErrorDiagnostic } from './issuer_policy.mjs';
 import { createLocalInteractions, createOriginDiagnostic } from './issuer_interactions.mjs';
@@ -99,6 +99,10 @@ export function validateConfig(config, { testIssuer = false } = {}) {
   if (config.managed_supervisor_file !== undefined && (typeof config.managed_supervisor_file !== 'string' ||
       !config.managed_supervisor_file.startsWith('/') || resolve(config.managed_supervisor_file) !== config.managed_supervisor_file))
     throw Error('managed supervisor requires an exact private capability reference');
+  if (config.managed_client_id !== undefined && (typeof config.managed_client_id !== 'string' ||
+      !/^[\x21-\x7e]{1,2048}$/.test(config.managed_client_id) ||
+      (config.issuer_mode === 'self-hosted' && config.managed_client_id !== config.clientId)))
+    throw Error('managed client ID must be an exact configured OAuth client');
   if (config.issuer_mode === 'self-hosted' && !config.issuer_state_dir)
     throw Error('self-hosted issuer is not safely available without private state');
   const publicProxy = config.issuer_mode === 'self-hosted' && config.issuer_exposure === 'public-proxy';
@@ -530,7 +534,7 @@ export function createGateway(rawConfig, options = {}) {
       throw Error('private issuer store unavailable');
   }
   const invoke = options.invoke ?? bridge;
-  const managedClaims = { iss: config.issuer, aud: config.audience, sub: config.principal, client_id: 'https://chatgpt.com/oauth/client.json' };
+  const managedClaims = { iss: config.issuer, aud: config.audience, sub: config.principal, client_id: managedClientID(config) };
   const authorized = async (_principal, task, name, filter) => {
     if (_principal !== config.principal || !active() || !approved() || unsafeMarker || markerState() === 'pending') return false;
     if (name?.startsWith('session.')) {
@@ -649,7 +653,7 @@ export function createGateway(rawConfig, options = {}) {
   const managedReader = config.managed_supervisor_file ? createManagedReader(config, () =>
     privateIssuerFile(dirname(config.managed_supervisor_file), basename(config.managed_supervisor_file))) : undefined;
   const eventTools = events && managedReader ? createManagedEventTools({ events, serverId: managedServerID(config.managed_server),
-    identity: { issuer: config.issuer, audience: config.audience, principal: config.principal, client_id: managedClaims.client_id },
+    identity: { issuer: config.issuer, audience: config.audience, principal: config.principal, client_id: managedClaims.client_id }, pinnedClientId: managedClientID(config),
     authorize: async (claims, scope) => {
       if (!active() || !approved() || unsafeMarker || markerState() === 'pending' || scope.server_id !== managedServerID(config.managed_server)) return false;
       await managedReader(scope.session_id ? 'read' : 'authorize', scope.session_id ? { session_id: scope.session_id } : {}, claims);

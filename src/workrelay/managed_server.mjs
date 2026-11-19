@@ -7,11 +7,15 @@ import { nativeActivity } from './native_activity.mjs';
 
 const sid = /^ses[A-Za-z0-9_-]{1,160}$/;
 const deny = () => { throw Error('managed server access unavailable'); };
+// Pinned OAuth client for managed access. Upstream default is the ChatGPT CIMD client;
+// an operator may pin a different locally registered client via `managed_client_id`.
+export const DEFAULT_MANAGED_CLIENT_ID = 'https://chatgpt.com/oauth/client.json';
+export const managedClientID = expected => expected?.managed_client_id ?? DEFAULT_MANAGED_CLIENT_ID;
 export const managedServerID = binding => 'srv_' + createHash('sha256').update(JSON.stringify([binding.server, binding.service_registration, binding.client_service_module])).digest('hex');
 export function checkManagedBinding(binding, claims, expected) {
   if (!binding || binding.enabled !== true || binding.revoked !== false ||
       !claims || binding.issuer !== expected.issuer || binding.audience !== expected.audience ||
-      binding.subject !== expected.principal || binding.client_id !== 'https://chatgpt.com/oauth/client.json' ||
+      binding.subject !== expected.principal || binding.client_id !== managedClientID(expected) ||
       claims.iss !== binding.issuer || claims.aud !== binding.audience ||
       claims.sub !== binding.subject || claims.client_id !== binding.client_id) deny();
   for (const key of ['server', 'service_registration', 'client_service_module'])
