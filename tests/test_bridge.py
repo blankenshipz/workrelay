@@ -294,6 +294,43 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("unverified", result[2])
         self.assertFalse(any(path == "/api/session" for _, path in FakeClient.calls))
 
+    def lazy_plugins(self, loads_after):
+        """After a service restart the first `loads_after` plugin reads are empty."""
+        active = FakeClient.metadata["/api/plugin"]
+        reads = []
+
+        class Lazy(FakeClient):
+            def request(self, method, path, body=None):
+                if (method, path) == ("GET", "/api/plugin"):
+                    reads.append(path)
+                    self.calls.append((method, path))
+                    return {"data": active if len(reads) > loads_after else []}
+                return super().request(method, path, body)
+        return Lazy, reads
+
+    def test_start_and_respond_retry_lazy_plugin_load_once_each(self):
+        Lazy, reads = self.lazy_plugins(1)
+        rc, out, err = self.run_bridge("start", "--key", "warm", "--owner", "dot-work", "--text", "x", client_type=Lazy)
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(sum(path == "/api/session" for _, path in FakeClient.calls), 1)
+        self.assertEqual(sum(path.endswith("/prompt") for _, path in FakeClient.calls), 1)
+        self.assertEqual(len(reads), 3)  # failed attestation, warm-up, passing attestation
+        Lazy, reads = self.lazy_plugins(1)
+        rc, _, err = self.run_bridge("respond", "--key", "warm", "--owner", "dot-work", "--feedback-key", "f", "--text", "ok", client_type=Lazy)
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(sum(path.endswith("/prompt") for _, path in FakeClient.calls), 2)
+
+    def test_start_gives_up_after_bound_without_session_or_ledger(self):
+        Lazy, reads = self.lazy_plugins(10**6)
+        rc, _, err = self.run_bridge("start", "--key", "cold", "--owner", "dot-work", "--text", "x", client_type=Lazy)
+        self.assertEqual(rc, 2)
+        self.assertIn("unverified", err)
+        self.assertEqual(len(reads), 4 + 3)  # 4 attestations + 3 warm-ups
+        self.assertFalse(any(path == "/api/session" or path.endswith("/prompt") for _, path in FakeClient.calls))
+        db = sqlite3.connect(Path(self.data["state_dir"]) / "bridge.sqlite")
+        self.assertIsNone(db.execute("SELECT 1 FROM tasks WHERE task_key='cold'").fetchone())
+        db.close()
+
     def test_router_configuration_is_allowed_without_arbitrary_agents(self):
         self.data["agent"] = "harness-router"
         self.write_config()

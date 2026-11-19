@@ -207,6 +207,60 @@ def admission(config, client):
         raise GuardFailure('ATTESTATION_FAILED', attestation_check_id='UNCLASSIFIED') from None
 
 
+# After an OpenCode service restart, per-directory plugin instances load lazily:
+# the first attestation read for a directory can observe an empty inventory and
+# fail GUARD_PLUGIN_STATE. Only that check is retried, only by the pre-POST
+# admission callers, after asking the service to load that directory's plugins.
+PLUGIN_WARMUP_DELAYS = (1.0, 3.0, 6.0)  # seconds between attempts; ~10s bound
+
+
+def plugin_warmup_retryable(error):
+    return (isinstance(error, GuardFailure) and error.denial_code == 'ATTESTATION_FAILED' and
+            error.attestation_check_id == 'GUARD_PLUGIN_STATE')
+
+
+def warm_plugins(client):
+    """GET the same plugin inventory attestation reads. For a managed session the
+    guarded transport scopes it to the session's verified directory, which makes
+    the service load that directory's plugin instance. Result is ignored."""
+    try:
+        client.request('GET', '/api/plugin')
+    except Exception:
+        pass  # Warm-up is best effort; the following admission decides.
+
+
+def admission_with_plugin_warmup(config, client, *, admit=None, delays=None, sleep=None,
+                                 before_retry=None, on_retry=None):
+    """admission(), retrying GUARD_PLUGIN_STATE with bounded backoff.
+
+    Callers MUST invoke this only before any prompt/session POST is permitted.
+    before_retry() may raise to abort (e.g. authority changed); on_retry(n) is
+    told each retry number. After the bound the ORIGINAL failure is raised.
+    """
+    admit = admission if admit is None else admit
+    delays = PLUGIN_WARMUP_DELAYS if delays is None else delays
+    sleep = time.sleep if sleep is None else sleep
+    original = None
+    for attempt in range(len(delays) + 1):
+        try:
+            return admit(config, client)
+        except GuardFailure as error:
+            if not plugin_warmup_retryable(error):
+                raise  # A different check failed: that is the current verdict.
+            original = original or error
+            if attempt == len(delays):
+                raise original from None
+        warm_plugins(client)
+        sleep(delays[attempt])
+        if before_retry is not None:
+            before_retry()
+        if on_retry is not None:
+            try:
+                on_retry(attempt + 1)
+            except Exception:
+                pass  # Diagnostics never change the admission outcome.
+
+
 def database(state):
     db = sqlite3.connect(state / "bridge.sqlite", timeout=20, isolation_level=None)
     os.chmod(state / "bridge.sqlite", 0o600)
@@ -488,7 +542,8 @@ def main(argv=None):
             require(bool(args.text.strip()) and len(args.text) <= 16000, "task text missing or too long")
             require(bool(args.owner.strip()) and len(args.owner) <= 100, "owner missing or too long")
             digest = hashlib.sha256((args.owner + "\0" + args.text).encode()).hexdigest()
-            admission(config, client)
+            # Before any ledger write, session POST or prompt POST: retry-safe.
+            admission_with_plugin_warmup(config, client)
             db.execute("BEGIN IMMEDIATE")
             row = task_row(db, key)
             if row:
@@ -576,7 +631,7 @@ def main(argv=None):
                         session.get("outcome") not in ("failed", "interrupted"),
                         "task not accepting feedback")
                 fkey = validate_key(args.feedback_key)
-                admission(config, client)
+                admission_with_plugin_warmup(config, client)  # before any feedback reservation/POST
                 db.execute("BEGIN IMMEDIATE")
                 latest = task_row(db, key)
                 if latest[5] != "running":

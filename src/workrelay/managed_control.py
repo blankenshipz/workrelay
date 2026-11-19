@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlencode
 
-from .cli import admission, BridgeError, require, GuardFailure, CONTROL_DENIAL_CODES, ATTESTATION_CHECK_IDS
+from .cli import admission, admission_with_plugin_warmup, BridgeError, require, GuardFailure, CONTROL_DENIAL_CODES, ATTESTATION_CHECK_IDS
 from .supervision import redact_text
 
 
@@ -49,6 +49,9 @@ def initialize(db):
             db.execute('ALTER TABLE managed_operations ADD COLUMN guard_diagnostic TEXT')
         if 'provider_diagnostic' not in columns:
             db.execute('ALTER TABLE managed_operations ADD COLUMN provider_diagnostic TEXT')
+        if 'plugin_warmup_retries' not in columns:
+            # Bounded count of GUARD_PLUGIN_STATE warm-up retries before POST.
+            db.execute('ALTER TABLE managed_operations ADD COLUMN plugin_warmup_retries INTEGER CHECK(plugin_warmup_retries IS NULL OR plugin_warmup_retries BETWEEN 0 AND 10)')
         db.execute('COMMIT')
     except Exception:
         db.execute('ROLLBACK')
@@ -80,6 +83,12 @@ def record_denial(db, binding, session_id, operation_id, error):
                        (json.dumps(diagnostic, sort_keys=True), binding, session_id, operation_id))
     except Exception:
         pass
+
+
+def record_plugin_warmup(db, binding, session_id, operation_id, count):
+    """Diagnostic only: how many pre-POST plugin warm-up retries ran."""
+    db.execute("UPDATE managed_operations SET plugin_warmup_retries=? WHERE binding=? AND session=? AND operation=? AND phase='reserved'",
+               (count, binding, session_id, operation_id))
 
 
 def denial_fields(phase, code, timestamp, attestation_check_id=None):
@@ -347,7 +356,12 @@ def settle_question(db, config, client, authorize, session_id, operation_id, for
         model = session_data.get('model') if isinstance(session_data, dict) else None
         require(isinstance(model, dict) and model.get('providerID') in SUPPORTED_EXISTING_SESSION_WRITE_PROVIDERS and set(model) <= {'providerID', 'id', 'variant'} and
                 isinstance(model.get('id'), str) and model['id'], 'native model unavailable')
-        admission({**config, 'model': model}, client)
+        def still_same():  # still 'reserved': no reply/cancel POST yet
+            require(authorize() == binding, 'authority changed')
+            again = client.request('GET', '/api/session/' + session_id)
+            require(identity(again.get('data') if isinstance(again, dict) else None, session_id) == current, 'session identity changed')
+        admission_with_plugin_warmup({**config, 'model': model}, client, admit=admission, before_retry=still_same,
+            on_retry=lambda count: record_plugin_warmup(db, binding, session_id, operation_id, count))
         require(authorize() == binding, 'authority changed')
         form_reply = client.request('GET', f'/api/session/{session_id}/form/{form_id}')
         form = form_reply.get('data') if isinstance(form_reply, dict) else None
@@ -567,7 +581,14 @@ def control(db, config, client, authorize, session_id, operation_id, *, text=Non
         if not interrupt:
             # Existing-session model is authoritative. Creation keeps its configured
             # default; every write freshly attests this exact full native reference.
-            admission({**config, 'model': route_model}, client)
+            # Phase is still 'reserved': no POST is permitted yet, so a lazy
+            # plugin load after a service restart may be retried safely.
+            def still_same():
+                check()
+                if snapshot() != current:
+                    raise GuardFailure('IDENTITY_CHANGED')
+            admission_with_plugin_warmup({**config, 'model': route_model}, client, admit=admission, before_retry=still_same,
+                on_retry=lambda count: record_plugin_warmup(db, binding, session_id, operation_id, count))
         check()
         if snapshot() != current:
             raise GuardFailure('IDENTITY_CHANGED')
