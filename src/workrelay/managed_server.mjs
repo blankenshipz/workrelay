@@ -118,6 +118,17 @@ function sessionStatus(session, active, pendingCount) {
     terminalOutcomes.includes(session.outcome) ? session.outcome : session.time?.idle ? 'idle' : 'unknown';
 }
 
+// OpenCode 2.0.30 keeps pending permission requests in memory; a tool waits on
+// one only inside a running execution (listed by /api/session/active). A
+// session that is not running and has finished a drain (terminal outcome or
+// time.idle) has nothing waiting: its listed requests are stale (e.g. created
+// via POST /api/session/<id>/permission, or cleanup still settling after an
+// interrupt). Replying resumes nothing. A non-running session without either
+// marker stays conservatively live so a real block is never hidden.
+const isStopped = (session, active) => !active && (terminalOutcomes.includes(session?.outcome) || Boolean(session?.time?.idle));
+const STALE_GUIDANCE = 'These requests belong to sessions that are stopped (not running per /api/session/active). Nothing is waiting on them: approving resumes no tool, and "always" would still save a project-wide rule. They do not block the tree. A human operator may dismiss them (deny) on /operator/permissions; to continue the work, start a new turn (message/resume) instead.';
+const staleItem = (item, status) => ({ ...item, stale: true, session_status: status });
+
 function projection(session, active = false, taskOutcome = unreadableOutcome(`${HARNESS_UNREADABLE}.`)) {
   if (!session || !sid.test(session.id) || typeof session.projectID !== 'string' || session.projectID.length > 160) deny();
   // Arbitrary metadata and location paths are never copied.
@@ -197,13 +208,21 @@ export function createManagedReader(expected, readBinding, { loadService = path 
     const pendingFor = async (sessionID, budget, previewLimit = 160) => {
       const pending = (await nativeJSON(`/api/session/${sessionID}/permission`, 262144, budget))?.data;
       if (!Array.isArray(pending) || pending.length > 1000 || pending.some(item => item?.sessionID !== sessionID || !permissionIDPattern.test(item.id ?? ''))) deny();
-      const items = pending.map(item => permissionSummary(item, seen(item.id), previewLimit));
+      return pending.map(item => permissionSummary(item, seen(item.id), previewLimit));
+    };
+    // Notify only live requests; stale requests on stopped sessions never page a human.
+    const notifyLive = items => {
       if (items.length && onPendingPermissions) { try { onPendingPermissions(items.map(item => ({ ...item, resource_preview: undefined }))); } catch { /* notification never affects reads */ } }
-      return items;
+    };
+    // Split one session's listed requests into live and stale.
+    const classify = (session, running, items) => {
+      if (!isStopped(session, running)) { notifyLive(items); return { live: items, stale: [] }; }
+      const status = sessionStatus(session, false, 0);
+      return { live: [], stale: items.map(item => staleItem(item, status)) };
     };
     // Breadth-first bounded walk of native child sessions (parentID filter).
     const sessionTree = async (root, active, { maxDepth, maxSessions, budget }) => {
-      const pending = await pendingFor(root.id, budget);
+      const own = classify(root, active[root.id]?.type === 'running', await pendingFor(root.id, budget));
       const children = []; const queue = [[root.id, 0]]; const visited = new Set([root.id]); let truncated = false;
       while (queue.length) {
         const [parent, depth] = queue.shift();
@@ -216,25 +235,29 @@ export function createManagedReader(expected, readBinding, { loadService = path 
           if (visited.has(child.id)) continue;
           if (children.length >= maxSessions) { truncated = true; break; }
           visited.add(child.id);
-          const childPending = await pendingFor(child.id, budget);
+          const childRunning = active[child.id]?.type === 'running';
+          const childPending = classify(child, childRunning, await pendingFor(child.id, budget));
           children.push({ session_id: child.id, parent_session_id: parent, depth: depth + 1, agent: agentLabel(child.agent),
-            status: sessionStatus(child, active[child.id]?.type === 'running', childPending.length),
-            pending_permission_count: childPending.length, pending: childPending });
+            status: sessionStatus(child, childRunning, childPending.live.length),
+            pending_permission_count: childPending.live.length, stale_permission_count: childPending.stale.length,
+            pending: childPending.live, stale: childPending.stale });
           queue.push([child.id, depth + 1]);
         }
       }
-      return { pending, children, truncated, depth_limit: maxDepth };
+      return { pending: own.live, stale: own.stale, children, truncated, depth_limit: maxDepth };
     };
     const treeFields = (root, rootActive, tree, itemLimit = 20) => {
       const pending = [...tree.pending, ...tree.children.flatMap(child => child.pending)];
+      const stale = [...tree.stale, ...tree.children.flatMap(child => child.stale)];
       const running = tree.children.filter(child => child.status === 'running').length;
       const blocked = tree.children.filter(child => child.status === 'blocked_on_permission').length;
       const own = sessionStatus(root, rootActive, 0);
       return { blocked_on_permission: pending.length > 0,
         aggregate_status: pending.length ? 'blocked_on_permission' : rootActive || running ? 'running' : tree.truncated ? 'unknown' : own,
         pending_permissions: { count: pending.length, items: pending.slice(0, itemLimit), truncated: pending.length > itemLimit, decision: 'human_operator_only',
-          guidance: 'Pending native permission requests (including child sessions) can be approved or denied only by a human operator in the workrelay operator approval page (/operator/permissions) or a native OpenCode UI. No MCP tool, message, steer or resume can approve them.' },
-        children: { items: tree.children.map(({ pending: _omit, ...child }) => child), count: tree.children.length,
+          guidance: 'Pending native permission requests on live (running) sessions, including child sessions, can be approved or denied only by a human operator in the workrelay operator approval page (/operator/permissions) or a native OpenCode UI. No MCP tool, message, steer or resume can approve them. Requests on stopped sessions are listed separately under stale_permissions.' },
+        stale_permissions: { count: stale.length, items: stale.slice(0, itemLimit), truncated: stale.length > itemLimit, guidance: STALE_GUIDANCE },
+        children: { items: tree.children.map(({ pending: _omit, stale: _stale, ...child }) => child), count: tree.children.length,
           running_count: running, blocked_count: blocked, truncated: tree.truncated, depth_limit: tree.depth_limit } };
     };
     const taskOutcomeFor = async (session, { walk = true } = {}) => {
@@ -260,6 +283,12 @@ export function createManagedReader(expected, readBinding, { loadService = path 
         const session = (await nativeJSON('/api/session/' + input.session_id))?.data;
         if (session?.id !== input.session_id || !allowed(session.location?.directory)) deny();
         if (!(await pendingFor(input.session_id)).some(item => item.permission_id === input.permission_id)) return { replied: false, reason: 'not_pending' };
+        const runningNow = (await nativeJSON('/api/session/active'))?.data;
+        if (!runningNow || typeof runningNow !== 'object' || Array.isArray(runningNow)) deny();
+        // Approving a stale request resumes nothing, and "always" would still
+        // save a project-wide rule; only a dismissal (reject) is forwarded.
+        if (input.decision !== 'reject' && isStopped(session, runningNow[session.id]?.type === 'running'))
+          return { replied: false, reason: 'stale_session_stopped', session_status: sessionStatus(session, false, 0) };
         stillBound();
         const response = await fetcher(new URL(`/api/session/${input.session_id}/permission/${input.permission_id}/reply`, endpoint.url), {
           method: 'POST', headers: { ...service.headers(endpoint), 'content-type': 'application/json' }, body: JSON.stringify({ decision: input.decision }),
@@ -279,9 +308,11 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       const items = [];
       for (const session of sessions.values()) {
         if (!allowed(session.location?.directory)) continue;
-        for (const item of await pendingFor(session.id, undefined, 2000))
+        const { live, stale } = classify(session, running[session.id]?.type === 'running', await pendingFor(session.id, undefined, 2000));
+        for (const item of [...live, ...stale])
           items.push({ ...item, session_title: managedText(session.title, 200).text, directory: session.location.directory, agent: agentLabel(session.agent) });
       }
+      items.sort((x, y) => Number(Boolean(x.stale)) - Number(Boolean(y.stale))); // live first (stable)
       stillBound();
       return { items: items.slice(0, 100), truncated: items.length > 100, scanned_sessions: sessions.size };
     }
@@ -608,7 +639,7 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       catch (error) { if (error !== budget.exhausted) throw error; return { ...item, tree: { status: 'not_computed', reason: 'Discover tree budget exhausted; use read for this session.' } }; }
       const fields = treeFields(session, isActive, tree, 0);
       return { ...item, blocked_on_permission: fields.blocked_on_permission, aggregate_status: fields.aggregate_status,
-        tree: { pending_permission_count: fields.pending_permissions.count, child_count: fields.children.count, running_children: fields.children.running_count,
+        tree: { pending_permission_count: fields.pending_permissions.count, stale_permission_count: fields.stale_permissions.count, child_count: fields.children.count, running_children: fields.children.running_count,
           blocked_children: fields.children.blocked_count, truncated: fields.children.truncated } };
     }));
     stillBound();

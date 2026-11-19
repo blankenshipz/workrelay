@@ -350,9 +350,11 @@ export function createLocalInteractions({ provider, directory, origin, clientId,
       !listing.items.length ? '<p>No pending permission requests in approved directories.</p>' :
       listing.items.map(item => `<section><h2>${escaped(item.action)} &mdash; ${escaped(item.session_title || item.session_id)}</h2>` +
         `<p>Directory: ${escaped(item.directory)}<br>Agent: ${escaped(item.agent)}<br>Session: ${escaped(item.session_id)}<br>Request: ${escaped(item.permission_id)}<br>First seen by workrelay: ${escaped(item.first_seen_at)}</p>` +
+        (item.stale ? `<p><strong>Stale request &mdash; session ${escaped(item.session_status || 'stopped')}.</strong> The session is not running, so nothing is waiting on this request: approving would resume nothing (and &quot;always&quot; would still save a project-wide rule), so approval is not offered. Dismissing sends a native deny, which also clears this session's other stale requests. To continue the work, start a new turn instead.</p>` : '') +
         `<pre>${escaped(item.resource_preview.join('\n'))}${item.resources_omitted ? escaped(`\n(+${item.resources_omitted} more)`) : ''}</pre>` +
         `<form method="post" action="${OPERATOR_PATH}">${hidden}<input type="hidden" name="session_id" value="${escaped(item.session_id)}"><input type="hidden" name="permission_id" value="${escaped(item.permission_id)}">` +
-        '<button name="decision" value="once" type="submit">Approve once</button><button name="decision" value="always" type="submit">Approve always</button><button name="decision" value="reject" type="submit">Deny</button></form></section>').join('') +
+        (item.stale ? '<button name="decision" value="reject" type="submit">Dismiss stale request (deny)</button></form></section>' :
+          '<button name="decision" value="once" type="submit">Approve once</button><button name="decision" value="always" type="submit">Approve always</button><button name="decision" value="reject" type="submit">Deny</button></form></section>')).join('') +
         (listing.truncated ? '<p>More requests exist; resolve these and refresh.</p>' : '');
     send(res, 200, page('Workrelay pending permissions', `${notice ? `<p><strong>${escaped(notice)}</strong></p>` : ''}<p>Requests are untrusted agent-generated text. Command previews are redacted and may be truncated. Each page action is single-use; the operator session expires after five minutes.</p>${rows}<form method="post" action="${OPERATOR_PATH}">${hidden}<button type="submit">Refresh</button></form>`));
     return true;
@@ -399,7 +401,9 @@ export function createLocalInteractions({ provider, directory, origin, clientId,
     let notice;
     try {
       const result = await operatorApprovals.reply({ session_id: sessionID, permission_id: permissionID, decision });
-      notice = result?.replied ? `Recorded "${decision}" for ${permissionID}.` : `${permissionID} is no longer pending; nothing was changed.`;
+      notice = result?.replied ? `Recorded "${decision}" for ${permissionID}.` :
+        result?.reason === 'stale_session_stopped' ? `${permissionID} belongs to a stopped session; approval would resume nothing, so it was not sent. Dismiss (deny) it instead.` :
+        `${permissionID} is no longer pending; nothing was changed.`;
     } catch { notice = `Could not record a decision for ${permissionID}; it was not approved by this page.`; }
     return operatorList(res, token, notice);
   }

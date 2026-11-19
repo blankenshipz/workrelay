@@ -116,6 +116,73 @@ test('read exposes child sessions, blocked permissions and a non-terminal aggreg
   await assert.rejects(readerFor(fetcher)('read', { session_id: router }, claims), 'child must name the queried parent');
 });
 
+test('stale requests on a stopped (interrupted) tree do not report it as blocked', async () => {
+  // Real run shape: router and verifier interrupted by the operator; the
+  // verifier still lists a shell ask raised just before the interrupt.
+  const { state, fetcher } = fixture();
+  state.sessions[router] = { ...state.sessions[router], outcome: 'interrupted', time: { idle: 2 } };
+  state.sessions[verifier] = { ...state.sessions[verifier], agent: 'harness-verifier', outcome: 'interrupted', time: { idle: 2 } };
+  delete state.sessions[builder]; delete state.sessions[helper];
+  state.active = {};
+  state.permissions = { [verifier]: [{ id: 'per_stale1', sessionID: verifier, action: 'shell', resources: ['python -m pytest'] }] };
+  const notified = [];
+  const read = await readerFor(fetcher, { onPendingPermissions: items => notified.push(...items) })('read', { session_id: router }, claims);
+  assert.equal(read.runtime_status, 'interrupted');
+  assert.equal(read.aggregate_status, 'interrupted');
+  assert.equal(read.blocked_on_permission, false);
+  assert.equal(read.pending_permissions.count, 0);
+  assert.equal(read.stale_permissions.count, 1);
+  const [stale] = read.stale_permissions.items;
+  assert.equal(stale.permission_id, 'per_stale1'); assert.equal(stale.stale, true); assert.equal(stale.session_status, 'interrupted');
+  assert.match(read.stale_permissions.guidance, /stopped/);
+  assert.deepEqual(read.children.items.map(child => [child.session_id, child.status, child.pending_permission_count, child.stale_permission_count]),
+    [[verifier, 'interrupted', 0, 1]]);
+  assert.equal(read.children.blocked_count, 0);
+  assert.equal(Object.hasOwn(read.children.items[0], 'stale'), false);
+  assert.deepEqual(notified, [], 'stale requests never notify');
+
+  const page = await readerFor(fetcher)('discover', {}, claims);
+  const item = page.items.find(entry => entry.session_id === router);
+  assert.equal(item.aggregate_status, 'interrupted'); assert.equal(item.blocked_on_permission, false);
+  assert.deepEqual(item.tree, { pending_permission_count: 0, stale_permission_count: 1, child_count: 1, running_children: 0, blocked_children: 0, truncated: false });
+  const child = page.items.find(entry => entry.session_id === verifier);
+  assert.equal(child.aggregate_status, 'interrupted'); assert.equal(child.blocked_on_permission, false);
+
+  // The same request on a running session is a live block.
+  state.active = { [verifier]: { type: 'running' } };
+  const live = await readerFor(fetcher)('read', { session_id: router }, claims);
+  assert.equal(live.aggregate_status, 'blocked_on_permission'); assert.equal(live.blocked_on_permission, true);
+  assert.equal(live.stale_permissions.count, 0); assert.equal(live.children.items[0].status, 'blocked_on_permission');
+
+  // Root stale too: idle (no outcome) root, nothing running.
+  state.active = {};
+  state.sessions[router] = { ...state.sessions[router], outcome: undefined, time: { idle: 3 } };
+  state.permissions[router] = [{ id: 'per_stale0', sessionID: router, action: 'edit', resources: ['a.py'] }];
+  const idle = await readerFor(fetcher)('read', { session_id: router }, claims);
+  assert.equal(idle.aggregate_status, 'idle'); assert.equal(idle.stale_permissions.count, 2); assert.equal(idle.blocked_on_permission, false);
+});
+
+test('operator page offers only dismissal for stale requests and the reader refuses stale approvals', async () => {
+  const { state, fetcher } = fixture();
+  state.sessions[verifier] = { ...state.sessions[verifier], outcome: 'interrupted', time: { idle: 2 } };
+  state.permissions[verifier] = [{ id: 'per_stale1', sessionID: verifier, action: 'shell', resources: ['python -m pytest'] }];
+  const notified = [];
+  const operator = readerFor(fetcher, { operatorActions: true, onPendingPermissions: items => notified.push(...items) });
+  const directories = ['/work/dd'];
+  const listing = await operator('pending_permissions', { directories }, claims);
+  assert.deepEqual(listing.items.map(item => [item.permission_id, Boolean(item.stale), item.session_status]),
+    [['per_pending1', false, undefined], ['per_stale1', true, 'interrupted']], 'live first, stale labelled');
+  assert.deepEqual(notified.map(item => item.permission_id), ['per_pending1']);
+  for (const decision of ['once', 'always'])
+    assert.deepEqual(await operator('permission_reply', { directories, session_id: verifier, permission_id: 'per_stale1', decision }, claims),
+      { replied: false, reason: 'stale_session_stopped', session_status: 'interrupted' });
+  assert.equal(state.replies.length, 0);
+  assert.equal((await operator('permission_reply', { directories, session_id: verifier, permission_id: 'per_stale1', decision: 'reject' }, claims)).replied, true);
+  assert.deepEqual(state.replies, [{ session: verifier, permission: 'per_stale1', body: { decision: 'reject' } }]);
+  // A live request still accepts approval.
+  assert.equal((await operator('permission_reply', { directories, session_id: helper, permission_id: 'per_pending1', decision: 'once' }, claims)).replied, true);
+});
+
 test('session_check authorizes writes without a tree walk', async () => {
   const { state, fetcher } = fixture();
   const checked = await readerFor(fetcher)('session_check', { session_id: router }, claims);
@@ -129,7 +196,7 @@ test('discover adds a compact tree and task summary per session', async () => {
   const item = page.items.find(entry => entry.session_id === router);
   assert.equal(item.blocked_on_permission, true);
   assert.equal(item.aggregate_status, 'blocked_on_permission');
-  assert.deepEqual(item.tree, { pending_permission_count: 1, child_count: 3, running_children: 1, blocked_children: 1, truncated: false });
+  assert.deepEqual(item.tree, { pending_permission_count: 1, stale_permission_count: 0, child_count: 3, running_children: 1, blocked_children: 1, truncated: false });
   assert.match(item.task_outcome.reason, /not readable by workrelay/);
   assert.equal(page.items.find(entry => entry.session_id === helper).blocked_on_permission, true);
   assert.equal(JSON.stringify(page).includes('hunter2'), false);
@@ -279,6 +346,12 @@ test('operator page requires password, single-use CSRF and origin before any dec
   assert.equal(replies.length, 1);
   const refreshed = await send(tokens(decided.text));
   assert.match(refreshed.text, /No pending permission requests/);
+  pending = [{ permission_id: 'per_stale1', session_id: verifier, action: 'shell', resource_preview: ['pytest'], resources_omitted: 0, stale: true, session_status: 'interrupted',
+    first_seen_at: '2026-11-19T00:00:00.000Z', session_title: 'DD verify', directory: '/work/dd', agent: 'harness-verifier' }];
+  const stalePage = await send(tokens(refreshed.text));
+  assert.match(stalePage.text, /Stale request &mdash; session interrupted/);
+  assert.match(stalePage.text, /value="reject"[^>]*>Dismiss stale request/);
+  assert.doesNotMatch(stalePage.text, /value="once"|value="always"/, 'no approval offered for stale requests');
   // Without operatorApprovals configured the route does not exist.
   const plain = createLocalInteractions({ provider: { interactionDetails: async () => ({}), interactionFinished: async () => {} }, directory: dir, origin, clientId: 'cid', resource: origin + '/mcp' });
   const res = { statusCode: 0, writeHead(code) { this.statusCode = code; }, end() {}, setHeader() {} };
