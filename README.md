@@ -4,7 +4,18 @@
 
 For example, ask your assistant to inspect a small issue in an isolated project, make one focused change under the existing OpenCode permissions, and report the changed file and check result. If OpenCode pauses for a native permission decision, the work waits for you; a message from the assistant does not approve it. Your computer, OpenCode service, Workrelay gateway, and HTTPS route must remain available while work is running.
 
-OpenAI describes Dots as ongoing assistants that carry goals and follow up across conversations, and documents connected apps through Plugins. Its developer docs describe authenticated MCP tools and MCP Events, including Dot use. Those docs establish the client/protocol surface—not successful Workrelay acceptance on every account or client path: [Introducing Dots](https://openai.com/index/introducing-dots/), [Dot setup and controls](https://help.openai.com/en/articles/20001530-getting-started-with-your-dot), [MCP servers](https://developers.openai.com/plugins/concepts/mcp-server), [MCP Events](https://developers.openai.com/plugins/build/mcp-events), and [OAuth authentication](https://developers.openai.com/plugins/build/auth).
+## Agent quickstart (any platform)
+
+1. **Connect** your MCP client to the gateway (`https://<host>/mcp`, OAuth) or a stdio proxy; tools come from the gateway.
+2. **Set your listener once**: `workrelay_server_notify {"action":"check","scope":"agent","agent":"<YourName>"}`; if none, `{"action":"set","scope":"agent","agent":"<YourName>","url":"https://<public-443-webhook>"}` then `{"action":"test",...}`.
+3. **Start work in one call**: `workrelay_server_start {"project":"<name or project_id>","agent":"<YourName>","text":"<task>"}` (add `"reuse":true` to continue your latest session; it rolls over above ~150k tokens). Retries are safe: it never starts twice.
+4. **Read the reply**: `session_id`, `status`, and `queued_behind` (`"ask"`: waiting on a permission ask, with age and summary; `"busy"`: behind the current run; `null`: free).
+5. **End your turn.** Do not poll; idle is not done.
+6. **Act on events** POSTed to your listener: `permission_asked` (tell your human), `finished`/`failed` (call `workrelay_server_read` with `include_messages:true`), `stalled` (read, then `workrelay_server_steer` or `interrupt`).
+7. **Follow up** with `workrelay_server_message` (queue) or `workrelay_server_steer` (running owner); both return `queued_behind`.
+8. **Permission asks are answered only by a human operator** on the Workrelay operator page (`/operator/permissions`) or a native OpenCode UI. No agent, message or MCP tool can approve them; do not resend while `queued_behind` is `"ask"`.
+9. **Native questions** (not permissions) can be answered with `workrelay_server_waits` then `workrelay_server_question_reply`, using your human's explicit choice.
+10. Details: [listen for events](#progress-notifications-listen-for-events), [docs/mcp-local.md](docs/mcp-local.md).
 
 ## Progress notifications (listen for events)
 
@@ -241,6 +252,10 @@ The 3-step setup (create a listener, register, test), the event schema, signatur
 - Interrupt targets only the named session, does not cancel descendants, remove queued text, or roll back edits. `idle_noop` is not proof an active task was stopped.
 - OAuth access tokens expire after 300 seconds; refresh authorization has a fixed maximum 14-day lifetime and rotates strictly. A lost refresh response can make a retry return `invalid_grant` and revoke the refresh family; transparent retry/grace is not implemented. Reconnect through the same client/browser and fresh consent when required—do not automatically replay the old refresh token or remove/re-add the client as the default fix. The reviewed OAuth change is deployed and the isolated renewal gate passed. A user-reported Dot reconnect/read succeeded, but that does not establish general ChatGPT UI renewal reliability; see [OAuth recovery details](docs/mcp-local.md#oauth-expiry-rotation-and-reconnect).
 - Do not place secrets in prompts, command arguments, logs, or Git. Do not loosen the existing subscription guard or infer task completion from idle/succeeded status. Revoke managed access using its private capability/revocation control; disabling a tunnel is not a substitute for revoking OAuth authority.
+
+## ChatGPT Dots and OpenAI clients
+
+OpenAI describes Dots as ongoing assistants that carry goals and follow up across conversations, and documents connected apps through Plugins. Its developer docs describe authenticated MCP tools and MCP Events, including Dot use. Those docs establish the client/protocol surface—not successful Workrelay acceptance on every account or client path: [Introducing Dots](https://openai.com/index/introducing-dots/), [Dot setup and controls](https://help.openai.com/en/articles/20001530-getting-started-with-your-dot), [MCP servers](https://developers.openai.com/plugins/concepts/mcp-server), [MCP Events](https://developers.openai.com/plugins/build/mcp-events), and [OAuth authentication](https://developers.openai.com/plugins/build/auth).
 
 ## Evidence and further reading
 

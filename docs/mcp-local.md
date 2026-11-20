@@ -223,6 +223,20 @@ The maintained provider emits `grant.error(ctx,err)` from its token-route error 
 
 No raw request/response, token, code, cookie, account, client, URL, session content, error message or stack is passed to the recorder. Exclusive `token-error.used` claim and atomic mode-0600 `token-error.receipt.json` publication prevent overwrite/reuse across processes and restart. These filenames are independent of other diagnostic arms. Missing/unsafe/malformed/expired state or recorder/callback failure cannot change authentication. Success and provider `server_error` are not captured; no receipt is inconclusive, not success or authorization to retry. Privately retain a finished arm/used/receipt together before any separately authorized later attempt, and disable this optional configuration after capture/expiry without deleting credentials/grants or shutting down ordinary service. Local maintained-provider fixture tests establish the hook and privacy contract, not installed or ChatGPT acceptance.
 
+## Start work in one call and see what your message waits on
+
+`workrelay_server_start {project, agent, text, title?, reuse?, operation_id?, notify?}` creates a session and sends its first message.
+
+- `project` may be a `project_id`, a native project name, or a root folder name. Ambiguous names return `candidates`.
+- Without `operation_id` the call is idempotent per client, agent, project, text, reuse and UTC day. A retry returns the same session with `replayed: true` and sends nothing. Pass a new `operation_id` to send identical text again. Reusing an `operation_id` with different arguments returns `operation_id_conflict`.
+- `reuse: true` continues the agent's latest session started with this tool for that project. It moves to a fresh session (`rolled_over_from`) when the latest session's context is above 150k tokens or the session is archived. If the latest session cannot be read, the call fails closed with `reuse_session_unreadable` and sends nothing.
+
+`workrelay_server_message`, `steer`, `resume` and `start` return `queued_behind`, observed just before the send (bounded to about 4 seconds):
+
+- `"ask"`: a live permission ask in the session tree is pending. The response also has `queued_age_seconds`, `queued_age_source` and `queued_ask` (`summary`, which is redacted and at most 120 characters, plus `action`, `agent`, `in_child_session` and `parked`). Only a human operator can answer the ask; do not resend.
+- `"busy"`: the session or a child is running. Your input waits for the next turn or boundary.
+- `null`: nothing is ahead of it. If the state could not be observed, the response also has `queue_state: "unavailable"`.
+
 ## Normal use and external acceptance
 
 **Tool-call audit log (`audit_log`):** the gateway appends one JSON line per MCP tool call (`workrelay_*`, `workrelay_server_*` and `workrelay_event_*`) with exactly: `ts` (ISO time), `tool`, `session_id` (from the arguments, or the created session for create; else `null`), `operation_key` (`operation_id`, or the task `key` for scoped tools; else `null`), `client_id` (the verified token's OAuth client ID), `duration_ms`, `status` (`ok`/`error`) and, on error, `error_category` (`exception`, `unavailable_or_denied`, `denied`, `uncertain`, `conflict`, `not_found`, `ambiguous`, `events_denied` or `tool_error`) plus, when known, the finite `error_code`, `denial_code` and `attestation_check_id` values. It never records message text, prompts, answers, titles, directories, other arguments, tool output, tokens, webhook secrets or exception text. Identifiers are validated against fixed patterns and omitted otherwise. A denied operation receipt is logged as `error`/`denied`. Calls rejected by the MCP SDK's input-schema validation never reach a tool and are not logged.

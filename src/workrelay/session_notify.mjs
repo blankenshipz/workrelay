@@ -138,7 +138,7 @@ function privateDirectory(path) {
   const dir = lstatSync(dirname(path));
   return dir.isDirectory() && !dir.isSymbolicLink() && dir.uid === process.getuid() && !(dir.mode & 0o077);
 }
-function readPrivateJSON(path, maxBytes = 65536) {
+export function readPrivateJSON(path, maxBytes = 65536) {
   if (!privateDirectory(path)) throw Object.assign(Error('not private'), { reason: 'secrets_file_not_private' });
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
@@ -330,7 +330,7 @@ export function createClientDefaults({ file, now = Date.now } = {}) {
   };
 }
 
-function writePrivateJSON(path, data) {
+export function writePrivateJSON(path, data) {
   if (!privateDirectory(path)) throw Object.assign(Error('directory not private'), { reason: 'directory_not_private' });
   const temporary = join(dirname(path), `.${basename(path)}.${randomBytes(6).toString('hex')}`);
   const fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.4.0 - 2026-11-20
+
+- `workrelay_server_message`/`steer`/`resume` now return `queued_behind`: `"ask"` when a live permission ask anywhere in the session tree is pending (only a human operator can answer it), `"busy"` when the session or a child is running, or `null`. Non-null values carry `queued_age_seconds` and `queued_age_source`. For `"ask"` there is also `queued_ask`, with the permission id, the session, the agent, whether it is in a child session, a short redacted summary (at most 120 characters), `parked`, and who can answer it. The state is observed just before the send, from the OpenCode session, active-run and permission APIs. When the harness park log `<harness_state_dir>/telemetry/permission-park.jsonl` exists, it is read (tail only, owner-only file) to mark the ask `parked` and to date it. Otherwise the ask age is a lower bound taken from the gateway's first sighting, which is now shared across the gateway's readers. If the state cannot be observed, the field is `queued_behind: null` with `queue_state: "unavailable"`.
+- New tool `workrelay_server_start {project, agent, text, title?, reuse?, operation_id?, notify?}` creates a session and sends its first message in one idempotent call.
+  - `project` accepts a `project_id`, a native project name or a root folder name. Duplicate historical IDs for one root resolve to the current handle. Ambiguous matches return candidates.
+  - `operation_id` is optional. The automatic ID hashes client, agent, project, text, reuse and the UTC day, so retries return the same session and never create or send twice.
+  - `reuse: true` continues the agent's latest session that was started through `workrelay_server_start` for that project. It rolls over to a fresh session when the latest session's context exceeds 150k tokens (from the newest assistant message's token use), or when it is gone or archived. The response then includes `rolled_over_from`.
+  - Returns `session_id`, `status`, `created`, `reused`, `queued_behind` and `notify`.
+  - Reuse and retry records are kept in the private `server-start.json` next to the managed capability file.
+- All existing tools and arguments are unchanged.
+- Shorter descriptions for the managed server tools, keeping the key rules: human-only approvals, operation_id reuse, notify onboarding, and that idle is not done. The server instructions point to `workrelay_server_start`. The capabilities journey has a new `start_in_one_call` stage.
+- README: a 10-line any-platform agent quickstart at the top. The OpenAI Dots/ChatGPT text has moved to a section near the end.
+
 ## 0.3.0 - 2026-11-20
 
 - Default-on listener onboarding: the server instructions and the `workrelay_server_create`/`message`/`resume`/`notify` descriptions tell every new agent, on first use, to run `workrelay_server_notify` `check` (scope `agent`) and, if no listener is shown, register its own (scope `agent`) and test it, with a link to the setup guide. Works on any platform.

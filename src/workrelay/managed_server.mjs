@@ -1,7 +1,7 @@
 // Explicit managed-registration authority; no session mutation or inference routes.
 import { realpathSync, lstatSync, openSync, fstatSync, readSync, closeSync, constants as fsConstants } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { dirname, relative, isAbsolute, join, resolve as resolvePath } from 'node:path';
+import { dirname, basename, relative, isAbsolute, join, resolve as resolvePath } from 'node:path';
 import { createHash } from 'node:crypto';
 import { nativeActivity } from './native_activity.mjs';
 
@@ -196,15 +196,58 @@ export function activityTail(messages, limit = 14) {
   return entries.reverse().flat().slice(-limit);
 }
 
+// Process-wide earliest observation per native permission request (bounded),
+// shared by every reader in the gateway so the operator poller's first sighting
+// dates an ask that an MCP caller later queues behind.
+const firstSeen = new Map();
+const seenAt = id => {
+  if (!firstSeen.has(id)) { firstSeen.set(id, new Date().toISOString()); if (firstSeen.size > 5000) firstSeen.delete(firstSeen.keys().next().value); }
+  return firstSeen.get(id);
+};
+
+// Harness park-and-yield log (<state>/telemetry/permission-park.jsonl), when the
+// harness writes one: requestID -> { parked: true, since_ms }. Read-only, tail
+// only (64KB), owner-only file, never trusted beyond these two fields.
+export function harnessParkedAsks(stateDir, ids, { stat = lstatSync } = {}) {
+  const found = new Map();
+  if (!stateDir || !ids?.size) return found;
+  const file = join(stateDir, 'telemetry', 'permission-park.jsonl');
+  let fd;
+  try {
+    for (const path of [stateDir, dirname(file)]) {
+      const entry = stat(path);
+      if (!entry.isDirectory() || entry.isSymbolicLink() || ![0, process.getuid()].includes(entry.uid) || entry.mode & 0o022) return found;
+    }
+    fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+    const entry = fstatSync(fd);
+    if (!entry.isFile() || ![0, process.getuid()].includes(entry.uid) || entry.mode & 0o022) return found;
+    const size = Math.min(entry.size, 65536);
+    const bytes = Buffer.alloc(size);
+    const read = readSync(fd, bytes, 0, size, entry.size - size);
+    for (const line of bytes.toString('utf8', 0, read).split('\n')) {
+      let record; try { record = JSON.parse(line); } catch { continue; }
+      if (record?.outcome !== 'parked' || !ids.has(record.requestID)) continue;
+      const at = Date.parse(record.at), pending = Number.isSafeInteger(record.pendingMs) && record.pendingMs >= 0 ? record.pendingMs : 0;
+      if (Number.isFinite(at)) found.set(record.requestID, { parked: true, since_ms: at - pending });
+    }
+  } catch { /* absent or unreadable: park state unknown */ } finally { if (fd !== undefined) closeSync(fd); }
+  return found;
+}
+
+// Context size of a native session: the newest assistant message's token use.
+export function contextTokens(messages) {
+  if (!Array.isArray(messages)) return null;
+  const n = value => Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  const total = tokens => n(tokens.input) + n(tokens.output) + n(tokens.reasoning) + n(tokens.cache?.read) + n(tokens.cache?.write);
+  // Skip in-flight messages that report no usage yet.
+  const message = messages.find(item => item?.type === 'assistant' && item.tokens && typeof item.tokens === 'object' && total(item.tokens) > 0);
+  return message ? total(message.tokens) : null;
+}
+
 export function createManagedReader(expected, readBinding, { loadService = path => import(pathToFileURL(path).href),
   fetcher = fetch, canonical = realpathSync, stat = lstatSync, internalAuthorize, harnessStateDir,
   operatorActions = false, onPendingPermissions } = {}) {
-  // Process-local earliest observation per native permission request (bounded).
-  const firstSeen = new Map();
-  const seen = id => {
-    if (!firstSeen.has(id)) { firstSeen.set(id, new Date().toISOString()); if (firstSeen.size > 5000) firstSeen.delete(firstSeen.keys().next().value); }
-    return firstSeen.get(id);
-  };
+  const seen = seenAt;
   const read = async (action, input, claims, selectedSession, observe) => {
     const stage = (name, status) => { try { observe?.(name, action, status); } catch { /* diagnostic only */ } };
     stage('binding');
@@ -388,6 +431,50 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       return { generated_at: new Date(now).toISOString(), truncated: candidates.length > shown.length,
         projects: [...projects].map(([directory, items]) => ({ directory, sessions: items })) };
     }
+    if (action === 'queue_state') {
+      // What a message sent now would wait behind: a live permission ask in the
+      // tree (answered only by a human), else a running drain. Read-only.
+      if (!sid.test(input.session_id ?? '')) deny();
+      const session = (await nativeJSON('/api/session/' + input.session_id))?.data;
+      if (session?.id !== input.session_id) deny();
+      const running = (await nativeJSON('/api/session/active'))?.data;
+      if (!running || typeof running !== 'object' || Array.isArray(running)) deny();
+      const tree = await sessionTree(session, running, { maxDepth: 3, maxSessions: 25 });
+      const asks = [...tree.pending.map(item => ({ ...item, agent: agentLabel(session.agent), child: false })),
+        ...tree.children.flatMap(child => child.pending.map(item => ({ ...item, agent: child.agent, child: true })))];
+      const busy = running[session.id]?.type === 'running' || tree.children.some(child => child.status === 'running');
+      let lastUser;
+      if (!asks.length && busy) {
+        const page = (await nativeJSON(`/api/session/${session.id}/message?` + new URLSearchParams({ limit: '10', order: 'desc' }), 2000000))?.data;
+        lastUser = Array.isArray(page) ? page.find(message => message?.type === 'user' && Number.isSafeInteger(message.time?.created)) : undefined;
+      }
+      stillBound();
+      const at = Date.now();
+      if (asks.length) {
+        const parked = harnessParkedAsks(harnessStateDir, new Set(asks.map(item => item.permission_id)));
+        const since = item => Math.min(Date.parse(item.first_seen_at) || at, parked.get(item.permission_id)?.since_ms ?? at);
+        const oldest = asks.reduce((a, b) => since(b) < since(a) ? b : a);
+        const fromPark = (parked.get(oldest.permission_id)?.since_ms ?? Infinity) < (Date.parse(oldest.first_seen_at) || at);
+        const resource = oldest.resource_preview[0];
+        return { queued_behind: 'ask', age_seconds: Math.max(0, Math.round((at - since(oldest)) / 1000)), asks_pending: asks.length,
+          ask: { permission_id: oldest.permission_id, session_id: oldest.session_id, agent: oldest.agent, in_child_session: oldest.child, action: oldest.action,
+            summary: managedText(`${oldest.action}${resource ? ': ' + resource : ''}`, 120).text, parked: parked.has(oldest.permission_id) },
+          age_source: fromPark ? 'harness_park_log' : 'gateway_first_seen (lower bound; resets on gateway restart)' };
+      }
+      if (busy) return { queued_behind: 'busy', age_seconds: lastUser ? Math.max(0, Math.round((at - lastUser.time.created) / 1000)) : null,
+        age_source: lastUser ? 'last_user_message' : 'unknown' };
+      return { queued_behind: null };
+    }
+    if (action === 'session_context') {
+      // Reuse check for workrelay_server_start: project, liveness and context size.
+      if (!sid.test(input.session_id ?? '')) deny();
+      const session = (await nativeJSON('/api/session/' + input.session_id))?.data;
+      if (session?.id !== input.session_id || typeof session.projectID !== 'string') deny();
+      const page = (await nativeJSON(`/api/session/${session.id}/message?` + new URLSearchParams({ limit: '10', order: 'desc' }), 8000000))?.data;
+      stillBound();
+      return { session_id: session.id, project_id: 'project_' + createHash('sha256').update(session.projectID).digest('hex'),
+        root: !sid.test(session.parentID ?? ''), archived: Boolean(session.time?.archived), context_tokens: contextTokens(page) };
+    }
     if (action === 'pending_permissions' || action === 'permission_reply') {
       // Human-operator approval surface only. Never reachable from MCP tools:
       // the gateway constructs a separate reader with operatorActions enabled.
@@ -492,7 +579,7 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       if (before.dev !== registration.dev || before.ino !== registration.ino || before.mtimeMs !== registration.mtimeMs) deny();
     } else if (action === 'open_events') {
       path = '/api/event';
-    } else if (action === 'projects' || action === 'agents' || action === 'resolve_project' || action === 'creation_target') {
+    } else if (action === 'projects' || action === 'agents' || action === 'resolve_project' || action === 'creation_target' || action === 'start_project') {
       path = action === 'agents' ? '/api/agent' : '/api/project';
     } else if (action === 'active') {
       path = '/api/session/active';
@@ -644,6 +731,23 @@ export function createManagedReader(expected, readBinding, { loadService = path 
       return { available: true, target: input.project_id === undefined ? 'configured_default_workspace' : 'registered_project_root', project_id: 'project_' + createHash('sha256').update(current.id).digest('hex'),
         label: managedText(matches.find(project => project.canonical === root)?.name, 200).text || 'Configured creation project',
         guidance: 'Optional default-project helper, not the only allowed project. Omit directory to select this native project canonical root, which may differ from the configured workspace subdirectory. Other discovered native projects remain selectable by the pinned server-wide principal. Never change arguments on a denied operation ID; native checks still apply.' };
+    }
+    if (action === 'start_project') {
+      // workrelay_server_start: a project_id, native name or root folder name.
+      // Several historical native IDs for one root resolve to its current handle.
+      const query = typeof input.project === 'string' ? input.project.trim() : '';
+      if (!query || query.length > 200 || !Array.isArray(value) || value.length > 10000) deny();
+      const handle = project => 'project_' + createHash('sha256').update(project.id).digest('hex');
+      const lower = query.toLowerCase();
+      const matches = value.filter(project => typeof project?.id === 'string' && project.id.length && project.id.length <= 160 &&
+        (handle(project) === query || typeof project.name === 'string' && project.name.toLowerCase() === lower ||
+          typeof project.canonical === 'string' && isAbsolute(project.canonical) && basename(project.canonical).toLowerCase() === lower));
+      const roots = [...new Set(matches.map(project => project.canonical).filter(root => typeof root === 'string' && isAbsolute(root)))];
+      const label = project => managedText(project.name, 200).text || `Project ${handle(project).slice(-8)}`;
+      if (!matches.length || !roots.length) return { error: 'project_not_found' };
+      if (roots.length !== 1) return { error: 'project_ambiguous', candidates: matches.slice(0, 10).map(project => ({ project_id: handle(project), label: label(project) })) };
+      const current = matches.length === 1 && value.filter(project => project?.canonical === roots[0]).length === 1 ? matches[0] : await currentLocation(roots[0]);
+      return { native_project_id: current.id, project_id: handle(current), label: label(matches.find(project => project.id === current.id) ?? matches[0]) };
     }
     if (action === 'resolve_project') {
       if (!/^project_[a-f0-9]{64}$/.test(input.project_id ?? '') || !Array.isArray(value) || value.length > 10000) deny();
