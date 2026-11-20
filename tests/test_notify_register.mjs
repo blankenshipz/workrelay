@@ -20,7 +20,10 @@ test('notify-register CLI: secrets only from env, never printed; set/show/test/l
   const dir = await privateDir(t);
   const file = join(dir, 'notify-clients.json');
   for (const bad of [['--url', HOOK], ['--header-value=x'], ['--hmac-secret', SIG]]) assert.throws(() => parseArgs(['--file', file, ...bad]), /not accepted/);
-  await assert.rejects(run(['--file', file, '--client', 'agent-a', '--url-env', 'WR_URL']), /WR_URL \(url\) is not set/);
+  await assert.rejects(run(['--file', file, '--hmac-secret-env', 'whsecABCsecretvalue', '--client', 'x', '--url-env', 'U'], { U: HOOK }), e => !/whsecABC/.test(e.message));
+  await assert.rejects(run(['--file', file, 'https://hooks.example.com/secretpath']), e => !/secretpath/.test(e.message));
+  await assert.rejects(run(['--file', file, '--show']), /--client is required with --file/);
+  await assert.rejects(run(['--file', file, '--client', 'agent-a', '--url-env', 'WR_URL']), /the variable named by --url-env is not set/);
   await assert.rejects(run(['--file', file, '--client', 'agent-a', '--url-env', 'WR_URL', '--header-name', 'X-S'], { WR_URL: HOOK }), /needs both/);
   await assert.rejects(run(['--file', file, '--client', 'agent-a', '--url-env', 'WR_URL'], { WR_URL: 'https://10.0.0.1/x' }), /not registered: invalid_url/);
 
@@ -51,3 +54,12 @@ test('notify-register CLI: secrets only from env, never printed; set/show/test/l
   assert.match((await run(['--file', file, '--client', 'agent-a', '--clear'])).text, /"cleared": true/);
   await assert.rejects(run(['--file', file, '--client', 'agent-a', '--test']), /no usable client default/);
 });
+
+test('notify-register CLI: default client is the gateway managed client id', async t => {
+  const dir = await privateDir(t);
+  const config = join(dir, 'mcp.json');
+  await fs.writeFile(config, JSON.stringify({ managed_supervisor_file: join(dir, 'capability.json'), session_notify: { enabled: true } }));
+  const shown = await run(['--config', config, '--show']);
+  assert.match(shown.text, /"client_id": "https:\/\/chatgpt\.com\/oauth\/client\.json"/);
+});
+

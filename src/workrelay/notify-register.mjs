@@ -10,13 +10,14 @@
 //
 // Secret values are read ONLY from the named environment variables and are
 // never printed; output shows the URL host, header name and signed flag.
-// --client defaults to the gateway's managed client id. --file PATH writes a
+// --client defaults to the gateway's managed OAuth client id. --file PATH writes a
 // clients file directly instead of deriving it from --config. The gateway
 // reads the file at use time: no restart is needed.
 import { readFileSync, realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { createClientDefaults, sessionNotifyPaths, testNotifyEvent, sendTestEvent, NOTIFY_FORMATS } from './session_notify.mjs';
 import { createPinnedWebhookTransport } from './events.mjs';
+import { managedClientID } from './managed_server.mjs';
 
 const USAGE = 'usage: notify-register.mjs (--config MCP_JSON | --file CLIENTS_JSON) [--client ID] (--url-env VAR [--header-name NAME|--header-name-env VAR] [--header-value-env VAR] [--hmac-secret-env VAR] [--format json|slack|text] [--stall-minutes N] [--test] | --show | --clear | --test | --list)';
 const FLAGS = new Set(['--show', '--clear', '--test', '--list', '--help']);
@@ -29,17 +30,20 @@ export function parseArgs(argv) {
     const arg = argv[i];
     if (SECRET_ARGS.has(arg.split('=')[0])) throw Error(`${arg.split('=')[0]} is not accepted: pass secrets through ${arg.split('=')[0]}-env VAR (arguments are visible in ps and shell history)`);
     if (FLAGS.has(arg)) { options[arg.slice(2)] = true; continue; }
-    if (!VALUES.has(arg)) throw Error(`unknown argument ${JSON.stringify(arg.slice(0, 40))}\n${USAGE}`);
+    // Never echo the argument: it may be a mistyped secret.
+    if (!VALUES.has(arg)) throw Error(`unknown argument #${i + 1}${arg.startsWith('--') ? '' : ' (not a --flag)'}\n${USAGE}`);
     if (i + 1 >= argv.length) throw Error(`${arg} needs a value`);
     options[arg.slice(2)] = argv[++i];
   }
   return options;
 }
 
-const fromEnv = (env, variable, label) => {
-  if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(variable)) throw Error(`invalid environment variable name for ${label}`);
+// Errors name the flag, never the variable name: an operator may have pasted
+// the secret itself where the variable name belongs.
+const fromEnv = (env, variable, flag) => {
+  if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(variable)) throw Error(`${flag} must name an environment variable`);
   const value = env[variable];
-  if (value === undefined || value === '') throw Error(`${variable} (${label}) is not set or empty`);
+  if (value === undefined || value === '') throw Error(`the variable named by ${flag} is not set or empty`);
   return value;
 };
 
@@ -52,7 +56,9 @@ export async function main(argv = process.argv.slice(2), { env = process.env, ou
   if (!file) throw Error(`--config or --file is required\n${USAGE}`);
   if (options.config && config.session_notify?.enabled !== true) out('warning: session_notify is not enabled in this gateway config; no events are sent until it is.');
   const clients = createClientDefaults({ file });
-  const clientID = options.client ?? config.managed_client_id ?? 'workrelay-managed';
+  // Default: the one OAuth client the gateway admits (same rule as the gateway).
+  if (options.client === undefined && !options.config && !options.list) throw Error('--client is required with --file');
+  const clientID = options.client ?? managedClientID(config);
   const print = value => out(JSON.stringify(value, null, 1));
   const modes = ['show', 'clear', 'list'].filter(mode => options[mode]);
   const setting = options['url-env'] !== undefined;
@@ -64,12 +70,12 @@ export async function main(argv = process.argv.slice(2), { env = process.env, ou
   if (options.show) { print(clients.get(clientID) ?? { client_id: clientID, client_default: null }); return 0; }
   if (options.clear) { print(clients.clear(clientID)); return 0; }
   if (setting) {
-    const target = { url: fromEnv(env, options['url-env'], 'url') };
-    const headerName = options['header-name'] ?? (options['header-name-env'] !== undefined ? fromEnv(env, options['header-name-env'], 'header name') : undefined);
-    const headerValue = options['header-value-env'] !== undefined ? fromEnv(env, options['header-value-env'], 'header value') : undefined;
+    const target = { url: fromEnv(env, options['url-env'], '--url-env') };
+    const headerName = options['header-name'] ?? (options['header-name-env'] !== undefined ? fromEnv(env, options['header-name-env'], '--header-name-env') : undefined);
+    const headerValue = options['header-value-env'] !== undefined ? fromEnv(env, options['header-value-env'], '--header-value-env') : undefined;
     if ((headerName === undefined) !== (headerValue === undefined)) throw Error('a header needs both a name and --header-value-env');
     if (headerName !== undefined) Object.assign(target, { header_name: headerName, header_value: headerValue });
-    if (options['hmac-secret-env'] !== undefined) target.hmac_secret = fromEnv(env, options['hmac-secret-env'], 'hmac secret');
+    if (options['hmac-secret-env'] !== undefined) target.hmac_secret = fromEnv(env, options['hmac-secret-env'], '--hmac-secret-env');
     if (options.format !== undefined) { if (!NOTIFY_FORMATS.includes(options.format)) throw Error('--format must be json, slack or text'); target.format = options.format; }
     if (options['stall-minutes'] !== undefined) target.stall_minutes = Number(options['stall-minutes']);
     try { print({ registered: clients.set(clientID, target, { by: 'cli' }) }); }

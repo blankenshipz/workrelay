@@ -145,7 +145,7 @@ test('targets persist privately (0600) with dedupe state; clear and expiry remov
   await again.notifier.tick();
   assert.equal(again.sent.length, 0, 'restart does not re-send an already notified ask');
   assert.equal(again.notifier.get(S).enabled, true);
-  assert.deepEqual(again.notifier.clear(S), { session_id: S, enabled: false, cleared: true });
+  assert.deepEqual(again.notifier.clear(S), { session_id: S, enabled: false, cleared: true, opted_out: true });
   assert.equal(harness(t, { statePath }).notifier.get(S).enabled, false);
   const expiring = harness(t, { statePath, settings: { ttl_hours: 1 } });
   expiring.notifier.set(S, { url: URL_OK }); expiring.advance(3600001); await expiring.notifier.tick();

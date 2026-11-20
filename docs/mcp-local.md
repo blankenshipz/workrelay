@@ -487,7 +487,7 @@ node src/workrelay/notify-register.mjs --config gateway/mcp.json --client '<oaut
 unset WR_URL WR_TOKEN WR_SIG
 ```
 
-`--client` is the agent's OAuth `client_id` (the `client_id` shown by `{action: "check", scope: "client"}`; default: the gateway's managed client). Other modes: `--show`, `--clear`, `--list`, `--test`. No restart is needed.
+`--client` is the agent's OAuth `client_id` (the `client_id` shown by `{action: "check", scope: "client"}`); with `--config` it defaults to the OAuth client the gateway admits (`managed_client_id`). Other modes: `--show`, `--clear`, `--list`, `--test`. No restart is needed.
 
 **3. Send a test event.** `workrelay_server_notify {"action": "test", "scope": "client"}` (or `--test` on the CLI). The response has `ok`, the receiver's HTTP `status` and the `event_id`; your listener should receive:
 

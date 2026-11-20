@@ -526,7 +526,9 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
   const hasDefaults = () => defaults.size > 0 || clients.any();
   function clear(sessionID, { optOut = true } = {}) {
     const had = targets.delete(sessionID);
-    const out = optOut && hasDefaults();
+    // Sticky even when no default exists yet, so a listener registered later
+    // is not attached to a session that opted out.
+    const out = optOut;
     if (out) optedOut.set(sessionID, now() + ttl);
     if (had || out) persist();
     return { session_id: sessionID, enabled: false, cleared: had, ...(out ? { opted_out: true } : {}) };
@@ -677,6 +679,9 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
       const own = clients.lookup(t.client_id);
       const stallOf = entry => entry.stall_minutes ? entry.stall_minutes * MINUTE : undefined;
       if (own.state === 'present') { if (!t.client_default || stallOf(own.entry) !== t.stall_ms) applyClient(t, t.client_id, own.entry); }
+      // A gateway-default target persisted before client ids were recorded
+      // cannot be re-matched by client: keep it while its entry exists.
+      else if (!t.client_default && t.client_id === undefined) { if (!defaults.has(t.default_name)) { targets.delete(sessionID); return; } }
       else if (!(own.state === 'error' && t.client_default)) {
         const entry = defaults.match({ directory: view.directory, client_id: t.client_id });
         if (!entry) { targets.delete(sessionID); return; }

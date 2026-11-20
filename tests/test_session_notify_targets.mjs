@@ -4,7 +4,7 @@ import { createHmac } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 import { privateTmpdir as tmpdir } from './support/private_tmp.mjs';
-import { createSessionNotifier, createDefaultTargets, directoryMatcher, renderNotifyBody, signStandardWebhook,
+import { createSessionNotifier, createDefaultTargets, createClientDefaults, directoryMatcher, renderNotifyBody, signStandardWebhook,
   validateNotifyTarget, validateSessionNotifySettings } from '../src/workrelay/session_notify.mjs';
 
 const S = 'ses_root000000000000000001';
@@ -263,4 +263,28 @@ test('review: clear/set during an in-flight delivery is honoured before the next
   notifier.set(S, { url: 'https://new.example.com/hook' });
   release(); await ticking;
   assert.deepEqual(sent, [HOOK, 'https://new.example.com/hook']);
+});
+
+test('review: opt-out is sticky before any default exists; legacy default targets without client_id are kept', async t => {
+  const dir = await privateDir(t);
+  const file = join(dir, 'clients.json'), secretsFile = join(dir, 'notify.json'), statePath = join(dir, 'state.json');
+  const clients = createClientDefaults({ file });
+  const sent = [];
+  const make = (extra = {}) => createSessionNotifier({ clients, statePath, watch: async () => ({ session_id: S, directory: '/home/u/work/demodirector', aggregate_status: 'idle',
+    runtime_status: 'idle', last_activity_at: 1, idle_at: null, running_children: 0, failed_children: [], pending: [] }),
+    transport: async (url, { body }) => { sent.push(body); return { status: 200, body: '' }; }, ...extra });
+  const n = make();
+  assert.equal(n.clear(S).opted_out, true);
+  clients.set('agent-a', { url: HOOK }, { by: 'cli' });
+  assert.equal(await n.attachDefault(S, { client_id: 'agent-a' }), null, 'opted-out session is not auto-attached to a later listener');
+  assert.equal((await n.attachDefault(S, { client_id: 'agent-a', explicit: true })).source, 'client_default');
+
+  // A gateway-default target persisted without client_id (older state) survives the per-tick re-match.
+  await writeSecrets(secretsFile, { grok: { url: HOOK } });
+  const S2 = 'ses_legacy0000000000000001';
+  await fs.writeFile(statePath, JSON.stringify({ version: 1, targets: { [S2]: { default_name: 'grok', registered_at: 1, expires_at: Date.now() + 3_600_000 } }, opt_out: {} }), { mode: 0o600 });
+  const legacy = make({ defaults: createDefaultTargets({ secretsFile, entries: [{ name: 'grok', secret: 'grok', clients: ['grokbot-mcp'] }] }), clients: createClientDefaults() });
+  assert.equal(legacy.get(S2).default_target, 'grok');
+  await legacy.tick();
+  assert.equal(legacy.get(S2).enabled, true);
 });
