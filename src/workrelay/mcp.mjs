@@ -469,6 +469,10 @@ function mcp(config, invoke, events, managedReader, eventTools, audit, notifier)
             }
             if (['message', 'resume', 'steer'].includes(action)) notifier.armed(target, startedAt);
             if (status) output = { ...output, notify: notify === false ? status : notifier.get(target) };
+            // Tell an agent that passed a name without a listener under it.
+            if (agent !== undefined && notify !== false && notifier.clients.lookupExact(claims?.client_id, agent).state === 'absent')
+              output = { ...output, notify: { ...(output.notify ?? { session_id: target, enabled: false }), agent_listener: 'not_registered',
+                agent_guidance: `No listener is registered for agent "${agent}". Register one with workrelay_server_notify {"action":"set","scope":"agent","agent":"${agent}","url":...}.` } };
           } catch { if (notify !== undefined || notifier.hasDefaults()) output = { ...output, notify: { session_id: target, enabled: false, reason: 'registration_failed' } }; }
         }
         return { content: [{ type: 'text', text: JSON.stringify(output) }], structuredContent: output, isError: Boolean(output.error) };

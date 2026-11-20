@@ -288,3 +288,29 @@ test('review: opt-out is sticky before any default exists; legacy default target
   await legacy.tick();
   assert.equal(legacy.get(S2).enabled, true);
 });
+
+test('review: an unregistered or mistyped agent name never detaches the session; clients file is version 2 with agents', async t => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'workrelay-notify-agent-')); await fs.chmod(dir, 0o700);
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'notify-clients.json'), statePath = join(dir, 'state.json');
+  const clients = createClientDefaults({ file });
+  clients.set('grokbot-mcp', { url: HOOK }, { agent: 'Harny' });
+  assert.equal(JSON.parse(await fs.readFile(file, 'utf8')).version, 2);
+  const view = { directory: '/x', aggregate_status: 'idle', pending: [], running_children: 0 };
+  const make = () => createSessionNotifier({ clients, statePath, watch: async () => view, transport: async () => ({ status: 200 }) });
+  const notifier = make();
+  assert.equal((await notifier.attachDefault(S, { client_id: 'grokbot-mcp', agent: 'Harny' })).agent, 'Harny');
+  for (const other of ['Scanner', 'harny']) {
+    assert.equal((await notifier.attachDefault(S, { client_id: 'grokbot-mcp', agent: other })).agent, 'Harny');
+    await notifier.tick();
+    assert.equal(notifier.get(S).agent, 'Harny', other);
+  }
+  // The remembered agent survives a restart; a registered agent takes over.
+  const restarted = make();
+  assert.equal((await restarted.status(S, { client_id: 'grokbot-mcp' })).session_agent, 'Harny');
+  clients.set('grokbot-mcp', { url: SECRET_URL }, { agent: 'Scanner' });
+  assert.equal((await restarted.attachDefault(S, { client_id: 'grokbot-mcp', agent: 'Scanner' })).agent, 'Scanner');
+  await restarted.tick(); assert.equal(restarted.get(S).agent, 'Scanner');
+  clients.clear('grokbot-mcp', { agent: 'Harny' }); clients.clear('grokbot-mcp', { agent: 'Scanner' });
+  assert.equal(JSON.parse(await fs.readFile(file, 'utf8')).version, 1);
+});

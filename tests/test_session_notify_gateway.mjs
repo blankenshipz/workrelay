@@ -255,6 +255,9 @@ test('agent scope: agents sharing one MCP client each get their own listener; ag
   await gateway.sessionNotifier.tick();
   assert.equal(delivered.length, before + 1); assert.equal(delivered.at(-1).url, HARNY); assert.equal(delivered.at(-1).headers['X-Hook-Token'], 'harny-secret');
 
+  // An unregistered agent name is reported and does not detach Harny.
+  const typo = (await call('workrelay_server_message', { session_id: root, operation_id: 'op-a2b', text: 'go', agent: 'harny' })).result.structuredContent;
+  assert.equal(typo.notify.agent, 'Harny'); assert.equal(typo.notify.agent_listener, 'not_registered');
   // A different agent delegating the session takes it over.
   const scanner = (await call('workrelay_server_resume', { session_id: root, operation_id: 'op-a3', text: 'go', agent: 'Scanner' })).result.structuredContent;
   assert.equal(scanner.notify.agent, 'Scanner');

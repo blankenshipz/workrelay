@@ -228,7 +228,7 @@ const MAX_AGENTS = 100; // per client
  * (owner-only directory, no symlinks, atomic replace) that both the gateway
  * and the notify-register CLI write; read at use time, so CLI changes apply
  * without a restart. Secrets are never returned: callers see only redacted
- * views. File: { version: 1, clients: { id: entry }, agents: { id: { name: entry } } }.
+ * views. File: { version: 1, clients: { id: entry } }, or version 2 with agents: { id: { name: entry } }.
  */
 export function createClientDefaults({ file, now = Date.now } = {}) {
   const plain = value => value && typeof value === 'object' && !Array.isArray(value);
@@ -237,7 +237,7 @@ export function createClientDefaults({ file, now = Date.now } = {}) {
     let data;
     try { data = readPrivateJSON(file, 1048576); }
     catch (error) { return error?.code === 'ENOENT' ? { clients: new Map(), agents: new Map() } : { error: error.reason ?? 'clients_file_unavailable' }; }
-    if (data?.version !== 1 || !plain(data.clients) || data.agents !== undefined && !plain(data.agents)) return { error: 'clients_file_invalid' };
+    if (![1, 2].includes(data?.version) || !plain(data.clients) || data.agents !== undefined && !plain(data.agents)) return { error: 'clients_file_invalid' };
     return { clients: new Map(Object.entries(data.clients).filter(([id, entry]) => validClientID(id) && plain(entry))),
       agents: new Map(Object.entries(data.agents ?? {}).filter(([id, byName]) => validClientID(id) && plain(byName))
         .map(([id, byName]) => [id, new Map(Object.entries(byName).filter(([name, entry]) => validAgentName(name) && plain(entry)))])) };
@@ -270,9 +270,11 @@ export function createClientDefaults({ file, now = Date.now } = {}) {
     return { client_id: clientID, ...(agent !== undefined ? { agent } : {}), configured: Boolean(resolved.target), ...(resolved.reason ? { reason: resolved.reason } : {}), ...redactTarget(resolved.target),
       ...(entry.stall_minutes ? { stall_minutes: entry.stall_minutes } : {}), updated_at: entry.updated_at ?? null, updated_by: entry.updated_by ?? null };
   }
+  // Version 2 when agent entries exist, so a pre-agent reader (which would
+  // rewrite the file without them) fails closed instead of erasing them.
   function write(all) {
-    writePrivateJSON(file, { version: 1, clients: Object.fromEntries(all.clients),
-      agents: Object.fromEntries([...all.agents].filter(([, byName]) => byName.size).map(([id, byName]) => [id, Object.fromEntries(byName)])) });
+    const agents = Object.fromEntries([...all.agents].filter(([, byName]) => byName.size).map(([id, byName]) => [id, Object.fromEntries(byName)]));
+    writePrivateJSON(file, { version: Object.keys(agents).length ? 2 : 1, clients: Object.fromEntries(all.clients), ...(Object.keys(agents).length ? { agents } : {}) });
   }
   const fail = reason => { throw Object.assign(Error('client default unavailable'), { reason }); };
   const checkAgent = agent => { if (agent !== undefined && !validAgentName(agent)) fail('invalid_agent'); };
@@ -449,8 +451,13 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
     if (a.until <= now()) { sessionAgents.delete(sessionID); return undefined; }
     return a.client_id === clientID ? a.agent : undefined;
   }
+  // A different agent replaces the remembered one only if it has its own
+  // listener: an unregistered or mistyped name never detaches the session
+  // from the listener it already reports to.
   function rememberAgent(sessionID, agent, clientID, at = now()) {
     if (!validAgentName(agent) || !SID.test(sessionID ?? '')) return;
+    const previous = agentOf(sessionID, clientID);
+    if (previous !== undefined && previous !== agent && clients.lookupExact(clientID, agent).state !== 'present') agent = previous;
     sessionAgents.delete(sessionID); // re-insert: Map order is the eviction order
     sessionAgents.set(sessionID, { agent, ...(validClientID(clientID) ? { client_id: clientID } : {}), until: at + ttl });
     while (sessionAgents.size > Math.max(1000, maxTargets * 5)) sessionAgents.delete(sessionAgents.keys().next().value);
@@ -538,7 +545,7 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
     if (agent !== undefined) { rememberAgent(sessionID, agent, clientID, at); persist(); }
     // The caller's own registered listener comes first (the agent's, else the
     // client's); no directory needed.
-    const own = clients.lookup(clientID, agent ?? agentOf(sessionID, clientID));
+    const own = clients.lookup(clientID, agentOf(sessionID, clientID) ?? agent);
     if (explicit) {
       if (own.state === 'present') {
         const t = ensure(sessionID, at); applyClient(t, clientID, own); optedOut.delete(sessionID); persist();
