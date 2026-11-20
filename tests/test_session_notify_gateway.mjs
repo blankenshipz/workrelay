@@ -65,7 +65,7 @@ async function setup(t, notifyExtra = () => ({}), gatewayOptions = {}) {
     try {
       await sdk.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`),
         { requestInit: { headers: { authorization: `Bearer ${token}` } } }));
-      return { result: await sdk.callTool({ name, arguments: args }), tools: (await sdk.listTools()).tools };
+      return { result: await sdk.callTool({ name, arguments: args }), tools: (await sdk.listTools()).tools, instructions: sdk.getInstructions() };
     } finally { await sdk.close(); }
   };
   const project = 'project_' + createHash('sha256').update('project').digest('hex');
@@ -243,6 +243,14 @@ test('agent scope: agents sharing one MCP client each get their own listener; ag
   // create with agent attaches that agent's listener; message without agent keeps it (remembered).
   const tools = (await call('workrelay_server_notify', { action: 'check', scope: 'agent', agent: 'Harny' })).tools;
   assert.match(tools.find(tool => tool.name === 'workrelay_server_create').description, /Always pass agent/);
+  // Default-on onboarding: new agents are told to check and register their own listener.
+  const onboarding = await call('workrelay_server_notify', { action: 'check', scope: 'agent', agent: 'Newbie' });
+  assert.match(onboarding.instructions, /first use.*workrelay_server_notify \{action: "check", scope: "agent"/s);
+  assert.match(onboarding.instructions, /#progress-notifications-listen-for-events/);
+  for (const name of ['workrelay_server_create', 'workrelay_server_message', 'workrelay_server_resume'])
+    assert.match(onboarding.tools.find(tool => tool.name === name).description, /First use: if workrelay_server_notify/);
+  assert.match(onboarding.tools.find(tool => tool.name === 'workrelay_server_notify').description, /NEW AGENT\? Do this once by default/);
+  assert.equal(onboarding.result.structuredContent.agent_default, null);
   const created = (await call('workrelay_server_create', { operation_id: 'op-a1', project_id: project, title: 'Deploy fix', agent: 'Harny' })).result.structuredContent;
   assert.equal(created.notify.source, 'agent_default'); assert.equal(created.notify.agent, 'Harny');
   const later = (await call('workrelay_server_message', { session_id: root, operation_id: 'op-a2', text: 'go' })).result.structuredContent;

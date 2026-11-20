@@ -6,6 +6,23 @@ For example, ask your assistant to inspect a small issue in an isolated project,
 
 OpenAI describes Dots as ongoing assistants that carry goals and follow up across conversations, and documents connected apps through Plugins. Its developer docs describe authenticated MCP tools and MCP Events, including Dot use. Those docs establish the client/protocol surface—not successful Workrelay acceptance on every account or client path: [Introducing Dots](https://openai.com/index/introducing-dots/), [Dot setup and controls](https://help.openai.com/en/articles/20001530-getting-started-with-your-dot), [MCP servers](https://developers.openai.com/plugins/concepts/mcp-server), [MCP Events](https://developers.openai.com/plugins/build/mcp-events), and [OAuth authentication](https://developers.openai.com/plugins/build/auth).
 
+## Progress notifications (listen for events)
+
+**Why.** Delegated work can take minutes or hours and may stop for a human permission decision. Instead of polling, register a listener once and Workrelay POSTs one compact event when a permission ask appears, a run finishes or fails, a child fails, or a run stalls. Any platform works: anything that accepts an HTTPS POST (Grok Bot routine webhook, Slack, ntfy, an agent HTTP hook, your own endpoint).
+
+**New agents do this by default.** The server instructions and the `workrelay_server_create`/`message`/`resume`/`notify` tool descriptions tell every agent, on first use, to run `workrelay_server_notify {action: "check", scope: "agent", agent: "<name>"}` and, if no listener is shown, to register its own.
+
+1. **Create a listener**: a public HTTPS URL on port 443, for example a Grok Bot routine with trigger type *webhook*, a Slack incoming webhook, or `https://ntfy.sh/<long-random-topic>`.
+2. **Register it under your agent name**: `workrelay_server_notify {"action": "set", "scope": "agent", "agent": "Harny", "url": "https://…", "header_name": "X-Hook-Token", "header_value": "…"}` (or `hmac_secret: "whsec_…"` for Standard Webhooks signing, `format: "slack"|"text"` for Slack/ntfy). Operators can do the same on the host with `node src/workrelay/notify-register.mjs --agent Harny`, so the secret never enters a chat.
+3. **Test it**: `workrelay_server_notify {"action": "test", "scope": "agent", "agent": "Harny"}` sends a signed `workrelay.test` event; the response shows `ok` and the receiver's HTTP status.
+
+Then pass the same `agent` on every `workrelay_server_create`/`message`/`resume` (it is remembered per session) and end your turn instead of polling; each event names the Workrelay tool to call next.
+
+- **Event schema** (`schema_version: 1`), signature verification and what to do on each event: [docs/mcp-local.md](docs/mcp-local.md#listen-for-progress-events-any-platform).
+- **Platform recipes**: Grok Bot (routine webhook, `json`, secret header), Slack (`slack`), ntfy (`text`), generic HTTPS (`json` + HMAC), Claude Code/Cursor (via a small public relay or ntfy and a hook): same link.
+- **Several agents on one connection** (for example every Grok Bot agent shares OAuth client `grokbot-mcp`): each agent registers with `scope: "agent"` under its own stable name (`A-Z a-z 0-9 . _ -`, max 64) and always passes it, so events reach the right agent. `scope: "client"` is a connection-wide fallback for a single agent; operators can add a project default (`session_notify.default_targets`).
+- **Stdio connectors / tool list not updating?** Tools and fields come from the gateway. A long-lived stdio proxy must forward `notifications/tools/list_changed` (or be restarted) after a gateway upgrade, or the client keeps its old cached tool list without `agent`/`notify`.
+
 ## Recover a paused conversation without duplicating work
 
 Use `workrelay_server_waits` to distinguish a native question from a permission
@@ -199,7 +216,7 @@ For the opted-in managed server, start with `workrelay_server_capabilities({})` 
 
 Managed Events use native `events/list`, `events/subscribe`, and `events/unsubscribe`; `workrelay_event_capabilities` describes receiver prerequisites, while subscription status exposes its expiry/renewal point. Subscriptions are leases, not permanent monitors: renew before expiry. Live SSE/state reconciliation is not historical replay and can miss intermediate transitions. An HTTP acknowledgement or `session.completed` event reports observed execution, not that you accepted or verified the requested result. Unsubscribe stops monitoring, not work or the Workrelay service. Poll/read current state if Events are unavailable, but do not count polling as Events acceptance.
 
-## Progress notifications
+## Progress notifications: details
 
 Workrelay can tell the agent (or person) that delegated work when that work needs attention, so the agent does not have to poll. This works on any agent platform: anything that accepts an HTTPS POST can receive the events. Examples are a Grok Bot routine webhook, a Slack incoming webhook, ntfy, Claude/Cursor/other agents' HTTP hooks, or your own endpoint.
 

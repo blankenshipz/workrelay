@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-11-20
+
+- Default-on listener onboarding: the server instructions and the `workrelay_server_create`/`message`/`resume`/`notify` descriptions tell every new agent, on first use, to run `workrelay_server_notify` `check` (scope `agent`) and, if no listener is shown, register its own (scope `agent`) and test it, with a link to the setup guide. Works on any platform.
+- README: prominent "Progress notifications (listen for events)" section near the top (why, 3-step setup, schema link, platform recipes, multi-agent note, stdio tool-list caching note).
+- MCP `serverInfo.version` now reports the package version (0.3.0); `package.json` carries the version.
+
 - Per-agent progress listeners for agents that share one MCP connection: `workrelay_server_notify` scope `agent` (`agent: "<stable name>"`, `[A-Za-z0-9._-]{1,64}`) stores a listener keyed by (OAuth `client_id`, agent). `workrelay_server_create`/`message`/`resume` accept an optional `agent` (remembered per session) and attach that agent's listener, falling back to the client listener, then the gateway default (`source: "agent_default"`). check/test/clear support scope `agent`; `notify-register.mjs` gains `--agent`.
 - Progress notifications work with any agent platform or receiver (`session_notify`):
   - **Event schema:** `schema_version: 1`, `source`, `server_id`, `project_id`, `directory`, a one-line `summary`, and a `read` hint (`workrelay_server_read`) on every event. The schema is documented.
