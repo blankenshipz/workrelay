@@ -63,3 +63,28 @@ test('notify-register CLI: default client is the gateway managed client id', asy
   assert.match(shown.text, /"client_id": "https:\/\/chatgpt\.com\/oauth\/client\.json"/);
 });
 
+
+test('notify-register CLI: --agent registers a per-agent listener under the client without touching others', async t => {
+  const dir = await privateDir(t);
+  const file = join(dir, 'notify-clients.json');
+  await assert.rejects(run(['--file', file, '--client', 'grokbot-mcp', '--agent', 'bad name', '--show']), /--agent must be/);
+  await assert.rejects(run(['--file', file, '--agent', 'Harny', '--list']), /--agent must be|--client is required/);
+  const sent = [];
+  const transport = async (url, { body }) => { sent.push({ url, body: JSON.parse(body) }); return { status: 204, body: '' }; };
+  const env = { WR_URL: HOOK, WR_TOKEN: 'harny-token', WR_SIG: SIG, WR_URL2: 'https://hooks.grok.example.com/routines/scanner/trigger' };
+  const harny = await run(['--file', file, '--client', 'grokbot-mcp', '--agent', 'Harny', '--url-env', 'WR_URL', '--header-name', 'X-Hook-Token',
+    '--header-value-env', 'WR_TOKEN', '--hmac-secret-env', 'WR_SIG', '--test'], env, transport);
+  assert.equal(harny.code, 0); assert.doesNotMatch(harny.text, /harny-token|whsec_|routines\/cli/); assert.match(harny.text, /"agent": "Harny"/);
+  assert.equal(sent[0].body.scope, 'agent'); assert.equal(sent[0].body.agent, 'Harny');
+  await run(['--file', file, '--client', 'grokbot-mcp', '--agent', 'Scanner', '--url-env', 'WR_URL2'], env);
+  const list = JSON.parse((await run(['--file', file, '--list'])).text);
+  assert.deepEqual(list.agents.map(entry => entry.agent).sort(), ['Harny', 'Scanner']); assert.deepEqual(list.clients, []);
+  assert.match((await run(['--file', file, '--client', 'grokbot-mcp', '--agent', 'Harny', '--show'])).text, /"secret_header": "X-Hook-Token"/);
+  assert.match((await run(['--file', file, '--client', 'grokbot-mcp', '--show'])).text, /"client_default": null/);
+  // The gateway resolves (client, agent) first, then the client.
+  const notifier = createSessionNotifier({ clients: createClientDefaults({ file }), watch: async () => null, transport });
+  assert.equal((await notifier.attachDefault('ses_cli000000000000000002', { client_id: 'grokbot-mcp', agent: 'Scanner' })).agent, 'Scanner');
+  assert.equal(await notifier.attachDefault('ses_cli000000000000000003', { client_id: 'grokbot-mcp' }), null);
+  assert.match((await run(['--file', file, '--client', 'grokbot-mcp', '--agent', 'Scanner', '--clear'])).text, /"cleared": true/);
+  assert.match((await run(['--file', file, '--client', 'grokbot-mcp', '--agent', 'Harny', '--show'])).text, /"agent": "Harny"/);
+});

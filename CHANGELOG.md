@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Per-agent progress listeners for agents that share one MCP connection: `workrelay_server_notify` scope `agent` (`agent: "<stable name>"`, `[A-Za-z0-9._-]{1,64}`) stores a listener keyed by (OAuth `client_id`, agent). `workrelay_server_create`/`message`/`resume` accept an optional `agent` (remembered per session) and attach that agent's listener, falling back to the client listener, then the gateway default (`source: "agent_default"`). check/test/clear support scope `agent`; `notify-register.mjs` gains `--agent`.
 - Progress notifications work with any agent platform or receiver (`session_notify`):
   - **Event schema:** `schema_version: 1`, `source`, `server_id`, `project_id`, `directory`, a one-line `summary`, and a `read` hint (`workrelay_server_read`) on every event. The schema is documented.
   - **Signing:** optional Standard Webhooks HMAC signing (`hmac_secret`: `webhook-id`, `webhook-timestamp`, `webhook-signature`). `webhook-id` is stable across retries; the timestamp and signature are fresh on each attempt.

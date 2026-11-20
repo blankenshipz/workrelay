@@ -21,7 +21,7 @@ import { createIssuerAdapter } from './oidc_adapter.mjs';
 import { createUnexposedIssuerPolicy, createPreapprovalDiagnostic, createAuthorizationOutcomeDiagnostic, createTokenErrorDiagnostic } from './issuer_policy.mjs';
 import { createLocalInteractions, createOriginDiagnostic, ACTIVITY_PATHS } from './issuer_interactions.mjs';
 import { createPermissionNotifier, validateNotifySettings } from './permission_notify.mjs';
-import { createSessionNotifier, createDefaultTargets, createClientDefaults, sessionNotifyPaths, validateSessionNotifySettings, validateNotifyTarget, NOTIFY_FORMATS } from './session_notify.mjs';
+import { createSessionNotifier, createDefaultTargets, createClientDefaults, sessionNotifyPaths, validAgentName, validateSessionNotifySettings, validateNotifyTarget, NOTIFY_FORMATS } from './session_notify.mjs';
 const loopback = new Set(['127.0.0.1', '::1']);
 const key = z.string().regex(/^[A-Za-z0-9_-]{1,80}$/);
 const grantId = z.string().regex(/^grant_[0-9a-f]{32}$/);
@@ -331,7 +331,8 @@ const notifyTargetFields = { url: z.string().min(1).max(2048), header_name: z.st
   header_value: z.string().min(1).max(1024).optional(), hmac_secret: z.string().min(16).max(512).optional(), format: z.enum(NOTIFY_FORMATS).optional(),
   stall_minutes: z.number().int().min(1).max(1440).optional() };
 const notifyInput = z.union([z.literal(false), z.object(notifyTargetFields).strict()]);
-const NOTIFY_DESCRIPTION = ' Progress events: if you registered your own listener once (workrelay_server_notify action set, scope client) or the operator configured a default for this project, Workrelay POSTs a compact JSON event to it (any platform: Grok Bot routine webhook, Slack, ntfy, an agent HTTP hook) only when a permission ask appears, the run finishes or fails, a child fails, or it stalls. The response field notify shows the effective target (enabled, source per_call|client_default|gateway_default, url_host; secrets never returned). When notify.enabled is true, do not poll or wait in a loop: end your turn and act on the event (it names the workrelay tool to call next). Optional notify {url, header_name?, header_value?, hmac_secret? (Standard Webhooks signature), format? json|slack|text, stall_minutes?} sets a per-session target that overrides any default; notify:false opts this session out.';
+const agentInput = z.string().regex(/^[A-Za-z0-9._-]{1,64}$/).refine(validAgentName);
+const NOTIFY_DESCRIPTION = ' Always pass agent: your own stable agent name (e.g. "Harny"; letters, digits, . _ -, max 64), the same name you registered your listener under; several agents may share this MCP connection, and agent selects YOUR listener (it is remembered for the session, so later calls may omit it). Progress events: if you registered your own listener once (workrelay_server_notify action set, scope agent with your agent name; or scope client for the whole connection) or the operator configured a default for this project, Workrelay POSTs a compact JSON event to it (any platform: Grok Bot routine webhook, Slack, ntfy, an agent HTTP hook) only when a permission ask appears, the run finishes or fails, a child fails, or it stalls. The response field notify shows the effective target (enabled, source per_call|agent_default|client_default|gateway_default, url_host; secrets never returned). When notify.enabled is true, do not poll or wait in a loop: end your turn and act on the event (it names the workrelay tool to call next). Optional notify {url, header_name?, header_value?, hmac_secret? (Standard Webhooks signature), format? json|slack|text, stall_minutes?} sets a per-session target that overrides any default; notify:false opts this session out.';
 const notifyFailure = reason => ({ isError: true, content: [{ type: 'text', text: JSON.stringify({ error: 'invalid_notify_target', reason }) }],
   structuredContent: { error: 'invalid_notify_target', reason } });
 
@@ -433,18 +434,18 @@ function mcp(config, invoke, events, managedReader, eventTools, audit, notifier)
         ['message', 'resume'].includes(action) ? 'Queue a bounded continuation to the existing session owner; preserves agent/model/permissions. Native approval gates and financial admission apply. Reuse operation_id with identical text to reconcile uncertainty; never blindly replay.' + (notifier ? NOTIFY_DESCRIPTION : '') :
         'Interrupt only this existing session, not descendants. Not rollback; queued inputs remain and may run on later resume. Idle no-op is not active-cancel proof. Native permissions remain. Reuse operation_id to inspect the same attempt.',
       inputSchema: action === 'create' ? z.object({ operation_id: key, project_id: z.string().regex(/^project_[a-f0-9]{64}$/), title: z.string().trim().min(1).max(160), directory: z.string().min(1).max(4096).optional(),
-        ...(notifier ? { notify: notifyInput.optional() } : {}) }).strict() :
+        ...(notifier ? { notify: notifyInput.optional(), agent: agentInput.optional() } : {}) }).strict() :
         z.object({ session_id: action === 'inspect' ? z.string().regex(/^ses[A-Za-z0-9_-]{1,160}$/).optional() : z.string().regex(/^ses[A-Za-z0-9_-]{1,160}$/),
         ...(action === 'waits' ? { limit: z.number().int().min(1).max(50).optional() } : { operation_id: key }),
         ...(['question_reply', 'question_cancel'].includes(action) ? { form_id: z.string().regex(/^frm_[A-Za-z0-9_-]{1,160}$/) } : {}),
         ...(action === 'question_reply' ? { answer: z.record(z.string(), z.union([z.string(), z.array(z.string())])).refine(value => Object.keys(value).length <= 20) } : {}),
         ...(['message', 'steer', 'resume'].includes(action) ? { text } : {}),
-        ...(notifier && ['message', 'resume'].includes(action) ? { notify: notifyInput.optional() } : {}) }).strict(),
+        ...(notifier && ['message', 'resume'].includes(action) ? { notify: notifyInput.optional(), agent: agentInput.optional() } : {}) }).strict(),
       annotations: { readOnlyHint: ['inspect', 'waits'].includes(action), destructiveHint: ['interrupt', 'question_cancel'].includes(action), idempotentHint: true, openWorldHint: false },
     }, async (rawInput, ctx) => {
       // notify is a workrelay-side registration only; never part of the
       // durable operation arguments or the native request.
-      const { notify, ...input } = rawInput;
+      const { notify, agent, ...input } = rawInput;
       if (notify !== undefined && notify !== false) { try { validateNotifyTarget(notify); } catch (error) { return notifyFailure(error.reason ?? 'invalid_target'); } }
       const startedAt = Date.now(); // before the native request: see notifier.armed
       try {
@@ -457,11 +458,14 @@ function mcp(config, invoke, events, managedReader, eventTools, audit, notifier)
         if (notifier && !output?.error && typeof target === 'string' && /^ses[A-Za-z0-9_-]{1,160}$/.test(target)) {
           try {
             let status = null;
+            // The delegating agent's name is remembered for the session.
+            if (agent !== undefined && notify !== undefined) notifier.rememberAgent(target, agent, claims?.client_id);
             if (notify === false) status = notifier.clear(target);
             else if (notify !== undefined) status = notifier.set(target, notify, startedAt);
             else if (['create', 'message', 'resume'].includes(action)) {
-              // Gateway default target (on unless this session opted out).
-              status = await notifier.attachDefault(target, { client_id: claims?.client_id, at: startedAt });
+              // The agent's, else the client's own listener, else the gateway
+              // default (unless this session opted out).
+              status = await notifier.attachDefault(target, { client_id: claims?.client_id, agent, at: startedAt });
             }
             if (['message', 'resume', 'steer'].includes(action)) notifier.armed(target, startedAt);
             if (status) output = { ...output, notify: notify === false ? status : notifier.get(target) };
@@ -474,42 +478,51 @@ function mcp(config, invoke, events, managedReader, eventTools, audit, notifier)
   if (managedReader && notifier) {
     register('workrelay_server_notify', {
       description: 'Register, check and test where Workrelay sends progress events for sessions you delegate. Works with any receiver that accepts an HTTPS POST: a Grok Bot routine webhook, a Slack incoming webhook (format slack), ntfy or a generic endpoint (format text), or another agent\'s HTTP hook (format json, the default). ' +
-        'Set up your own listener once: action set, scope client, with url (public HTTPS only) and optional header_name/header_value (secret header), hmac_secret (whsec_..., Standard Webhooks webhook-id/webhook-timestamp/webhook-signature), format json|slack|text, stall_minutes. It is stored privately for your MCP client and used for every session you create, message or resume from then on. Then call action test, scope client, to send a signed workrelay.test event and confirm it arrives. clear with scope client removes it; check with scope client shows it, redacted. (An operator can also register it on the Workrelay host with the notify-register CLI, so the secret never enters a chat.) ' +
-        'scope session (the default, needs session_id): set with url sets a target for that session only; set without url attaches your client default (or the operator default for the project); clear removes the target and opts the session out of defaults; check reports the effective target, redacted, with source per_call, client_default or gateway_default; test sends a test event to it. A per-call notify argument always overrides defaults. Secrets are never returned. ' +
+        'Several agents can share one MCP connection, so register under your own stable agent name and always pass it: action set, scope agent, agent "<your name>" (letters, digits, . _ -, max 64, e.g. "Harny"), with url (public HTTPS only) and the optional fields below. Then pass the same agent on every workrelay_server_create/message/resume (or once per session); events for those sessions go to your listener, falling back to the client listener, then the operator default. test/check/clear with scope agent and your agent name verify, show (redacted) or remove it. ' +
+        'Client-wide listener (only when you are the sole agent on this connection): action set, scope client, with url (public HTTPS only) and optional header_name/header_value (secret header), hmac_secret (whsec_..., Standard Webhooks webhook-id/webhook-timestamp/webhook-signature), format json|slack|text, stall_minutes. It is stored privately for your MCP client and used for every session you create, message or resume from then on. Then call action test, scope client, to send a signed workrelay.test event and confirm it arrives. clear with scope client removes it; check with scope client shows it, redacted. (An operator can also register it on the Workrelay host with the notify-register CLI, so the secret never enters a chat.) ' +
+        'scope session (the default, needs session_id): set with url sets a target for that session only; set without url attaches your agent listener (pass agent; remembered for the session), else your client default, else the operator default for the project; clear removes the target and opts the session out of defaults; check reports the effective target, redacted, with source per_call, agent_default, client_default or gateway_default; test sends a test event to it. A per-call notify argument always overrides defaults. Secrets are never returned. ' +
         'Events (JSON type): workrelay.session.permission_asked (a human must approve on the operator page), .finished / .failed (read the session for the result), .child_failed, .stalled, .unobservable; each has summary and read {tool, arguments}. Never per step; non-ask/non-completion events are limited to one per session per 2 minutes. While enabled, rely on the events instead of polling. Notification failures never affect the run.',
-      inputSchema: z.object({ action: z.enum(['set', 'clear', 'check', 'status', 'test']), scope: z.enum(['session', 'client']).optional(),
-        session_id: z.string().regex(/^ses[A-Za-z0-9_-]{1,160}$/).optional(),
+      inputSchema: z.object({ action: z.enum(['set', 'clear', 'check', 'status', 'test']), scope: z.enum(['session', 'agent', 'client']).optional(),
+        session_id: z.string().regex(/^ses[A-Za-z0-9_-]{1,160}$/).optional(), agent: agentInput.optional(),
         url: notifyTargetFields.url.optional(), header_name: notifyTargetFields.header_name, header_value: notifyTargetFields.header_value,
         hmac_secret: notifyTargetFields.hmac_secret, format: notifyTargetFields.format, stall_minutes: notifyTargetFields.stall_minutes }).strict(),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    }, async ({ session_id, action: rawAction, scope = 'session', ...target }, ctx) => {
+    }, async ({ session_id, agent, action: rawAction, scope = 'session', ...target }, ctx) => {
       const action = rawAction === 'status' ? 'check' : rawAction;
       if (action !== 'set' && Object.keys(target).length) return notifyFailure('fields_only_for_set');
       if (scope === 'session' && !session_id) return notifyFailure('session_id_required');
       if (scope === 'client' && session_id) return notifyFailure('session_id_not_allowed_for_client_scope');
+      if (scope === 'agent' && session_id) return notifyFailure('session_id_not_allowed_for_agent_scope');
+      if (scope === 'agent' && agent === undefined) return notifyFailure('agent_required');
+      if (scope === 'client' && agent !== undefined) return notifyFailure('agent_not_allowed_for_client_scope');
+      if (scope === 'session' && agent !== undefined && action === 'clear') return notifyFailure('agent_not_allowed_for_clear');
       const useDefault = scope === 'session' && action === 'set' && target.url === undefined;
       if (useDefault && Object.keys(target).length) return notifyFailure('url_required_with_target_fields');
       if (action === 'set' && !useDefault) { try { validateNotifyTarget(target); } catch (error) { return notifyFailure(error.reason ?? 'invalid_target'); } }
       try {
         const claims = ctx.http?.authInfo?.extra?.managedClaims;
         let output;
-        if (scope === 'client') {
+        if (scope === 'client' || scope === 'agent') {
           await managedReader('authorize', {}, claims);
           const clientID = claims?.client_id;
           if (typeof clientID !== 'string' || !clientID) return notifyFailure('client_identity_unavailable');
+          const fallback = scope === 'agent' ? 'client listener, then gateway default for the session project, if one matches' :
+            notifier.hasGatewayDefaults() ? 'gateway default for the session project, if one matches' : null;
           try {
-            output = action === 'set' ? { scope, ...notifier.clients.set(clientID, target, { by: 'mcp' }), applies_to: 'every session this client creates, messages or resumes; a per-call notify still overrides' } :
-              action === 'clear' ? { scope, ...notifier.clients.clear(clientID) } :
-              action === 'test' ? { scope, ...await notifier.test({ client_id: clientID }) } :
-              { scope, client_id: clientID, client_default: notifier.clients.get(clientID),
-                fallback: notifier.hasGatewayDefaults() ? 'gateway default for the session project, if one matches' : null };
+            output = action === 'set' ? { scope, ...notifier.clients.set(clientID, target, { by: 'mcp', agent }),
+              applies_to: scope === 'agent' ? `every session you create, message or resume with agent "${agent}"; a per-call notify still overrides` :
+                'every session this client creates, messages or resumes without an agent that has its own listener; a per-call notify still overrides' } :
+              action === 'clear' ? { scope, ...notifier.clients.clear(clientID, { agent }) } :
+              action === 'test' ? { scope, ...await notifier.test({ client_id: clientID, agent }) } :
+              { scope, client_id: clientID, ...(scope === 'agent' ? { agent, agent_default: notifier.clients.get(clientID, agent) } : { client_default: notifier.clients.get(clientID) }), fallback };
           } catch (error) { if (error.reason) return notifyFailure(error.reason); throw error; }
         } else {
           await managedReader('session_check', { session_id }, claims);
-          output = useDefault ? await notifier.attachDefault(session_id, { client_id: claims?.client_id, explicit: true }) :
+          if (agent !== undefined && action === 'set' && !useDefault) notifier.rememberAgent(session_id, agent, claims?.client_id);
+          output = useDefault ? await notifier.attachDefault(session_id, { client_id: claims?.client_id, agent, explicit: true }) :
             action === 'set' ? notifier.set(session_id, target) : action === 'clear' ? notifier.clear(session_id) :
-            action === 'test' ? await notifier.test({ session_id, client_id: claims?.client_id }) :
-            await notifier.status(session_id, { client_id: claims?.client_id });
+            action === 'test' ? await notifier.test({ session_id, client_id: claims?.client_id, agent }) :
+            await notifier.status(session_id, { client_id: claims?.client_id, agent });
         }
         if (output?.error && typeof output.error === 'string') return notifyFailure(output.error);
         return { content: [{ type: 'text', text: JSON.stringify(output) }], structuredContent: output, isError: action === 'test' && output.ok === false };

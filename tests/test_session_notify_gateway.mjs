@@ -216,3 +216,57 @@ test('client scope: an agent registers its own listener once; it applies to ever
   assert.equal((await call('workrelay_server_notify', { action: 'clear', scope: 'client' })).result.structuredContent.cleared, true);
   assert.equal((await call('workrelay_server_notify', { action: 'check', scope: 'client' })).result.structuredContent.client_default, null);
 });
+
+test('agent scope: agents sharing one MCP client each get their own listener; agent is remembered per session; falls back to client', async t => {
+  const { call, gateway, delivered, native, project } = await setup(t);
+  const HARNY = 'https://hooks.grok.example.com/routines/harny/trigger', SCANNER = 'https://hooks.grok.example.com/routines/scanner/trigger';
+  // Validation.
+  assert.equal((await call('workrelay_server_notify', { action: 'set', scope: 'agent', url: HARNY })).result.structuredContent.reason, 'agent_required');
+  assert.equal((await call('workrelay_server_notify', { action: 'set', scope: 'agent', agent: 'Harny', session_id: root, url: HARNY })).result.structuredContent.reason, 'session_id_not_allowed_for_agent_scope');
+  assert.equal((await call('workrelay_server_notify', { action: 'set', scope: 'client', agent: 'Harny', url: HARNY })).result.structuredContent.reason, 'agent_not_allowed_for_client_scope');
+  for (const bad of ['', 'Harny Bot', 'a'.repeat(65), '__proto__', 'é']) assert.equal((await call('workrelay_server_notify', { action: 'check', scope: 'agent', agent: bad })).result.isError, true, bad);
+  assert.equal((await call('workrelay_server_notify', { action: 'test', scope: 'agent', agent: 'Harny' })).result.structuredContent.reason, 'no_agent_default');
+
+  const set = (await call('workrelay_server_notify', { action: 'set', scope: 'agent', agent: 'Harny', url: HARNY, header_name: 'X-Hook-Token', header_value: 'harny-secret' })).result;
+  assert.ok(!set.isError, JSON.stringify(set)); assert.equal(set.structuredContent.agent, 'Harny'); assert.equal(set.structuredContent.client_id, client);
+  assert.doesNotMatch(JSON.stringify(set), /harny-secret|routines\/harny/);
+  await call('workrelay_server_notify', { action: 'set', scope: 'agent', agent: 'Scanner', url: SCANNER });
+  await call('workrelay_server_notify', { action: 'set', scope: 'client', url: HOOK });
+  // Registering Scanner did not overwrite Harny (the r18 shared-client problem).
+  const harny = (await call('workrelay_server_notify', { action: 'check', scope: 'agent', agent: 'Harny' })).result.structuredContent;
+  assert.equal(harny.agent_default.secret_header, 'X-Hook-Token'); assert.equal(harny.agent_default.agent, 'Harny');
+  assert.equal((await call('workrelay_server_notify', { action: 'check', scope: 'client' })).result.structuredContent.client_default.secret_header, null);
+  const tested = (await call('workrelay_server_notify', { action: 'test', scope: 'agent', agent: 'Harny' })).result.structuredContent;
+  assert.equal(tested.ok, true); assert.equal(tested.source, 'agent_default');
+  assert.equal(delivered.at(-1).url, HARNY); assert.equal(delivered.at(-1).event.scope, 'agent'); assert.equal(delivered.at(-1).event.agent, 'Harny');
+
+  // create with agent attaches that agent's listener; message without agent keeps it (remembered).
+  const tools = (await call('workrelay_server_notify', { action: 'check', scope: 'agent', agent: 'Harny' })).tools;
+  assert.match(tools.find(tool => tool.name === 'workrelay_server_create').description, /Always pass agent/);
+  const created = (await call('workrelay_server_create', { operation_id: 'op-a1', project_id: project, title: 'Deploy fix', agent: 'Harny' })).result.structuredContent;
+  assert.equal(created.notify.source, 'agent_default'); assert.equal(created.notify.agent, 'Harny');
+  const later = (await call('workrelay_server_message', { session_id: root, operation_id: 'op-a2', text: 'go' })).result.structuredContent;
+  assert.equal(later.notify.source, 'agent_default'); assert.equal(later.notify.agent, 'Harny');
+  assert.equal((await call('workrelay_server_notify', { session_id: root, action: 'check' })).result.structuredContent.session_agent, 'Harny');
+  native.active = { [root]: { type: 'running' }, [child]: { type: 'running' } };
+  native.child = { id: child, parentID: root, projectID: 'project', agent: 'harness-builder', location: { directory: '/x' }, time: { updated: 5 } };
+  native.permissions = [{ id: 'per_agent1', sessionID: child, action: 'shell', resources: ['ls'] }];
+  const before = delivered.length;
+  await gateway.sessionNotifier.tick();
+  assert.equal(delivered.length, before + 1); assert.equal(delivered.at(-1).url, HARNY); assert.equal(delivered.at(-1).headers['X-Hook-Token'], 'harny-secret');
+
+  // A different agent delegating the session takes it over.
+  const scanner = (await call('workrelay_server_resume', { session_id: root, operation_id: 'op-a3', text: 'go', agent: 'Scanner' })).result.structuredContent;
+  assert.equal(scanner.notify.agent, 'Scanner');
+  // Its listener removed: falls back to the client listener on the next tick.
+  assert.equal((await call('workrelay_server_notify', { action: 'clear', scope: 'agent', agent: 'Scanner' })).result.structuredContent.cleared, true);
+  await gateway.sessionNotifier.tick();
+  const fallback = (await call('workrelay_server_notify', { session_id: root, action: 'check' })).result.structuredContent;
+  assert.equal(fallback.source, 'client_default'); assert.equal(fallback.agent, undefined);
+  // Re-registered: the session's agent listener takes over again.
+  await call('workrelay_server_notify', { action: 'set', scope: 'agent', agent: 'Scanner', url: SCANNER });
+  await gateway.sessionNotifier.tick();
+  assert.equal((await call('workrelay_server_notify', { session_id: root, action: 'check' })).result.structuredContent.agent, 'Scanner');
+  // Harny is still registered.
+  assert.equal((await call('workrelay_server_notify', { action: 'check', scope: 'agent', agent: 'Harny' })).result.structuredContent.agent_default.configured, true);
+});

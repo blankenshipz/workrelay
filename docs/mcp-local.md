@@ -331,8 +331,9 @@ Optional settings:
 Each agent registers its own listener once; that is the normal setup (see [Listen for progress events](#listen-for-progress-events-any-platform)). A session's target comes from the first of these that applies:
 
 1. **Per call (`per_call`).** `notify: {url, header_name?, header_value?, hmac_secret?, format?, stall_minutes?}` on create, message or resume, or `workrelay_server_notify` action `set` with `url` (scope `session`). Always overrides any default.
-2. **Your client default (`client_default`).** The listener you registered with `workrelay_server_notify` action `set`, scope `client`, or with the `notify-register.mjs` CLI on the Workrelay host. It is keyed by your authenticated OAuth `client_id`, stored in the private `0600` clients file (`clients_file`, default `<dir of managed_supervisor_file>/notify-clients.json`) and attached automatically to every session you create, message or resume. Changes apply without a restart.
-3. **Gateway default (`gateway_default`), optional operator fallback.** The first `default_targets` entry that matches. Each entry can have two match fields:
+2. **Your agent listener (`agent_default`).** The listener registered under your stable agent name with `workrelay_server_notify` action `set`, scope `agent`, `agent: "<name>"` (or `notify-register.mjs --agent <name>`). It is keyed by (OAuth `client_id`, agent name), so several agents that share one MCP connection each keep their own listener. It is attached when you pass `agent: "<name>"` on create, message or resume; the name is remembered for that session (per client), so later calls may omit it. Passing a different agent name on a later call hands the session's events to that agent. Agent names are 1–64 characters of `A-Z a-z 0-9 . _ -`. If the agent has no listener (or it is removed), the client default applies.
+3. **Your client default (`client_default`).** The listener you registered with `workrelay_server_notify` action `set`, scope `client`, or with the `notify-register.mjs` CLI on the Workrelay host. It is keyed by your authenticated OAuth `client_id`, stored in the private `0600` clients file (`clients_file`, default `<dir of managed_supervisor_file>/notify-clients.json`) and attached automatically to every session you create, message or resume. Changes apply without a restart.
+4. **Gateway default (`gateway_default`), optional operator fallback.** The first `default_targets` entry that matches. Each entry can have two match fields:
    - `directories` matches the session's project directory. A plain path matches that directory and everything below it; a trailing slash is ignored. A glob matches the whole path: `*` matches one path segment, `**` matches any depth and `?` matches one character.
    - `clients` matches the authenticated OAuth `client_id` of the MCP caller.
 
@@ -344,13 +345,15 @@ The response's `notify` field shows the attached target and its `source`. If not
 
 | Call | Effect |
 |---|---|
-| `{action: "set", scope: "client", url, header_name?, header_value?, hmac_secret?, format?, stall_minutes?}` | Register your own listener for all future delegations. |
+| `{action: "set", scope: "agent", agent, url, header_name?, header_value?, hmac_secret?, format?, stall_minutes?}` | Register your own agent's listener (recommended when several agents share one MCP connection). |
+| `{action: "test", scope: "agent", agent}` / `{action: "check", scope: "agent", agent}` / `{action: "clear", scope: "agent", agent}` | Test / show (redacted) / remove it. |
+| `{action: "set", scope: "client", url, header_name?, header_value?, hmac_secret?, format?, stall_minutes?}` | Register a listener for the whole MCP client (fallback for agents without their own). |
 | `{action: "test", scope: "client"}` | Send one signed `workrelay.test` event to it now (rate limited to one per 10 s). |
 | `{action: "check", scope: "client"}` / `{action: "clear", scope: "client"}` | Show (redacted) / remove it. |
 | `{action: "set", session_id, url, ...}` | Per-session target. |
-| `{action: "set", session_id}` | Attach your client default (or the gateway default) to this session. |
+| `{action: "set", session_id, agent?}` | Attach your agent listener (`agent` is remembered for the session), else your client default, else the gateway default. |
 | `{action: "clear", session_id}` | Remove the target and opt this session out of defaults. |
-| `{action: "check", session_id}` | Effective target, redacted, with `source` (`per_call`, `client_default`, `gateway_default`); `status` is an alias. |
+| `{action: "check", session_id}` | Effective target, redacted, with `source` (`per_call`, `agent_default`, `client_default`, `gateway_default`) and `session_agent`; `status` is an alias. |
 | `{action: "test", session_id}` | Send a test event to the session's effective target. |
 
 **Opt out.** To opt a session out of defaults, pass `notify: false` to create, message or resume, or call `clear`. Later automatic attaches are then skipped until `set` is called or the opt-out expires after `ttl_hours`.
@@ -457,6 +460,8 @@ Any Standard Webhooks library verifies these headers, for example `new Webhook("
 
 Three steps, done once per agent. Nothing has to change on the Workrelay host except that `session_notify.enabled` is true.
 
+**Pick a stable agent name and always pass it.** Several agents often reach Workrelay through the same MCP connection (one OAuth client: for example every Grok Bot agent uses `grokbot-mcp`). A client-wide listener is shared by all of them, so the last one to register wins. Instead, each agent registers under its own name (`scope: "agent"`, `agent: "Harny"`) and passes the same `agent` on every `workrelay_server_create`, `workrelay_server_message` and `workrelay_server_resume` (at least once per session; it is remembered). Names: 1–64 characters of `A-Z a-z 0-9 . _ -`, case-sensitive. Use `scope: "client"` only when one agent owns the connection.
+
 **1. Create a listener.** Anything that accepts an HTTPS POST on a public host, port 443:
 
 | Platform | Listener | `format` | Auth |
@@ -472,7 +477,7 @@ For signing, generate a secret: `echo "whsec_$(openssl rand -base64 32)"`.
 **2. Register it with Workrelay.** Either from the agent, through its Workrelay MCP connection:
 
 ```json
-workrelay_server_notify {"action": "set", "scope": "client",
+workrelay_server_notify {"action": "set", "scope": "agent", "agent": "Harny",
   "url": "https://hooks.example.com/…", "header_name": "X-Hook-Token", "header_value": "…",
   "hmac_secret": "whsec_…", "format": "json", "stall_minutes": 15}
 ```
@@ -481,23 +486,23 @@ or, to keep the URL and secrets out of every chat transcript, on the Workrelay h
 
 ```sh
 read -rs WR_URL; read -rs WR_TOKEN; read -rs WR_SIG; export WR_URL WR_TOKEN WR_SIG
-node src/workrelay/notify-register.mjs --config gateway/mcp.json --client '<oauth client_id>' \
+node src/workrelay/notify-register.mjs --config gateway/mcp.json --agent Harny \
   --url-env WR_URL --header-name X-Hook-Token --header-value-env WR_TOKEN --hmac-secret-env WR_SIG \
   --format json --test
 unset WR_URL WR_TOKEN WR_SIG
 ```
 
-`--client` is the agent's OAuth `client_id` (the `client_id` shown by `{action: "check", scope: "client"}`); with `--config` it defaults to the OAuth client the gateway admits (`managed_client_id`). Other modes: `--show`, `--clear`, `--list`, `--test`. No restart is needed.
+`--agent` is the agent's own name. `--client` is the OAuth `client_id` (shown by `{action: "check", scope: "agent", agent: "Harny"}`); with `--config` it defaults to the OAuth client the gateway admits (`managed_client_id`). Omit `--agent` to register a client-wide listener. Other modes: `--show`, `--clear`, `--list`, `--test` (each with `--agent` for that agent's entry). No restart is needed.
 
-**3. Send a test event.** `workrelay_server_notify {"action": "test", "scope": "client"}` (or `--test` on the CLI). The response has `ok`, the receiver's HTTP `status` and the `event_id`; your listener should receive:
+**3. Send a test event.** `workrelay_server_notify {"action": "test", "scope": "agent", "agent": "Harny"}` (or `--agent Harny --test` on the CLI). The response has `ok`, the receiver's HTTP `status` and the `event_id`; your listener should receive:
 
 ```json
-{ "type": "workrelay.test", "schema_version": 1, "event_id": "evt_…", "source": "workrelay", "scope": "client",
+{ "type": "workrelay.test", "schema_version": 1, "event_id": "evt_…", "source": "workrelay", "scope": "agent", "agent": "Harny",
   "at": "…", "summary": "Workrelay test event: this listener is set up correctly. No action needed.",
   "guidance": "Verification only. Do not call any tool; real events have types workrelay.session.*." }
 ```
 
-From then on every session the agent creates, messages or resumes reports to this listener (`notify.source: "client_default"`). Stop polling: end the turn and act on the next event.
+From then on every session the agent creates, messages or resumes with `"agent": "Harny"` reports to this listener (`notify.source: "agent_default"`, `notify.agent: "Harny"`); for example `workrelay_server_create {"operation_id": "…", "project_id": "project_…", "title": "…", "agent": "Harny"}`. Stop polling: end the turn and act on the next event.
 
 **What the agent should do on each event.**
 

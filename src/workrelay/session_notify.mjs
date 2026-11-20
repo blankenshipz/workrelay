@@ -4,6 +4,10 @@
 // Targets come from, in order of precedence:
 //  - the caller, per session (workrelay_server_create/message/resume `notify`,
 //    or workrelay_server_notify scope session),
+//  - the delegating agent's own listener: agents that share one MCP client
+//    (OAuth client_id) each register under their stable agent name
+//    (workrelay_server_notify scope agent) and pass `agent` on
+//    create/message/resume (remembered per session), else
 //  - the caller's own client default: each MCP client (OAuth client_id)
 //    registers its listener once (workrelay_server_notify scope client, or the
 //    notify-register.mjs CLI on the workrelay host) and it applies to every
@@ -209,76 +213,117 @@ export function redactTarget(target) {
 
 const CLIENT_ID = /^[\x21-\x7e]{1,512}$/;
 export const validClientID = value => typeof value === 'string' && CLIENT_ID.test(value) && !['__proto__', 'constructor', 'prototype'].includes(value);
+// Stable agent name, chosen by the agent itself ("Harny", "Scanner"): several
+// agents that share one MCP connection (one OAuth client) each register their
+// own listener under (client_id, agent).
+export const AGENT_NAME = /^[A-Za-z0-9._-]{1,64}$/;
+export const validAgentName = value => typeof value === 'string' && AGENT_NAME.test(value) && !['__proto__', 'constructor', 'prototype'].includes(value);
 const MAX_CLIENTS = 100;
+const MAX_AGENTS = 100; // per client
 
 /**
- * Per-client default targets ("register your own listener once"). Keyed by the
- * authenticated OAuth client_id. Stored in a private 0600 file (owner-only
- * directory, no symlinks, atomic replace) that both the gateway and the
- * notify-register CLI write; read at use time, so CLI changes apply without a
- * restart. Secrets are never returned: callers see only redacted views.
+ * Per-client and per-agent default targets ("register your own listener
+ * once"). Keyed by the authenticated OAuth client_id and, optionally, the
+ * agent's own stable name under that client. Stored in a private 0600 file
+ * (owner-only directory, no symlinks, atomic replace) that both the gateway
+ * and the notify-register CLI write; read at use time, so CLI changes apply
+ * without a restart. Secrets are never returned: callers see only redacted
+ * views. File: { version: 1, clients: { id: entry }, agents: { id: { name: entry } } }.
  */
 export function createClientDefaults({ file, now = Date.now } = {}) {
-  // { state: 'present', entry } | { state: 'absent' } | { state: 'error', reason }
+  const plain = value => value && typeof value === 'object' && !Array.isArray(value);
   function readAll() {
-    if (!file) return { clients: new Map() };
+    if (!file) return { clients: new Map(), agents: new Map() };
     let data;
-    try { data = readPrivateJSON(file, 524288); }
-    catch (error) { return error?.code === 'ENOENT' ? { clients: new Map() } : { error: error.reason ?? 'clients_file_unavailable' }; }
-    if (data?.version !== 1 || !data.clients || typeof data.clients !== 'object' || Array.isArray(data.clients)) return { error: 'clients_file_invalid' };
-    return { clients: new Map(Object.entries(data.clients).filter(([id, entry]) => validClientID(id) && entry && typeof entry === 'object' && !Array.isArray(entry))) };
+    try { data = readPrivateJSON(file, 1048576); }
+    catch (error) { return error?.code === 'ENOENT' ? { clients: new Map(), agents: new Map() } : { error: error.reason ?? 'clients_file_unavailable' }; }
+    if (data?.version !== 1 || !plain(data.clients) || data.agents !== undefined && !plain(data.agents)) return { error: 'clients_file_invalid' };
+    return { clients: new Map(Object.entries(data.clients).filter(([id, entry]) => validClientID(id) && plain(entry))),
+      agents: new Map(Object.entries(data.agents ?? {}).filter(([id, byName]) => validClientID(id) && plain(byName))
+        .map(([id, byName]) => [id, new Map(Object.entries(byName).filter(([name, entry]) => validAgentName(name) && plain(entry)))])) };
   }
-  function lookup(clientID) {
-    if (!validClientID(clientID)) return { state: 'absent' };
+  // Exact lookup: the agent's own entry when `agent` is given, else the
+  // client entry. { state: 'present', entry } | { state: 'absent' } | { state: 'error', reason }
+  function lookupExact(clientID, agent) {
+    if (!validClientID(clientID) || agent !== undefined && !validAgentName(agent)) return { state: 'absent' };
     const all = readAll();
     if (all.error) return { state: 'error', reason: all.error };
-    const entry = all.clients.get(clientID);
+    const entry = agent !== undefined ? all.agents.get(clientID)?.get(agent) : all.clients.get(clientID);
     return entry ? { state: 'present', entry } : { state: 'absent' };
+  }
+  // Effective lookup for delegation: the agent's own listener, else the
+  // client's. `agent` in the result names the agent entry used, if any.
+  function lookup(clientID, agent) {
+    if (agent !== undefined && validAgentName(agent)) {
+      const own = lookupExact(clientID, agent);
+      if (own.state !== 'absent') return own.state === 'present' ? { ...own, agent } : own;
+    }
+    return lookupExact(clientID);
   }
   function resolveEntry(entry) {
     const { stall_minutes: stall, ...fields } = Object.fromEntries(Object.entries(entry).filter(([key]) => TARGET_FIELDS.includes(key)));
     try { return { target: validateNotifyTarget(fields), ...(stall ? { stall_minutes: stall } : {}) }; }
     catch (error) { return { reason: `client_default_${error.reason ?? 'invalid'}` }; }
   }
-  function view(clientID, entry) {
+  function view(clientID, entry, agent) {
     const resolved = resolveEntry(entry);
-    return { client_id: clientID, configured: Boolean(resolved.target), ...(resolved.reason ? { reason: resolved.reason } : {}), ...redactTarget(resolved.target),
+    return { client_id: clientID, ...(agent !== undefined ? { agent } : {}), configured: Boolean(resolved.target), ...(resolved.reason ? { reason: resolved.reason } : {}), ...redactTarget(resolved.target),
       ...(entry.stall_minutes ? { stall_minutes: entry.stall_minutes } : {}), updated_at: entry.updated_at ?? null, updated_by: entry.updated_by ?? null };
   }
-  function write(clients) {
-    writePrivateJSON(file, { version: 1, clients: Object.fromEntries(clients) });
+  function write(all) {
+    writePrivateJSON(file, { version: 1, clients: Object.fromEntries(all.clients),
+      agents: Object.fromEntries([...all.agents].filter(([, byName]) => byName.size).map(([id, byName]) => [id, Object.fromEntries(byName)])) });
   }
   const fail = reason => { throw Object.assign(Error('client default unavailable'), { reason }); };
+  const checkAgent = agent => { if (agent !== undefined && !validAgentName(agent)) fail('invalid_agent'); };
   return {
-    lookup,
-    any: () => { const all = readAll(); return Boolean(all.error || all.clients.size); },
-    resolve(clientID) {
-      const found = lookup(clientID);
+    lookup, lookupExact,
+    any: () => { const all = readAll(); return Boolean(all.error || all.clients.size || [...all.agents.values()].some(byName => byName.size)); },
+    // Exact: the agent's entry (agent given) or the client entry.
+    resolve(clientID, agent) {
+      const found = lookupExact(clientID, agent);
       if (found.state === 'error') return { reason: found.reason };
-      if (found.state === 'absent') return { reason: 'client_default_removed' };
+      if (found.state === 'absent') return { reason: agent !== undefined ? 'agent_default_removed' : 'client_default_removed' };
       return resolveEntry(found.entry);
     },
-    get(clientID) { const found = lookup(clientID); return found.state === 'present' ? view(clientID, found.entry) : found.state === 'error' ? { client_id: clientID, error: found.reason } : null; },
-    list() { const all = readAll(); return all.error ? { error: all.error } : { clients: [...all.clients].map(([id, entry]) => view(id, entry)) }; },
+    get(clientID, agent) {
+      const found = lookupExact(clientID, agent);
+      return found.state === 'present' ? view(clientID, found.entry, agent) :
+        found.state === 'error' ? { client_id: clientID, ...(agent !== undefined ? { agent } : {}), error: found.reason } : null;
+    },
+    list() {
+      const all = readAll();
+      return all.error ? { error: all.error } : { clients: [...all.clients].map(([id, entry]) => view(id, entry)),
+        agents: [...all.agents].flatMap(([id, byName]) => [...byName].map(([name, entry]) => view(id, entry, name))) };
+    },
     // `by` is a non-secret label ("mcp" or "cli") recorded for operators.
-    set(clientID, rawTarget, { by = 'mcp' } = {}) {
+    set(clientID, rawTarget, { by = 'mcp', agent } = {}) {
       if (!file) fail('clients_file_not_configured');
       if (!validClientID(clientID)) fail('invalid_client_id');
+      checkAgent(agent);
       const target = validateNotifyTarget(rawTarget);
       const all = readAll();
       if (all.error) fail(all.error);
-      if (!all.clients.has(clientID) && all.clients.size >= MAX_CLIENTS) fail('too_many_clients');
-      all.clients.set(clientID, { ...target, updated_at: new Date(now()).toISOString(), updated_by: by });
-      write(all.clients);
-      return view(clientID, all.clients.get(clientID));
+      const known = all.clients.has(clientID) || all.agents.has(clientID);
+      if (!known && new Set([...all.clients.keys(), ...all.agents.keys()]).size >= MAX_CLIENTS) fail('too_many_clients');
+      const entry = { ...target, updated_at: new Date(now()).toISOString(), updated_by: by };
+      if (agent === undefined) all.clients.set(clientID, entry);
+      else {
+        const byName = all.agents.get(clientID) ?? new Map();
+        if (!byName.has(agent) && byName.size >= MAX_AGENTS) fail('too_many_agents');
+        byName.set(agent, entry); all.agents.set(clientID, byName);
+      }
+      write(all);
+      return view(clientID, entry, agent);
     },
-    clear(clientID) {
+    clear(clientID, { agent } = {}) {
       if (!file) fail('clients_file_not_configured');
+      checkAgent(agent);
       const all = readAll();
       if (all.error) fail(all.error);
-      const had = all.clients.delete(clientID);
-      if (had) write(all.clients);
-      return { client_id: clientID, cleared: had };
+      const had = agent === undefined ? all.clients.delete(clientID) : Boolean(all.agents.get(clientID)?.delete(agent));
+      if (had) write(all);
+      return { client_id: clientID, ...(agent !== undefined ? { agent } : {}), cleared: had };
     },
   };
 }
@@ -349,9 +394,9 @@ export async function postNotifyEvent(target, event, { transport, now = Date.now
 
 // `workrelay.test`: sent only on request (notify tool action test, or the CLI)
 // so a newly set up listener can be verified end to end. Receivers ignore it.
-export function testNotifyEvent({ sessionID, serverId, scope, now = Date.now } = {}) {
+export function testNotifyEvent({ sessionID, serverId, scope, agent, now = Date.now } = {}) {
   return { type: 'workrelay.test', schema_version: EVENT_SCHEMA_VERSION, event_id: 'evt_' + randomBytes(12).toString('hex'), source: 'workrelay',
-    ...(sessionID ? { session_id: sessionID } : {}), ...(serverId ? { server_id: serverId } : {}), ...(scope ? { scope } : {}),
+    ...(sessionID ? { session_id: sessionID } : {}), ...(serverId ? { server_id: serverId } : {}), ...(scope ? { scope } : {}), ...(agent ? { agent } : {}),
     at: new Date(now()).toISOString(),
     summary: 'Workrelay test event: this listener is set up correctly. No action needed.',
     guidance: 'Verification only. Do not call any tool; real events have types workrelay.session.*.' };
@@ -387,27 +432,46 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
     (typeof t.url === 'string' || typeof t.default_name === 'string' || t.default_pending === true || t.client_default === true && validClientID(t.client_id))));
   // Sessions opted out of gateway defaults -> expiry time.
   const optedOut = new Map(Object.entries(loaded.opt_out ?? {}).filter(([id, until]) => SID.test(id) && Number.isSafeInteger(until)));
+  // The delegating agent's name per session (create/message/resume `agent`),
+  // remembered so later calls need not repeat it: session -> { agent, client_id, until }.
+  const sessionAgents = new Map(Object.entries(loaded.agents ?? {}).filter(([id, a]) => SID.test(id) && a && validAgentName(a.agent) &&
+    (a.client_id === undefined || validClientID(a.client_id)) && Number.isSafeInteger(a.until)));
   const persist = () => {
     if (!statePath) return;
-    try { saveState(statePath, { targets: Object.fromEntries(targets), opt_out: Object.fromEntries(optedOut) }); } catch { log('session notify state not saved'); }
+    try { saveState(statePath, { targets: Object.fromEntries(targets), opt_out: Object.fromEntries(optedOut), agents: Object.fromEntries(sessionAgents) }); }
+    catch { log('session notify state not saved'); }
   };
+  // The session's agent for this client (a remembered name applies only to the
+  // client that set it). Expired entries are dropped.
+  function agentOf(sessionID, clientID) {
+    const a = sessionAgents.get(sessionID);
+    if (!a) return undefined;
+    if (a.until <= now()) { sessionAgents.delete(sessionID); return undefined; }
+    return a.client_id === clientID ? a.agent : undefined;
+  }
+  function rememberAgent(sessionID, agent, clientID, at = now()) {
+    if (!validAgentName(agent) || !SID.test(sessionID ?? '')) return;
+    sessionAgents.delete(sessionID); // re-insert: Map order is the eviction order
+    sessionAgents.set(sessionID, { agent, ...(validClientID(clientID) ? { client_id: clientID } : {}), until: at + ttl });
+    while (sessionAgents.size > Math.max(1000, maxTargets * 5)) sessionAgents.delete(sessionAgents.keys().next().value);
+  }
   const isOptedOut = (sessionID, at = now()) => {
     const until = optedOut.get(sessionID);
     if (until !== undefined && until <= at) { optedOut.delete(sessionID); return false; }
     return until !== undefined;
   };
   // Effective delivery target: a per-call target, or a default resolved now.
-  const effective = t => t.client_default ? clients.resolve(t.client_id) : t.default_name ? defaults.resolve(t.default_name) :
+  const effective = t => t.client_default ? clients.resolve(t.client_id, t.listener_agent) : t.default_name ? defaults.resolve(t.default_name) :
     t.url ? { target: { url: t.url, header_name: t.header_name, header_value: t.header_value, hmac_secret: t.hmac_secret, format: t.format } } :
     { reason: 'default_pending' };
-  const sourceOf = t => t.url ? 'per_call' : t.client_default ? 'client_default' : 'gateway_default';
+  const sourceOf = t => t.url ? 'per_call' : t.client_default ? (t.listener_agent !== undefined ? 'agent_default' : 'client_default') : 'gateway_default';
   // Redacted view: never the URL path, header value or HMAC secret.
   function publicStatus(id, t) {
     if (!t) return { session_id: id, enabled: false, ...(isOptedOut(id) ? { opted_out: true } : {}) };
     const resolved = t.default_pending ? { reason: 'default_pending' } : effective(t);
     const target = resolved.target;
     return { session_id: id, enabled: true, source: sourceOf(t),
-      ...(t.client_default ? { client_id: t.client_id } : {}),
+      ...(t.client_default ? { client_id: t.client_id, ...(t.listener_agent !== undefined ? { agent: t.listener_agent } : {}) } : {}),
       ...(t.default_name ? { default_target: t.default_name } : {}), ...(t.default_pending ? { pending: true } : {}),
       configured: Boolean(target), ...(resolved.reason ? { reason: resolved.reason } : {}), ...redactTarget(target),
       stall_minutes: Math.round((t.stall_ms ?? (resolved.stall_minutes ? resolved.stall_minutes * MINUTE : stallDefault)) / MINUTE),
@@ -429,7 +493,7 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
     t.registered_at = at; t.expires_at = Math.max(t.expires_at ?? 0, at + ttl);
     return t;
   }
-  const CALL_FIELDS = ['url', 'header_name', 'header_value', 'hmac_secret', 'format', 'stall_ms', 'default_name', 'default_pending', 'client_id', 'client_default'];
+  const CALL_FIELDS = ['url', 'header_name', 'header_value', 'hmac_secret', 'format', 'stall_ms', 'default_name', 'default_pending', 'client_id', 'client_default', 'listener_agent'];
   function set(sessionID, rawTarget, at = now()) {
     if (!SID.test(sessionID ?? '')) throw Object.assign(Error('invalid session'), { reason: 'invalid_session' });
     const target = validateNotifyTarget(rawTarget);
@@ -448,13 +512,16 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
     // client_id is kept so the match can be re-checked against current config.
     Object.assign(t, { default_name: entry.name, client_id: clientID, stall_ms: entry.stall_minutes ? entry.stall_minutes * MINUTE : undefined });
   }
-  function applyClient(t, clientID, entry) {
+  // `own` is a present clients.lookup result: the agent's own entry (own.agent) or the client's.
+  function applyClient(t, clientID, own) {
     for (const key of CALL_FIELDS) delete t[key];
-    Object.assign(t, { client_default: true, client_id: clientID, stall_ms: entry.stall_minutes ? entry.stall_minutes * MINUTE : undefined });
+    Object.assign(t, { client_default: true, client_id: clientID, ...(own.agent !== undefined ? { listener_agent: own.agent } : {}),
+      stall_ms: own.entry.stall_minutes ? own.entry.stall_minutes * MINUTE : undefined });
   }
+  const sameListener = (t, clientID, own) => t.client_default && t.client_id === clientID && t.listener_agent === own.agent;
   // A default whose source no longer exists counts as no target (a transient
   // clients-file error does not).
-  const stale = t => t?.default_name !== undefined && !defaults.has(t.default_name) || t?.client_default === true && clients.lookup(t.client_id).state === 'absent';
+  const stale = t => t?.default_name !== undefined && !defaults.has(t.default_name) || t?.client_default === true && clients.lookupExact(t.client_id, t.listener_agent).state === 'absent';
   const bounded = (promise, ms) => {
     let timer;
     return Promise.race([promise.catch(() => null), new Promise(done => { timer = setTimeout(() => done(null), ms); timer.unref?.(); })]).finally(() => clearTimeout(timer));
@@ -464,13 +531,17 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
   // out; the directory is matched via watch now (bounded) or on the next tick.
   // Explicit (workrelay_server_notify set without url): replaces a per-call
   // target and lifts the opt-out, but only when a default matches.
-  async function attachDefault(sessionID, { client_id: clientID, at = now(), explicit = false, waitMs = 4000 } = {}) {
+  // `agent` (optional) names the delegating agent; it is remembered for the
+  // session, so later calls may omit it.
+  async function attachDefault(sessionID, { client_id: clientID, agent, at = now(), explicit = false, waitMs = 4000 } = {}) {
     if (!SID.test(sessionID ?? '')) return null;
-    // The caller's own registered listener comes first; no directory needed.
-    const own = clients.lookup(clientID);
+    if (agent !== undefined) { rememberAgent(sessionID, agent, clientID, at); persist(); }
+    // The caller's own registered listener comes first (the agent's, else the
+    // client's); no directory needed.
+    const own = clients.lookup(clientID, agent ?? agentOf(sessionID, clientID));
     if (explicit) {
       if (own.state === 'present') {
-        const t = ensure(sessionID, at); applyClient(t, clientID, own.entry); optedOut.delete(sessionID); persist();
+        const t = ensure(sessionID, at); applyClient(t, clientID, own); optedOut.delete(sessionID); persist();
         return publicStatus(sessionID, t);
       }
       if (!defaults.size || !defaults.mayMatch(clientID)) return { error: 'no_default_target' };
@@ -486,12 +557,12 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
       const t = targets.get(sessionID);
       // An automatic target follows the delegating client's own listener;
       // a per-call target is never replaced.
-      if (!t.url && own.state === 'present' && !(t.client_default && t.client_id === clientID)) { applyClient(t, clientID, own.entry); persist(); }
+      if (!t.url && own.state === 'present' && !sameListener(t, clientID, own)) { applyClient(t, clientID, own); persist(); }
       return publicStatus(sessionID, t);
     }
     if (isOptedOut(sessionID, at)) return null;
     if (own.state === 'present') {
-      const t = ensure(sessionID, at); applyClient(t, clientID, own.entry); persist();
+      const t = ensure(sessionID, at); applyClient(t, clientID, own); persist();
       return publicStatus(sessionID, t);
     }
     if (!defaults.size || !defaults.mayMatch(clientID)) return null;
@@ -517,9 +588,9 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
     if (!t?.default_pending) return;
     try { view ??= await watch(sessionID); } catch { return; } // retried on the next tick
     if (!t.default_pending || targets.get(sessionID) !== t) return;
-    const own = clients.lookup(t.client_id);
+    const own = clients.lookup(t.client_id, agentOf(sessionID, t.client_id));
     const entry = own.state === 'present' ? null : defaults.match({ directory: view.directory, client_id: t.client_id });
-    if (own.state === 'present') applyClient(t, t.client_id, own.entry);
+    if (own.state === 'present') applyClient(t, t.client_id, own);
     else if (entry) applyDefault(t, entry, t.client_id); else targets.delete(sessionID);
     persist();
   }
@@ -535,15 +606,17 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
   }
   function get(sessionID) { return publicStatus(sessionID, targets.get(sessionID)); }
   // Status plus whether a gateway default would apply (bounded native read).
-  async function status(sessionID, { client_id: clientID, waitMs = 4000 } = {}) {
+  async function status(sessionID, { client_id: clientID, agent, waitMs = 4000 } = {}) {
     const current = get(sessionID);
-    if (current.enabled) return current;
+    const sessionAgent = agent ?? agentOf(sessionID, clientID);
+    if (current.enabled) return { ...current, ...(sessionAgent !== undefined ? { session_agent: sessionAgent } : {}) };
     const guidance = current.opted_out ? 'This session opted out of defaults. Call set without url to re-attach the default.' :
       'Delegating with create/message/resume attaches it automatically; or call set without url.';
-    const own = clients.lookup(clientID);
+    const own = clients.lookup(clientID, sessionAgent);
     if (own.state === 'present') {
-      const resolved = clients.resolve(clientID);
-      return { ...current, default_available: { source: 'client_default', client_id: clientID, configured: Boolean(resolved.target),
+      const resolved = clients.resolve(clientID, own.agent);
+      return { ...current, default_available: { source: own.agent !== undefined ? 'agent_default' : 'client_default', client_id: clientID,
+        ...(own.agent !== undefined ? { agent: own.agent } : {}), configured: Boolean(resolved.target),
         ...(resolved.reason ? { reason: resolved.reason } : {}), ...redactTarget(resolved.target) }, guidance };
     }
     if (!defaults.size || !defaults.mayMatch(clientID)) return current;
@@ -559,28 +632,29 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
   // delegation would attach; or (no session) to the client's own default.
   // Sent now, outside the outbox, and not counted in delivery stats.
   const lastTest = new Map();
-  async function test({ session_id: sessionID, client_id: clientID } = {}) {
-    const key = sessionID ? `s:${sessionID}` : `c:${clientID}`;
+  // `agent` without a session tests that agent's own listener (scope agent).
+  async function test({ session_id: sessionID, client_id: clientID, agent } = {}) {
+    const key = sessionID ? `s:${sessionID}` : agent !== undefined ? `a:${clientID}\n${agent}` : `c:${clientID}`;
     if (now() - (lastTest.get(key) ?? -Infinity) < 10000) return { error: 'test_rate_limited' };
     let resolved, source;
     if (!sessionID) {
-      if (clients.lookup(clientID).state !== 'present') return { error: 'no_client_default' };
-      resolved = clients.resolve(clientID); source = 'client_default';
+      if (clients.lookupExact(clientID, agent).state !== 'present') return { error: agent !== undefined ? 'no_agent_default' : 'no_client_default' };
+      resolved = clients.resolve(clientID, agent); source = agent !== undefined ? 'agent_default' : 'client_default';
     } else {
       const t = targets.get(sessionID);
       if (t) { resolved = t.default_pending ? { reason: 'default_pending' } : effective(t); source = sourceOf(t); }
       else {
-        const available = (await status(sessionID, { client_id: clientID })).default_available;
+        const available = (await status(sessionID, { client_id: clientID, agent })).default_available;
         if (!available || available === 'unknown') return { error: 'no_target' };
         source = available.source;
-        resolved = source === 'client_default' ? clients.resolve(clientID) : defaults.resolve(available.default_target);
+        resolved = source === 'gateway_default' ? defaults.resolve(available.default_target) : clients.resolve(clientID, available.agent);
       }
     }
     if (!resolved.target) return { error: 'target_not_configured', source, ...(resolved.reason ? { reason: resolved.reason } : {}) };
     lastTest.set(key, now());
     if (lastTest.size > 1000) lastTest.delete(lastTest.keys().next().value);
-    const event = testNotifyEvent({ sessionID, serverId, scope: sessionID ? 'session' : 'client', now });
-    return { ...(sessionID ? { session_id: sessionID } : { client_id: clientID }), source, ...await sendTestEvent(resolved.target, event, { transport, now }) };
+    const event = testNotifyEvent({ sessionID, serverId, scope: sessionID ? 'session' : agent !== undefined ? 'agent' : 'client', ...(agent !== undefined ? { agent } : {}), now });
+    return { ...(sessionID ? { session_id: sessionID } : { client_id: clientID, ...(agent !== undefined ? { agent } : {}) }), source, ...await sendTestEvent(resolved.target, event, { transport, now }) };
   }
 
   // The delegating agent started/continued work (message/resume/steer).
@@ -617,7 +691,7 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
   }
 
   // Reasons that mean "deliberately no receiver": drop instead of retrying.
-  const INERT = new Set(['url_not_configured', 'default_target_removed', 'default_pending', 'client_default_removed']);
+  const INERT = new Set(['url_not_configured', 'default_target_removed', 'default_pending', 'client_default_removed', 'agent_default_removed']);
   async function deliver(sessionID, t) {
     const ready = (t.outbox ?? []).filter(item => item.next_at <= now());
     // At most 3 sends per target per tick; targets are delivered concurrently.
@@ -676,9 +750,9 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
       // config: a newly registered client listener takes over, a removed one
       // falls back to the gateway default, and narrowed, renamed or removed
       // gateway entries re-match or detach instead of lingering.
-      const own = clients.lookup(t.client_id);
+      const own = clients.lookup(t.client_id, agentOf(sessionID, t.client_id));
       const stallOf = entry => entry.stall_minutes ? entry.stall_minutes * MINUTE : undefined;
-      if (own.state === 'present') { if (!t.client_default || stallOf(own.entry) !== t.stall_ms) applyClient(t, t.client_id, own.entry); }
+      if (own.state === 'present') { if (!sameListener(t, t.client_id, own) || stallOf(own.entry) !== t.stall_ms) applyClient(t, t.client_id, own); }
       // A gateway-default target persisted before client ids were recorded
       // cannot be re-matched by client: keep it while its entry exists.
       else if (!t.client_default && t.client_id === undefined) { if (!defaults.has(t.default_name)) { targets.delete(sessionID); return; } }
@@ -748,8 +822,9 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
   async function tick() {
     if (running) return; running = true;
     try {
-      const before = JSON.stringify([[...targets], [...optedOut]]);
+      const before = JSON.stringify([[...targets], [...optedOut], [...sessionAgents]]);
       for (const [id, until] of [...optedOut]) if (until <= now()) optedOut.delete(id);
+      for (const [id, a] of [...sessionAgents]) if (a.until <= now()) sessionAgents.delete(id);
       const live = [];
       for (const [sessionID, t] of [...targets]) {
         if (t.expires_at <= now()) { targets.delete(sessionID); continue; }
@@ -758,11 +833,11 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
       }
       // One slow receiver must not delay another session's events.
       await Promise.allSettled(live.map(([sessionID, t]) => deliver(sessionID, t)));
-      if (JSON.stringify([[...targets], [...optedOut]]) !== before) persist();
+      if (JSON.stringify([[...targets], [...optedOut], [...sessionAgents]]) !== before) persist();
     } finally { running = false; }
   }
   let timer;
-  return { set, clear, get, status, test, attachDefault, armed, tick, hasDefaults, hasGatewayDefaults: () => defaults.size > 0, clients,
+  return { set, clear, get, status, test, attachDefault, armed, rememberAgent: (sessionID, agent, clientID) => { rememberAgent(sessionID, agent, clientID); persist(); }, tick, hasDefaults, hasGatewayDefaults: () => defaults.size > 0, clients,
     size: () => targets.size,
     start() { if (!timer) { timer = setInterval(() => { void tick().catch(() => {}); }, settings.poll_interval_ms ?? 30000); timer.unref?.(); } },
     stop() { clearInterval(timer); timer = undefined; } };
