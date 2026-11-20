@@ -62,6 +62,8 @@ function fixture(overrides = {}) {
       state.permissions[match[1]] = state.permissions[match[1]].filter(item => item.id !== match[2]);
       return json({ data: true });
     }
+    match = /^\/api\/session\/([^/]+)\/message$/.exec(path);
+    if (match) return json({ data: (state.messages?.[match[1]] ?? []).slice(0, Number(url.searchParams.get('limit') ?? 10)), cursor: {} });
     match = /^\/api\/session\/([^/]+)\/permission$/.exec(path);
     if (match) return json({ data: state.permissions[match[1]] ?? [] });
     match = /^\/api\/session\/([^/]+)$/.exec(path);
@@ -357,4 +359,63 @@ test('operator page requires password, single-use CSRF and origin before any dec
   const res = { statusCode: 0, writeHead(code) { this.statusCode = code; }, end() {}, setHeader() {} };
   assert.equal(await plain({ url: '/operator/permissions', method: 'GET', headers: {}, socket: {} }, res), true);
   assert.equal(res.statusCode, 404);
+});
+
+test('operator session_watch: tree status, live asks with preview and directory, last activity; operator reader only', async () => {
+  const { state, fetcher } = fixture();
+  state.sessions[router].time = { idle: 1, updated: 100 };
+  state.sessions[builder].time = { updated: 500 };
+  state.sessions[helper].location = { directory: '/work/dd/apps/api' };
+  const operator = readerFor(fetcher, { operatorActions: true });
+  const view = await operator('session_watch', { session_id: router, directories: ['/work/dd'] }, claims);
+  assert.equal(view.session_id, router); assert.equal(view.directory, '/work/dd');
+  assert.equal(view.aggregate_status, 'blocked_on_permission'); assert.equal(view.runtime_status, 'succeeded');
+  assert.equal(view.last_activity_at, 500); assert.equal(view.idle_at, 1); assert.equal(view.running_children, 1);
+  assert.equal(view.pending.length, 1);
+  assert.equal(view.pending[0].permission_id, 'per_pending1'); assert.equal(view.pending[0].session_id, helper);
+  assert.equal(view.pending[0].directory, '/work/dd/apps/api'); assert.equal(view.pending[0].action, 'shell');
+  assert.ok(view.pending[0].resource_preview[0].length <= 160);
+  assert.doesNotMatch(JSON.stringify(view), /hunter2/, 'previews are redacted');
+  // Outside the approved directories, or through a non-operator reader: denied.
+  await assert.rejects(operator('session_watch', { session_id: router, directories: ['/work/other'] }, claims));
+  await assert.rejects(readerFor(fetcher)('session_watch', { session_id: router, directories: ['/work/dd'] }, claims));
+  await assert.rejects(readerFor(fetcher)('activity_overview', { directories: ['/work/dd'] }, claims));
+});
+
+test('operator activity_overview groups active sessions by project with a redacted tail and live asks', async () => {
+  const now = Date.now();
+  const { state, fetcher } = fixture();
+  state.sessions[builder].time = { updated: now - 1000 };
+  state.sessions[helper].time = { updated: now - 2000 };
+  state.sessions[router].time = { idle: now - 7200000, updated: now - 7200000 }; // old, idle: hidden
+  state.sessions[verifier].time = { idle: now - 600000, updated: now - 600000 }; // recently idle: shown
+  state.sessions.ses_elsewhere00000000001 = { id: 'ses_elsewhere00000000001', projectID: 'q', agent: 'x', location: { directory: '/work/other' }, time: { updated: now } };
+  state.active.ses_elsewhere00000000001 = { type: 'running' };
+  state.messages = { [builder]: [
+    { id: 'msg_2', type: 'assistant', time: { created: now - 1000 }, content: [{ type: 'reasoning', text: 'secret thoughts' },
+      { type: 'tool', id: 'toolu_1', name: 'shell', state: { status: 'running', input: { command: 'pytest -q && export API_KEY=abc123' }, content: 'OUTPUT-NOT-SHOWN' } },
+      { type: 'text', text: 'Running   the tests now.' }] },
+    { id: 'msg_1', type: 'user', text: 'Please fix the failing test', time: { created: now - 5000 } }] };
+  const operator = readerFor(fetcher, { operatorActions: true });
+  const view = await operator('activity_overview', { directories: ['/work/dd'] }, claims);
+  assert.equal(view.projects.length, 1); assert.equal(view.projects[0].directory, '/work/dd');
+  const sessions = view.projects[0].sessions;
+  assert.deepEqual(sessions.map(item => item.session_id).sort(), [builder, helper, verifier].sort());
+  const b = sessions.find(item => item.session_id === builder);
+  assert.equal(b.status, 'running'); assert.equal(b.parent_session_id, router); assert.equal(b.agent, 'harness-builder');
+  assert.deepEqual(b.tail.map(entry => entry.kind), ['user', 'tool', 'text']);
+  assert.equal(b.tail[1].tool, 'shell'); assert.equal(b.tail[1].status, 'running');
+  assert.match(b.tail[1].preview, /^pytest -q && export API_KEY=\[REDACTED\]/);
+  assert.equal(b.tail[2].text, 'Running the tests now.');
+  const raw = JSON.stringify(view);
+  assert.doesNotMatch(raw, /secret thoughts|OUTPUT-NOT-SHOWN|abc123|hunter2|\/work\/other/);
+  const h = sessions.find(item => item.session_id === helper);
+  assert.equal(h.status, 'blocked_on_permission'); assert.equal(h.pending[0].permission_id, 'per_pending1');
+  assert.equal(sessions[0].status === 'running' || sessions[0].status === 'blocked_on_permission', true, 'busy sessions first');
+  // One session's permission list failing (e.g. deleted mid-scan) does not blank the feed.
+  const broken = fixture();
+  broken.state.sessions[builder].time = { updated: now };
+  const brokenFetcher = async (url, options) => url.pathname === `/api/session/${builder}/permission` ? new Response('{}', { status: 500 }) : broken.fetcher(url, options);
+  const partial = await readerFor(brokenFetcher, { operatorActions: true })('activity_overview', { directories: ['/work/dd'] }, claims);
+  assert.ok(partial.projects[0].sessions.some(item => item.session_id === builder));
 });

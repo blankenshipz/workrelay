@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Per-session progress notifications for the delegating agent (`session_notify`, opt-in):
+  - **Registering:** pass an optional `notify` to `workrelay_server_create`/`message`/`resume`, or use the new `workrelay_server_notify` tool (set, clear, status). It takes a public HTTPS webhook URL, such as a Grok Bot routine webhook trigger, an optional secret header and an optional stall threshold.
+  - **Events:** `permission_asked` (permission id, child session, action, redacted preview, directory; immediate, deduped), `finished`/`failed` (once per run), `child_failed`, `stalled` (default 10 min without progress) and `unobservable`. The last three are limited to one per session per 2 minutes and coalesced. There are no per-step events.
+  - **Delivery:** the SSRF-pinned transport shared with Events (public DNS answers only, no redirects). The header is stored only in a private `0600` state file and is never returned or put in a payload. Delivery runs in a background poller with concurrent delivery and longer retries for asks and completion, so failures never affect tool calls or runs.
+- Loopback-only live activity view (`/operator/activity` on `operator_approvals.local_listen`):
+  - Shows active sessions per project with status and a short redacted tail of tool calls and text. Pending asks get Approve once, Approve always and Deny buttons.
+  - Uses the same operator session and directory-bound reply path as the permissions page. The JSON feed needs the session cookie plus a custom header; decisions need Origin plus a session-bound CSRF token. The CSP is strict and nonce-based.
+  - The feed renews the operator session while the view is open, up to 2 hours; the page has a Sign out button. Per-session rate limits are applied after the session check.
+  - The loopback cookies now use `Path=/operator`.
+- New operator-only reader actions `session_watch` and `activity_overview`. They are never reachable from MCP tools.
 - Managed create allows Anthropic routes only when the complete `provider_guard_file_hashes.anthropic` pin set is configured, and the pinned guard files currently match before the session is created. Incomplete, malformed or mismatched pins deny the create. Later writes still run full attestation.
 - Managed create now stamps the target agent's own configured native model (`GET /api/agent/<agent>` at the creation location) instead of always forcing the profile `model`. The profile model is a fallback only for agents without a model, or an explicit override via `managed_create_model: "profile"`. An unavailable agent definition denies the create; there is no silent fallback. The guarded transport independently re-resolves the model before the native POST. Resolved models pass the same exact-reference, provider and pin checks.
 - Read surfaces pending native permission requests across the session tree (per-session lists; the location-scoped global list is not used): `blocked_on_permission`, sanitized `pending_permissions`, `children` with running/idle/blocked status, and an `aggregate_status` that never reports a finished tree while children run or are blocked. Discover adds a compact per-session `tree` summary.

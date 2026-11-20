@@ -188,9 +188,95 @@ const OPERATOR_SESSION_MS = 300000;
 // so it uses distinct, host-only, path-scoped HttpOnly SameSite=Strict cookies.
 // Confidentiality on that path comes from the SSH tunnel and the loopback bind.
 const PUBLIC_OPERATOR_SITE = Object.freeze({ flowCookie: COOKIE, sessionCookie: OPERATOR_COOKIE, attributes: 'Path=/; Secure; HttpOnly; SameSite=Strict' });
+// Path=/operator so the loopback session also covers the live view
+// (/operator/activity*), which exists only on the loopback listener.
 const LOOPBACK_OPERATOR_SITE = Object.freeze({ flowCookie: 'workrelay-operator-flow', sessionCookie: 'workrelay-operator-session',
-  attributes: `Path=${OPERATOR_PATH}; HttpOnly; SameSite=Strict` });
+  attributes: 'Path=/operator; HttpOnly; SameSite=Strict' });
+export const ACTIVITY_PATHS = Object.freeze(['/operator/activity', '/operator/activity/feed', '/operator/activity/reply', '/operator/activity/signout']);
+// The live view polls; it renews the operator session while open, up to an
+// absolute lifetime. Per-session in-memory rate limits (checked after the
+// session) replace the sign-in limits, so unauthenticated requests cannot
+// exhaust an operator's budget.
+const OPERATOR_SESSION_MAX_MS = 2 * 3600000;
 const LOOPBACK_ORIGIN = /^http:\/\/(?:127\.0\.0\.1|localhost):(?:[1-9][0-9]{0,4})$/;
+
+// Live view page. All data is rendered with textContent (never innerHTML);
+// the script is nonce-bound under a strict CSP and only talks to this origin.
+function activityPage(nonce, csrf) {
+  const script = `
+const csrf = ${JSON.stringify(csrf)};
+const root = document.getElementById('root'), statusLine = document.getElementById('status');
+const el = (tag, text, cls) => { const n = document.createElement(tag); if (text !== undefined) n.textContent = text; if (cls) n.className = cls; return n; };
+const ago = ms => { if (!ms) return ''; const s = Math.max(0, Math.round((Date.now() - ms) / 1000)); return s < 90 ? s + 's ago' : Math.round(s / 60) + 'm ago'; };
+async function decide(sessionID, permissionID, decision, button) {
+  if (decision !== 'reject' && !confirm('Send "' + decision + '" for ' + permissionID + '?')) return;
+  button.disabled = true;
+  try {
+    const body = new URLSearchParams({ csrf, session_id: sessionID, permission_id: permissionID, decision });
+    const r = await fetch('/operator/activity/reply', { method: 'POST', body, headers: { 'content-type': 'application/x-www-form-urlencoded' }, credentials: 'same-origin' });
+    const j = await r.json().catch(() => ({}));
+    statusLine.textContent = j.notice || ('Decision failed (HTTP ' + r.status + ')');
+  } catch { statusLine.textContent = 'Decision failed.'; }
+  poll();
+}
+function render(view) {
+  root.replaceChildren();
+  if (!view.projects || !view.projects.length) { root.append(el('p', 'No active or recent sessions in approved directories.')); return; }
+  for (const project of view.projects) {
+    const section = el('section'); section.append(el('h2', project.directory));
+    for (const s of project.sessions) {
+      const box = el('div', undefined, 'session ' + s.status);
+      const head = el('div', undefined, 'head');
+      head.append(el('strong', s.title || s.session_id), el('span', ' ' + s.agent + ' · ' + s.status + ' · ' + ago(s.updated_at), 'meta'),
+        el('div', s.session_id + (s.parent_session_id ? ' (child of ' + s.parent_session_id + ')' : ''), 'id'));
+      box.append(head);
+      for (const p of s.pending) {
+        const ask = el('div', undefined, 'ask');
+        ask.append(el('div', 'Permission ask: ' + p.action + ' (' + p.permission_id + ')'), el('pre', p.resource_preview.join('\\n') + (p.resources_omitted ? '\\n(+' + p.resources_omitted + ' more)' : '')));
+        for (const [decision, label] of [['once', 'Approve once'], ['always', 'Approve always'], ['reject', 'Deny']]) {
+          const b = el('button', label); b.type = 'button'; b.addEventListener('click', () => decide(s.session_id, p.permission_id, decision, b)); ask.append(b);
+        }
+        box.append(ask);
+      }
+      const list = el('ol', undefined, 'tail');
+      for (const e of s.tail) {
+        const li = el('li', undefined, e.kind);
+        li.textContent = e.kind === 'tool' ? '⚙ ' + e.tool + ' [' + e.status + '] ' + (e.preview || '') : (e.kind === 'user' ? '» ' : '') + e.text;
+        list.append(li);
+      }
+      box.append(list); section.append(box);
+    }
+    root.append(section);
+  }
+  if (view.truncated) root.append(el('p', 'More sessions exist; showing the most active.'));
+}
+let timer;
+async function poll() {
+  clearTimeout(timer);
+  try {
+    const r = await fetch('/operator/activity/feed', { headers: { 'x-workrelay-operator': 'feed' }, credentials: 'same-origin', cache: 'no-store' });
+    if (r.status === 401) { statusLine.textContent = 'Signed out. Sign in again on /operator/permissions.'; return; }
+    const view = await r.json();
+    if (view.error) statusLine.textContent = 'Unavailable (' + view.error + '); retrying.';
+    else { render(view); statusLine.textContent = 'Updated ' + new Date().toLocaleTimeString(); }
+  } catch { statusLine.textContent = 'Feed error; retrying.'; }
+  timer = setTimeout(poll, 5000);
+}
+document.getElementById('signout').addEventListener('click', async () => {
+  clearTimeout(timer);
+  try { await fetch('/operator/activity/signout', { method: 'POST', body: new URLSearchParams({ csrf }), headers: { 'content-type': 'application/x-www-form-urlencoded' }, credentials: 'same-origin' }); } catch {}
+  root.replaceChildren(); statusLine.textContent = 'Signed out.';
+});
+poll();`;
+  const style = 'body{font:14px system-ui,sans-serif;margin:1em}h2{font-size:1em;margin:1.2em 0 .4em}.session{border:1px solid #ccc;border-radius:6px;padding:.5em;margin:.5em 0}' +
+    '.session.running{border-color:#2a7}.session.blocked_on_permission{border-color:#d70;background:#fff8ec}.meta{color:#666}.id{color:#999;font-size:.85em}' +
+    '.tail{margin:.4em 0 0;padding-left:1.4em;font-family:ui-monospace,monospace;font-size:12px}.tail li{white-space:pre-wrap;word-break:break-word}.tail .tool{color:#345}.tail .user{color:#06c}' +
+    '.ask{border-left:3px solid #d70;padding:.3em .6em;margin:.4em 0}.ask pre{white-space:pre-wrap;background:#f4f4f4;padding:.3em}.ask button{margin-right:.4em}';
+  return `<!doctype html><html lang="en"><meta charset="utf-8"><title>Workrelay live activity</title><style nonce="${nonce}">${style}</style>` +
+    `<h1>Workrelay live activity</h1><p><a href="${OPERATOR_PATH}">Pending permissions page</a> · <button type="button" id="signout">Sign out</button> · <span id="status">Loading…</span></p>` +
+    '<p class="meta">Agent text and tool previews are untrusted, redacted and truncated. Decisions here are the same as on the permissions page.</p>' +
+    `<div id="root"></div><script nonce="${nonce}">${script}</script></html>`;
+}
 
 export function createLocalInteractions({ provider, directory, origin, clientId, resource, captureConsent, operatorApprovals }) {
   if (!provider?.interactionDetails || !provider?.interactionFinished ||
@@ -217,6 +303,7 @@ export function createLocalInteractions({ provider, directory, origin, clientId,
   db.exec('CREATE TABLE IF NOT EXISTS csrf (uid TEXT PRIMARY KEY, bound TEXT NOT NULL, expires INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS attempts (account TEXT PRIMARY KEY, count INTEGER NOT NULL, until INTEGER NOT NULL, locked INTEGER NOT NULL)');
   db.exec('CREATE TABLE IF NOT EXISTS admission (subject TEXT PRIMARY KEY, count INTEGER NOT NULL, expires INTEGER NOT NULL); PRAGMA max_page_count=64');
   db.exec('CREATE TABLE IF NOT EXISTS operator_session (token TEXT PRIMARY KEY, expires INTEGER NOT NULL)');
+  db.exec('CREATE TABLE IF NOT EXISTS operator_session_start (token TEXT PRIMARY KEY, started INTEGER NOT NULL)');
   assertState();
   function bounded() {
     const pages = db.prepare('PRAGMA page_count').get().page_count;
@@ -345,11 +432,14 @@ export function createLocalInteractions({ provider, directory, origin, clientId,
       db.prepare('DELETE FROM operator_session WHERE expires<=?').run(Date.now());
       if (db.prepare('SELECT COUNT(*) AS count FROM operator_session').get().count >= 16 || !bounded()) { db.exec('COMMIT'); return null; }
       db.prepare('INSERT INTO operator_session(token,expires) VALUES(?,?)').run(digest(token), Date.now() + OPERATOR_SESSION_MS);
+      db.prepare('DELETE FROM operator_session_start WHERE token NOT IN (SELECT token FROM operator_session)').run();
+      db.prepare('INSERT OR REPLACE INTO operator_session_start(token,started) VALUES(?,?)').run(digest(token), Date.now());
       db.exec('COMMIT'); return token;
     } catch { try { db.exec('ROLLBACK'); } catch { /* unavailable */ } return null; }
   }
   const page = (title, content) => `<!doctype html><html lang="en"><meta charset="utf-8"><title>${escaped(title)}</title><h1>${escaped(title)}</h1>${content}</html>`;
-  async function operatorList(res, token, notice = '') {
+  async function operatorList(res, token, notice = '', site) {
+    const liveLink = site?.sessionCookie === LOOPBACK_OPERATOR_SITE.sessionCookie;
     const csrf = issueOperatorCsrf('operator:' + digest(token));
     if (!csrf) { send(res, 503); return true; }
     let listing;
@@ -365,7 +455,7 @@ export function createLocalInteractions({ provider, directory, origin, clientId,
         (item.stale ? '<button name="decision" value="reject" type="submit">Dismiss stale request (deny)</button></form></section>' :
           '<button name="decision" value="once" type="submit">Approve once</button><button name="decision" value="always" type="submit">Approve always</button><button name="decision" value="reject" type="submit">Deny</button></form></section>')).join('') +
         (listing.truncated ? '<p>More requests exist; resolve these and refresh.</p>' : '');
-    send(res, 200, page('Workrelay pending permissions', `${notice ? `<p><strong>${escaped(notice)}</strong></p>` : ''}<p>Requests are untrusted agent-generated text. Command previews are redacted and may be truncated. Each page action is single-use; the operator session expires after five minutes.</p>${rows}<form method="post" action="${OPERATOR_PATH}">${hidden}<button type="submit">Refresh</button></form>`));
+    send(res, 200, page('Workrelay pending permissions', `${notice ? `<p><strong>${escaped(notice)}</strong></p>` : ''}${operatorApprovals.activity && liveLink ? '<p><a href="/operator/activity">Live activity view</a></p>' : ''}<p>Requests are untrusted agent-generated text. Command previews are redacted and may be truncated. Each page action is single-use; the operator session expires after five minutes${liveLink ? ' (an open live activity view renews it, up to two hours after sign-in; use its Sign out button when done)' : ''}.</p>${rows}<form method="post" action="${OPERATOR_PATH}">${hidden}<button type="submit">Refresh</button></form>`));
     return true;
   }
   async function operatorHandle(req, res, site) {
@@ -398,7 +488,7 @@ export function createLocalInteractions({ provider, directory, origin, clientId,
       if (!token) { send(res, 503); return true; }
       res.setHeader('set-cookie', [`${site.flowCookie}=; ${site.attributes}; Max-Age=0`,
         `${site.sessionCookie}=${token}; ${site.attributes}; Max-Age=${OPERATOR_SESSION_MS / 1000}`]);
-      return operatorList(res, token);
+      return operatorList(res, token, '', site);
     }
     const token = cookieValue(req, site.sessionCookie);
     const sessionID = fields.get('session_id'), permissionID = fields.get('permission_id'), decision = fields.get('decision');
@@ -406,7 +496,7 @@ export function createLocalInteractions({ provider, directory, origin, clientId,
     if (!refresh && (!/^ses[A-Za-z0-9_-]{1,160}$/.test(sessionID ?? '') || !/^per[A-Za-z0-9_-]{1,160}$/.test(permissionID ?? '') ||
         !['once', 'always', 'reject'].includes(decision))) { send(res, 403); return true; }
     if (!operatorSession(token) || !consumeOperatorCsrf(fields.get('flow'), 'operator:' + digest(token), fields.get('csrf'))) { send(res, 403); return true; }
-    if (refresh) return operatorList(res, token);
+    if (refresh) return operatorList(res, token, '', site);
     let notice;
     try {
       const result = await operatorApprovals.reply({ session_id: sessionID, permission_id: permissionID, decision });
@@ -414,7 +504,7 @@ export function createLocalInteractions({ provider, directory, origin, clientId,
         result?.reason === 'stale_session_stopped' ? `${permissionID} belongs to a stopped session; approval would resume nothing, so it was not sent. Dismiss (deny) it instead.` :
         `${permissionID} is no longer pending; nothing was changed.`;
     } catch { notice = `Could not record a decision for ${permissionID}; it was not approved by this page.`; }
-    return operatorList(res, token, notice);
+    return operatorList(res, token, notice, site);
   }
   async function operatorEntry(req, res, site) {
     try { return await operatorHandle(req, res, site); }
@@ -519,9 +609,104 @@ export function createLocalInteractions({ provider, directory, origin, clientId,
   // has already verified the socket peer, exact Host and absent forwarding;
   // localOrigin is that validated http://<loopback host>:<port>. Only the
   // operator page is reachable here: never OAuth interactions.
+  // ---- Loopback-only live activity view -------------------------------
+  // Same operator session (password sign-in on /operator/permissions). Reads
+  // are cookie-authenticated GETs that also require a custom header (so a
+  // cross-site page cannot trigger them without a CORS preflight, which is
+  // never granted). Decisions are POSTs with an exact Origin check and a
+  // session-bound CSRF token, and go through the same permission_reply path.
+  function renewOperatorSession(token) {
+    if (!operatorSession(token)) return false;
+    try {
+      const started = db.prepare('SELECT started FROM operator_session_start WHERE token=?').get(digest(token))?.started;
+      if (!started) return true; // legacy session: no renewal, normal expiry
+      const expires = Math.min(Date.now() + OPERATOR_SESSION_MS, started + OPERATOR_SESSION_MAX_MS);
+      db.prepare('UPDATE operator_session SET expires=MAX(expires,?) WHERE token=?').run(expires, digest(token));
+    } catch { /* renewal is best effort; the session still has its current expiry */ }
+    return true;
+  }
+  const activityCsrf = token => digest('workrelay-activity-csrf:' + token);
+  const buckets = new Map();
+  const admittedTo = (bucket, limit) => {
+    const now = Date.now();
+    const hits = (buckets.get(bucket) ?? []).filter(at => at > now - 60000);
+    if (hits.length >= limit) { buckets.set(bucket, hits); return false; }
+    hits.push(now); buckets.delete(bucket); buckets.set(bucket, hits);
+    while (buckets.size > 64) buckets.delete(buckets.keys().next().value);
+    return true;
+  };
+  const sendJSON = (res, status, value) => {
+    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff',
+      'content-security-policy': "default-src 'none'; frame-ancestors 'none'", 'referrer-policy': 'same-origin' });
+    res.end(JSON.stringify(value));
+  };
+  async function activityHandle(req, res, site) {
+    const path = req.url;
+    if (!operatorApprovals?.activity) { send(res, 404); return true; }
+    assertState();
+    const token = cookieValue(req, site.sessionCookie);
+    const sessionBucket = token ? 'session:' + digest(token) : '';
+    if (path === '/operator/activity') {
+      if (req.method !== 'GET') { send(res, 405); return true; }
+      if (!operatorSession(token)) {
+        if (!admittedTo('anonymous', 60)) { send(res, 429); return true; }
+        send(res, 200, page('Workrelay live activity', `<p>Sign in on <a href="${OPERATOR_PATH}">${OPERATOR_PATH}</a> first, then return here.</p>`));
+        return true;
+      }
+      if (!admittedTo(sessionBucket, 120)) { send(res, 429); return true; }
+      renewOperatorSession(token);
+      const nonce = randomBytes(16).toString('base64');
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'same-origin',
+        'content-security-policy': `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'` });
+      res.end(activityPage(nonce, activityCsrf(token)));
+      return true;
+    }
+    if (path === '/operator/activity/feed') {
+      if (req.method !== 'GET') { send(res, 405); return true; }
+      if (req.headers['x-workrelay-operator'] !== 'feed') { sendJSON(res, 403, { error: 'denied' }); return true; }
+      if (!operatorSession(token)) { sendJSON(res, 401, { error: 'signed_out' }); return true; }
+      if (!admittedTo(sessionBucket, 120)) { sendJSON(res, 429, { error: 'rate_limited' }); return true; }
+      renewOperatorSession(token);
+      let view;
+      try { view = await operatorApprovals.activity(); } catch { view = null; }
+      sendJSON(res, 200, view ?? { error: 'unavailable' });
+      return true;
+    }
+    // /operator/activity/reply and /operator/activity/signout
+    if (req.method !== 'POST') { send(res, 405); return true; }
+    if (req.headers.origin !== site.origin || !operatorSession(token)) { sendJSON(res, 403, { error: 'denied' }); return true; }
+    if (!admittedTo('reply:' + sessionBucket, 30)) { sendJSON(res, 429, { error: 'rate_limited' }); return true; }
+    let fields;
+    try { fields = await body(req, path === '/operator/activity/signout' ? ['csrf'] : ['csrf', 'session_id', 'permission_id', 'decision']); } catch { sendJSON(res, 403, { error: 'denied' }); return true; }
+    if (!same(fields.get('csrf') ?? '', activityCsrf(token))) { sendJSON(res, 403, { error: 'denied' }); return true; }
+    if (path === '/operator/activity/signout') {
+      db.prepare('DELETE FROM operator_session WHERE token=?').run(digest(token));
+      db.prepare('DELETE FROM operator_session_start WHERE token=?').run(digest(token));
+      res.setHeader('set-cookie', `${site.sessionCookie}=; ${site.attributes}; Max-Age=0`);
+      sendJSON(res, 200, { notice: 'Signed out.' });
+      return true;
+    }
+    const sessionID = fields.get('session_id'), permissionID = fields.get('permission_id'), decision = fields.get('decision');
+    if (!/^ses[A-Za-z0-9_-]{1,160}$/.test(sessionID ?? '') ||
+        !/^per[A-Za-z0-9_-]{1,160}$/.test(permissionID ?? '') || !['once', 'always', 'reject'].includes(decision)) { sendJSON(res, 403, { error: 'denied' }); return true; }
+    let notice;
+    try {
+      const result = await operatorApprovals.reply({ session_id: sessionID, permission_id: permissionID, decision });
+      notice = result?.replied ? `Recorded "${decision}" for ${permissionID}.` :
+        result?.reason === 'stale_session_stopped' ? `${permissionID} belongs to a stopped session; not sent.` : `${permissionID} is no longer pending; nothing changed.`;
+    } catch { notice = `Could not record a decision for ${permissionID}.`; }
+    sendJSON(res, 200, { notice });
+    return true;
+  }
   handle.operatorLoopback = async (req, res, localOrigin) => {
-    if (typeof localOrigin !== 'string' || !LOOPBACK_ORIGIN.test(localOrigin) || req.url !== OPERATOR_PATH) { send(res, 404); return true; }
-    return operatorEntry(req, res, { ...LOOPBACK_OPERATOR_SITE, origin: localOrigin });
+    if (typeof localOrigin !== 'string' || !LOOPBACK_ORIGIN.test(localOrigin)) { send(res, 404); return true; }
+    const site = { ...LOOPBACK_OPERATOR_SITE, origin: localOrigin };
+    if (ACTIVITY_PATHS.includes(req.url)) {
+      try { return await activityHandle(req, res, site); }
+      catch { if (!res.headersSent) send(res, 403); else res.destroy(); return true; }
+    }
+    if (req.url !== OPERATOR_PATH) { send(res, 404); return true; }
+    return operatorEntry(req, res, site);
   };
   return handle;
 }

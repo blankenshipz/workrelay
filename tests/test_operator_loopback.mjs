@@ -110,7 +110,7 @@ test('loopback listener serves only the password/CSRF-protected operator page', 
         cookie: [...cookies].map(([name, value]) => `${name}=${value}`).join('; ') } });
     for (const set of [response.headers['set-cookie'] ?? []].flat()) {
       // Plain-HTTP loopback origin: host-only, path-scoped, HttpOnly, Strict, never __Host-/Secure.
-      assert.match(set, /^workrelay-operator-(flow|session)=[^;]*; Path=\/operator\/permissions; HttpOnly; SameSite=Strict; Max-Age=\d+$/);
+      assert.match(set, /^workrelay-operator-(flow|session)=[^;]*; Path=\/operator; HttpOnly; SameSite=Strict; Max-Age=\d+$/);
       const [pair] = set.split(';'); const [name, value] = pair.split('=');
       if (/Max-Age=0/.test(set)) jar.delete(name); else jar.set(name, value);
     }
@@ -154,6 +154,55 @@ test('loopback listener serves only the password/CSRF-protected operator page', 
   assert.equal(main.status, 200);
   assert.match([main.headers['set-cookie']].flat()[0], /^__Host-workrelay-flow=[^;]+; Path=\/; Secure; HttpOnly; SameSite=Strict/);
   assert.equal((await call(mainPort, { path: '/mcp', method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).status, 401);
+
+  // Live activity view: loopback only, same operator session.
+  for (const path of ['/operator/activity', '/operator/activity/feed'])
+    assert.equal((await call(mainPort, { path, headers: { cookie: `workrelay-operator-session=${session}` } })).status, 404, `public ${path}`);
+  const cookie = `workrelay-operator-session=${session}`;
+  const signedOut = await call(operatorPort, { path: '/operator/activity' });
+  assert.equal(signedOut.status, 200); assert.doesNotMatch(signedOut.text, /<script/); assert.match(signedOut.text, /Sign in/);
+  const live = await call(operatorPort, { path: '/operator/activity', headers: { cookie } });
+  assert.equal(live.status, 200);
+  const nonce = /script-src 'nonce-([^']+)'/.exec(live.headers['content-security-policy'])?.[1];
+  assert.ok(nonce); assert.match(live.headers['content-security-policy'], /default-src 'none'/); assert.match(live.headers['content-security-policy'], /connect-src 'self'/);
+  assert.ok(live.text.includes(`<script nonce="${nonce}">`)); assert.doesNotMatch(live.text, /innerHTML/);
+  const csrf = /const csrf = "([a-f0-9]{64})"/.exec(live.text)?.[1]; assert.ok(csrf);
+  assert.equal((await call(operatorPort, { path: '/operator/activity/feed', headers: { cookie } })).status, 403, 'feed needs the custom header');
+  assert.equal((await call(operatorPort, { path: '/operator/activity/feed', headers: { 'x-workrelay-operator': 'feed' } })).status, 401);
+  assert.equal((await call(operatorPort, { path: '/operator/activity/feed', headers: { 'x-workrelay-operator': 'feed', cookie: 'workrelay-operator-session=' + 'A'.repeat(43) } })).status, 401);
+  const feed = await call(operatorPort, { path: '/operator/activity/feed', headers: { 'x-workrelay-operator': 'feed', cookie } });
+  assert.equal(feed.status, 200); assert.match(feed.headers['content-type'], /application\/json/);
+  assert.deepEqual(JSON.parse(feed.text), { error: 'unavailable' }, 'fixture has no native server; nothing is fabricated');
+  assert.equal((await call(operatorPort, { path: '/operator/activity/feed', method: 'POST', body: '', headers: { cookie } })).status, 405);
+  const reply = (form, headers = {}) => call(operatorPort, { path: '/operator/activity/reply', method: 'POST', body: new URLSearchParams(form).toString(),
+    headers: { 'content-type': 'application/x-www-form-urlencoded', origin: local, cookie, ...headers } });
+  const decision = { csrf, session_id: 'ses_example', permission_id: 'per_example', decision: 'once' };
+  assert.equal((await reply(decision, { origin: 'https://evil.test' })).status, 403);
+  assert.equal((await reply(decision, { cookie: '' })).status, 403);
+  assert.equal((await reply({ ...decision, csrf: 'f'.repeat(64) })).status, 403);
+  assert.equal((await reply({ ...decision, decision: 'yolo' })).status, 403);
+  assert.equal((await reply({ ...decision, extra: '1' })).status, 403);
+  const accepted = await reply(decision);
+  assert.equal(accepted.status, 200); assert.match(JSON.parse(accepted.text).notice, /Could not record/);
+  assert.equal((await call(operatorPort, { path: '/operator/activity/reply', headers: { cookie } })).status, 405);
+  assert.match(refreshed.text, /href="\/operator\/activity"/, 'loopback permissions page links the live view');
+  assert.match(refreshed.text, /up to two hours after sign-in/);
+  // Unauthenticated floods (e.g. a web page firing no-cors GETs) cannot exhaust the operator's budget.
+  let limited = 0;
+  for (let i = 0; i < 65; i++) if ((await call(operatorPort, { path: '/operator/activity' })).status === 429) limited++;
+  assert.ok(limited >= 5, 'anonymous requests are limited');
+  assert.equal((await call(operatorPort, { path: '/operator/activity/feed', headers: { 'x-workrelay-operator': 'feed', cookie } })).status, 200);
+  assert.equal((await reply(decision)).status, 200);
+  // Sign out: needs Origin + CSRF; afterwards the feed is signed out.
+  const signout = (form, headers = {}) => call(operatorPort, { path: '/operator/activity/signout', method: 'POST', body: new URLSearchParams(form).toString(),
+    headers: { 'content-type': 'application/x-www-form-urlencoded', origin: local, cookie, ...headers } });
+  assert.equal((await signout({ csrf: 'f'.repeat(64) })).status, 403);
+  assert.equal((await signout({ csrf }, { origin: 'https://evil.test' })).status, 403);
+  const out = await signout({ csrf });
+  assert.equal(out.status, 200); assert.match([out.headers['set-cookie']].flat()[0], /^workrelay-operator-session=; Path=\/operator; HttpOnly; SameSite=Strict; Max-Age=0$/);
+  assert.equal((await call(operatorPort, { path: '/operator/activity/feed', headers: { 'x-workrelay-operator': 'feed', cookie } })).status, 401);
+  assert.equal((await reply(decision)).status, 403);
+  assert.doesNotMatch((await call(mainPort)).text, /operator\/activity/);
 
   await new Promise(resolve => { gateway.close(resolve); gateway.closeAllConnections(); });
   assert.equal(gateway.operatorServer.listening, false, 'operator listener shares the gateway lifetime');

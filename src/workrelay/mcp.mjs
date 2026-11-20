@@ -19,8 +19,9 @@ import { createManagedEventSource } from './managed_event_source.mjs';
 import { createManagedReader, managedServerID, managedClientID } from './managed_server.mjs';
 import { createIssuerAdapter } from './oidc_adapter.mjs';
 import { createUnexposedIssuerPolicy, createPreapprovalDiagnostic, createAuthorizationOutcomeDiagnostic, createTokenErrorDiagnostic } from './issuer_policy.mjs';
-import { createLocalInteractions, createOriginDiagnostic } from './issuer_interactions.mjs';
+import { createLocalInteractions, createOriginDiagnostic, ACTIVITY_PATHS } from './issuer_interactions.mjs';
 import { createPermissionNotifier, validateNotifySettings } from './permission_notify.mjs';
+import { createSessionNotifier, validateSessionNotifySettings, validateNotifyTarget } from './session_notify.mjs';
 const loopback = new Set(['127.0.0.1', '::1']);
 const key = z.string().regex(/^[A-Za-z0-9_-]{1,80}$/);
 const grantId = z.string().regex(/^grant_[0-9a-f]{32}$/);
@@ -176,6 +177,8 @@ export function validateConfig(config, { testIssuer = false } = {}) {
       !config.revocation_file.startsWith('/'))) throw Error('private revocation file path required');
   auditSettings(config); // throws on an invalid explicit audit_log
   validateNotifySettings(config.operator_approvals);
+  validateSessionNotifySettings(config.session_notify);
+  if (config.session_notify !== undefined && !config.managed_supervisor_file) throw Error('session_notify requires managed_supervisor_file');
   if (config.operator_approvals !== undefined && !config.managed_supervisor_file) throw Error('operator_approvals requires managed_supervisor_file');
   if (config.operator_approvals?.local_listen !== undefined &&
       (config.issuer_mode !== 'self-hosted' || config.operator_approvals.local_listen.port === config.port))
@@ -324,7 +327,13 @@ function bridge(config, command, input) {
   });
 }
 
-function mcp(config, invoke, events, managedReader, eventTools, audit) {
+const notifyInput = z.object({ url: z.string().min(1).max(2048), header_name: z.string().min(1).max(64).optional(),
+  header_value: z.string().min(1).max(1024).optional(), stall_minutes: z.number().int().min(1).max(1440).optional() }).strict();
+const NOTIFY_DESCRIPTION = ' Optional notify {url, header_name?, header_value?, stall_minutes?} registers a public HTTPS webhook (e.g. a Grok Bot routine webhook trigger URL) that receives a compact JSON event only when a permission ask appears, the run finishes or fails, or it stalls; the header is sent with each event and never returned.';
+const notifyFailure = reason => ({ isError: true, content: [{ type: 'text', text: JSON.stringify({ error: 'invalid_notify_target', reason }) }],
+  structuredContent: { error: 'invalid_notify_target', reason } });
+
+function mcp(config, invoke, events, managedReader, eventTools, audit, notifier) {
   const server = new McpServer({ name: 'workrelay', version: '0.1.0' },
     { ...(events ? { capabilities: { events: {} } } : {}),
       instructions: managedReader ? 'Start with workrelay_server_discover({}) for explicitly authorized managed-server access, or workrelay_discover({}) for ordinary scoped work. Server tools verify the pinned principal and client on every call. No enrollment is needed for approved server access. Message queues to the existing owner with native approvals and financial admission; interrupt is not rollback and does not cancel descendants. Reuse operation_id and identical inputs after uncertainty; do not blindly replay. When Events are enabled, session.completed/session.failed/session.needs_input accept the returned server_id and optional session_id; omitting session_id monitors the bound server. Events reconcile observed state, not transcript/history; idle is not completion and does not establish that a child completed before its parent became idle. Unsubscribe stops monitoring, not ordinary work.' :
@@ -412,31 +421,63 @@ function mcp(config, invoke, events, managedReader, eventTools, audit) {
   }
   if (managedReader) for (const action of ['create', 'message', 'steer', 'resume', 'inspect', 'waits', 'question_reply', 'question_cancel', 'reconcile', 'interrupt']) {
     register(`workrelay_server_${action === 'inspect' ? 'operation_status' : action}`, {
-      description: action === 'create' ? 'For the pinned server-wide principal, select project_id from workrelay_server_projects and omit directory to create an idle session at that verified native project canonical root. Optional creation_target selects the default project only. Explicit directory must be the selected root or an operator-allowlisted location within it; no arbitrary filesystem access. Supply operation_id/title. Inspect original operations before retry; never change arguments on an existing operation ID. Native model/permission/financial checks remain.' :
+      description: action === 'create' ? 'For the pinned server-wide principal, select project_id from workrelay_server_projects and omit directory to create an idle session at that verified native project canonical root. Optional creation_target selects the default project only. Explicit directory must be the selected root or an operator-allowlisted location within it; no arbitrary filesystem access. Supply operation_id/title. Inspect original operations before retry; never change arguments on an existing operation ID. Native model/permission/financial checks remain.' + (notifier ? NOTIFY_DESCRIPTION : '') :
         action === 'waits' ? 'Read bounded redacted native permission waits and native question forms for an exact session. This cannot reply to permissions or approve anything.' :
         action === 'question_reply' ? 'Submit an explicit caller-supplied answer to one exact, pending native question-tool form. The exact question form and owning running question tool are revalidated. Permission, authentication and MCP forms are never settled.' :
         action === 'question_cancel' ? 'Cancel one exact, pending native question-tool form. This can resume native inference and retains model, financial and native gates. Permission, authentication and MCP forms are never settled.' :
         action === 'reconcile' ? 'Read current native receipt for a retained operation and persist only an exact verified local observation. This distinguishes queued from materialized messages and native blockers, or observes question form state. It never posts or permits replay; historical operation status remains receipt-only.' :
         action === 'inspect' ? 'Read a historical durable receipt under the current authenticated principal/server binding; no current execution-model guard, native observation, continuation or interruption. session_id is optional when unknown. Not-found/ambiguous is scoped to this binding, never global absence or proof of no effect. Use retained original references or operator receipt reconciliation, not repeated identical failed lookups, guessed sessions, binding changes or replay. Writes retain native model/permission/financial guards.' :
         action === 'steer' ? 'Steer bounded text to the existing native owner at its supported boundary. No agent transfer or permission approval. Reuse operation_id and identical inputs.' :
-        ['message', 'resume'].includes(action) ? 'Queue a bounded continuation to the existing session owner; preserves agent/model/permissions. Native approval gates and financial admission apply. Reuse operation_id with identical text to reconcile uncertainty; never blindly replay.' :
+        ['message', 'resume'].includes(action) ? 'Queue a bounded continuation to the existing session owner; preserves agent/model/permissions. Native approval gates and financial admission apply. Reuse operation_id with identical text to reconcile uncertainty; never blindly replay.' + (notifier ? NOTIFY_DESCRIPTION : '') :
         'Interrupt only this existing session, not descendants. Not rollback; queued inputs remain and may run on later resume. Idle no-op is not active-cancel proof. Native permissions remain. Reuse operation_id to inspect the same attempt.',
-      inputSchema: action === 'create' ? z.object({ operation_id: key, project_id: z.string().regex(/^project_[a-f0-9]{64}$/), title: z.string().trim().min(1).max(160), directory: z.string().min(1).max(4096).optional() }).strict() :
+      inputSchema: action === 'create' ? z.object({ operation_id: key, project_id: z.string().regex(/^project_[a-f0-9]{64}$/), title: z.string().trim().min(1).max(160), directory: z.string().min(1).max(4096).optional(),
+        ...(notifier ? { notify: notifyInput.optional() } : {}) }).strict() :
         z.object({ session_id: action === 'inspect' ? z.string().regex(/^ses[A-Za-z0-9_-]{1,160}$/).optional() : z.string().regex(/^ses[A-Za-z0-9_-]{1,160}$/),
         ...(action === 'waits' ? { limit: z.number().int().min(1).max(50).optional() } : { operation_id: key }),
         ...(['question_reply', 'question_cancel'].includes(action) ? { form_id: z.string().regex(/^frm_[A-Za-z0-9_-]{1,160}$/) } : {}),
         ...(action === 'question_reply' ? { answer: z.record(z.string(), z.union([z.string(), z.array(z.string())])).refine(value => Object.keys(value).length <= 20) } : {}),
-        ...(['message', 'steer', 'resume'].includes(action) ? { text } : {}) }).strict(),
+        ...(['message', 'steer', 'resume'].includes(action) ? { text } : {}),
+        ...(notifier && ['message', 'resume'].includes(action) ? { notify: notifyInput.optional() } : {}) }).strict(),
       annotations: { readOnlyHint: ['inspect', 'waits'].includes(action), destructiveHint: ['interrupt', 'question_cancel'].includes(action), idempotentHint: true, openWorldHint: false },
-    }, async (input, ctx) => {
+    }, async (rawInput, ctx) => {
+      // notify is a workrelay-side registration only; never part of the
+      // durable operation arguments or the native request.
+      const { notify, ...input } = rawInput;
+      if (notify !== undefined) { try { validateNotifyTarget(notify); } catch (error) { return notifyFailure(error.reason ?? 'invalid_target'); } }
+      const startedAt = Date.now(); // before the native request: see notifier.armed
       try {
         const claims = ctx.http?.authInfo?.extra?.managedClaims;
         const resolved = action === 'inspect' ? (await managedReader('authorize', {}, claims), {}) : action === 'create' ? await managedReader('resolve_project', { project_id: input.project_id }, claims) :
           (await managedReader('session_check', { session_id: input.session_id }, claims), {});
         const result = await invoke(config, 'managed-control', { ...input, ...resolved, action, claims });
-        const output = result?.error ? safeControlFailure(result) : safeControlResult(result);
+        let output = result?.error ? safeControlFailure(result) : safeControlResult(result);
+        const target = action === 'create' ? output?.session_id : input.session_id;
+        if (notifier && !output?.error && typeof target === 'string' && /^ses[A-Za-z0-9_-]{1,160}$/.test(target)) {
+          try {
+            if (notify !== undefined) notifier.set(target, notify, startedAt);
+            if (['message', 'resume', 'steer'].includes(action)) notifier.armed(target, startedAt);
+            if (notify !== undefined) output = { ...output, notify: notifier.get(target) };
+          } catch { if (notify !== undefined) output = { ...output, notify: { session_id: target, enabled: false, reason: 'registration_failed' } }; }
+        }
         return { content: [{ type: 'text', text: JSON.stringify(output) }], structuredContent: output, isError: Boolean(output.error) };
       } catch { return { isError: true, content: [{ type: 'text', text: 'Managed control unavailable or denied.' }] }; }
+    });
+  }
+  if (managedReader && notifier) {
+    register('workrelay_server_notify', {
+      description: 'Set, clear or check the progress webhook for one session you delegated. set needs url (public HTTPS, e.g. a Grok Bot routine webhook trigger URL) and optionally header_name/header_value (a secret header sent with every event, never returned) and stall_minutes (default from gateway, 10). Events: workrelay.session.permission_asked (permission id, child session, action, redacted preview, directory; a human must approve), .finished / .failed (run ended; read the session for the result), .child_failed, .stalled, .unobservable. Never per step; non-ask/non-completion events are limited to one per session per 2 minutes. Notification failures never affect the run.',
+      inputSchema: z.object({ session_id: z.string().regex(/^ses[A-Za-z0-9_-]{1,160}$/), action: z.enum(['set', 'clear', 'status']),
+        url: z.string().min(1).max(2048).optional(), header_name: z.string().min(1).max(64).optional(), header_value: z.string().min(1).max(1024).optional(),
+        stall_minutes: z.number().int().min(1).max(1440).optional() }).strict(),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    }, async ({ session_id, action, ...target }, ctx) => {
+      if (action !== 'set' && Object.keys(target).length) return notifyFailure('fields_only_for_set');
+      if (action === 'set') { try { validateNotifyTarget(target); } catch (error) { return notifyFailure(error.reason ?? 'invalid_target'); } }
+      try {
+        await managedReader('session_check', { session_id }, ctx.http?.authInfo?.extra?.managedClaims);
+        const output = action === 'set' ? notifier.set(session_id, target) : action === 'clear' ? notifier.clear(session_id) : notifier.get(session_id);
+        return { content: [{ type: 'text', text: JSON.stringify(output) }], structuredContent: output };
+      } catch { return { isError: true, content: [{ type: 'text', text: 'Managed server capability unavailable or denied.' }] }; }
     });
   }
   if (eventTools) for (const definition of managedEventToolDefinitions) {
@@ -492,10 +533,34 @@ export function createGateway(rawConfig, options = {}) {
     return bridgeConfig.managed_allowed_directories ?? [bridgeConfig.directory];
   };
   const operatorClaims = () => ({ iss: config.issuer, aud: config.audience, sub: config.principal, client_id: managedClientID(config) });
+  // Operator-only activity views (session notifier poller, loopback live log).
+  // Separate reader instance: never reachable from MCP tools.
+  const notifySettings = config.session_notify?.enabled === true ? config.session_notify : null;
+  const activityReader = notifySettings || localOperatorPort ? createManagedReader(config, readManagedBinding, { operatorActions: true,
+    harnessStateDir: config.harness_state_dir }) : null;
+  const activityDirectories = () => {
+    if (approvals?.directories) return approvals.directories;
+    const bridgeConfig = privateIssuerFile(dirname(config.bridge_config), basename(config.bridge_config), 131072);
+    return bridgeConfig.managed_allowed_directories ?? [bridgeConfig.directory];
+  };
+  let activityCache = null;
   const operatorApprovals = approvals ? {
     list: () => operatorReader('pending_permissions', { directories: approvalDirectories() }, operatorClaims()),
     reply: input => operatorReader('permission_reply', { ...input, directories: approvalDirectories() }, operatorClaims()),
+    // Shared 3s cache so several open live-view tabs cost one native scan.
+    ...(localOperatorPort ? { activity: () => {
+      if (activityCache && Date.now() - activityCache.at < 3000) return activityCache.promise;
+      const promise = activityReader('activity_overview', { directories: activityDirectories() }, operatorClaims());
+      activityCache = { at: Date.now(), promise }; promise.catch(() => { if (activityCache?.promise === promise) activityCache = null; });
+      return promise;
+    } } : {}),
   } : undefined;
+  const sessionNotifier = notifySettings ? createSessionNotifier({ settings: notifySettings,
+    statePath: notifySettings.state_file ?? join(dirname(config.managed_supervisor_file), 'session-notify.json'),
+    approvalUrl: localOperatorPort ? `http://127.0.0.1:${localOperatorPort}/operator/permissions` : undefined,
+    watch: sessionID => activityReader('session_watch', { session_id: sessionID, directories: activityDirectories() }, operatorClaims()),
+    ...(options.notifyTransport ? { transport: options.notifyTransport } : {}),
+    log: message => process.stderr.write(message + '\n') }) : null;
   if (config.issuer_mode === 'self-hosted') {
     const settings = privateIssuerFile(config.issuer_state_dir, 'issuer.json');
     const human = privateIssuerFile(config.issuer_state_dir, 'human.json', 4096);
@@ -706,7 +771,7 @@ export function createGateway(rawConfig, options = {}) {
     }
     return result;
   } } : null;
-  const handler = options.sdkHandler ?? createMcpHandler(() => mcp(config, invoke, servedEvents, managedReader, eventTools, audit));
+  const handler = options.sdkHandler ?? createMcpHandler(() => mcp(config, invoke, servedEvents, managedReader, eventTools, audit, sessionNotifier));
   const jwks = localJwks ?? createRemoteJWKSet(new URL(config.jwks_uri), { timeoutDuration: 3000, cooldownDuration: 1000 });
   const metadataUrl = `${config.public_origin}/.well-known/oauth-protected-resource/mcp`;
   const resource = `${config.public_origin}/mcp`;
@@ -1123,7 +1188,7 @@ export function createGateway(rawConfig, options = {}) {
           ['origin', 'cookie', 'content-length', 'content-type', 'transfer-encoding'].some(name => names.filter(value => value === name).length > 1) ||
           names.some(name => name === 'forwarded' || name === 'x-real-ip' || name.startsWith('x-forwarded-')))
         return reject(400, 'invalid_origin');
-      if (req.url !== '/operator/permissions') return reject(404, 'not_found');
+      if (req.url !== '/operator/permissions' && !ACTIVITY_PATHS.includes(req.url)) return reject(404, 'not_found');
       if (!['GET', 'POST'].includes(req.method)) return reject(405, 'not_allowed');
       if (req.headers['transfer-encoding'] || req.headers['content-encoding']) return reject(400, 'invalid_request');
       const length = req.headers['content-length'];
@@ -1140,6 +1205,13 @@ export function createGateway(rawConfig, options = {}) {
       operatorServer.listen(localOperatorPort, '127.0.0.1');
     });
     server.on('close', () => { operatorServer.close(); operatorServer.closeAllConnections?.(); });
+  }
+  if (sessionNotifier) {
+    // Background poller; never blocks tool calls. Paused while revoked.
+    const timer = setInterval(() => { if (active()) void sessionNotifier.tick().catch(() => {}); }, notifySettings.poll_interval_ms ?? 30000);
+    timer.unref?.();
+    server.sessionNotifier = sessionNotifier;
+    server.on('close', () => clearInterval(timer));
   }
   if (operatorReader && notifyPending) {
     // Background discovery so a hook fires even when no agent is reading.
