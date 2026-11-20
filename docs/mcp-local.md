@@ -287,54 +287,179 @@ Use the same local and remote port: the Host and Origin must equal the configure
 
 **Live activity view (loopback listener only).** With `local_listen` set, `http://127.0.0.1:<port>/operator/activity` shows the active sessions in the approved directories, grouped by project directory: running or blocked sessions, plus sessions updated in the last 30 minutes (at most 12, busiest first). Each shows its status, agent, parent session and a short tail of recent activity: tool calls (tool name, status and one redacted input field such as the command or path, at most 140 characters), assistant text snippets and the user prompt. Reasoning, tool output and metadata are never shown. Pending live permission asks show their redacted preview with **Approve once**, **Approve always** and **Deny** buttons. Sign in on `/operator/permissions` first; the page reuses that operator session. It polls `GET /operator/activity/feed` every 5 s. The feed needs the session cookie plus an `X-Workrelay-Operator: feed` header, so a cross-site page cannot trigger it without a CORS preflight, which is never granted. A 3 s shared cache keeps the native-server load at one scan per 3 s however many tabs are open. While the view is open, each feed call renews the operator session to 5 minutes, up to 2 hours after sign-in. Use the page's **Sign out** button when done. Rate limits are applied after the session check: 120 per minute per operator session for the page and feed, and 30 per minute for decisions. Unauthenticated requests share a separate bucket, so they cannot exhaust an operator's budget. Decisions are `POST /operator/activity/reply`. They need an exact `Origin`, the session cookie and a CSRF token bound to the session, and use the same directory-bound, stale-aware reply path as the permissions page. The page script is nonce-bound under a strict CSP and renders all agent text with `textContent`. The public origin does not serve the live view.
 
-### Progress notifications to the delegating agent (`session_notify`)
+**Notifications (optional).** With `notify_command` (absolute argv, no shell, `PATH=/usr/bin:/bin`, 10 s timeout) and/or `notify_webhook_url` (HTTPS, or HTTP to loopback; POST, no redirects, 5 s timeout), the gateway sends one JSON payload per new live pending request (stale requests on stopped sessions are not notified). Delivery is deduplicated by permission ID per gateway process, so a restart may notify again. The payload is `{"event": "workrelay.permission.pending", "permission_id", "session_id", "action", "first_seen_at", "approval_url", "guidance"}`, written to the command's stdin or sent as the webhook body. It never includes command/resource text, titles or directories. Pending requests are found by agent reads/discover and by a background poll every `poll_interval_ms` (default 30 s, minimum 5 s). The poll never overlaps itself and pauses while the gateway is revoked. Notification failures are ignored and never block or alter tool calls.
 
-A delegating agent (for example a Grok Bot agent) otherwise hears nothing until it reads the session again. Workrelay's caller identity is the single pinned OAuth principal and client (for example `grokbot-mcp`): it cannot tell one Grok agent from another, and MCP Events (`events/subscribe`) need a client that implements them. Notifications are therefore registered **per session** by the caller, with a webhook URL the caller controls. Enable them in the gateway config:
+### Progress notifications (`session_notify`)
+
+Progress notifications tell the agent that delegated work (or the human behind it) when something needs attention, so it does not have to poll. They work with **any agent platform or receiver that accepts an HTTPS POST**: a Grok Bot routine webhook, a Slack incoming webhook, ntfy, Claude/Cursor/other agents' HTTP hooks, or your own endpoint. MCP Events (`events/subscribe`) are a separate feature that needs a client which implements MCP Events. Progress notifications only need a URL.
+
+Workrelay sends an event only when:
+- a new live permission ask appears,
+- a run finishes or fails,
+- a child session fails, or
+- a run stalls.
+
+There are no per-step events.
+
+#### Enable
 
 ```json
-"session_notify": { "enabled": true, "stall_minutes": 10 }
+"session_notify": {
+  "enabled": true,
+  "stall_minutes": 10,
+  "secrets_file": "/abs/gateway/secrets/notify.json",
+  "default_targets": [
+    { "name": "team-agent", "secret": "team-agent",
+      "directories": ["/home/me/work/project-a", "/home/me/work/clients/*/app"],
+      "clients": ["grokbot-mcp"], "format": "json" }
+  ]
+}
 ```
 
 Optional settings:
-- `stall_minutes` (default 10): the default stall threshold.
-- `min_interval_ms` (default 120000): the rate limit for non-ask, non-completion events.
-- `poll_interval_ms` (default 30000).
-- `max_targets` (default 200).
-- `ttl_hours` (default 72; extended each time work is armed).
-- `state_file` (default `<dir of managed_supervisor_file>/session-notify.json`; must be in an owner-only directory, written `0600`).
 
-It requires `managed_supervisor_file`.
+| Setting | Default | Meaning |
+|---|---|---|
+| `stall_minutes` | 10 | Default stall threshold. |
+| `min_interval_ms` | 120000 | Rate limit for non-ask, non-completion events. |
+| `poll_interval_ms` | 30000 | How often the background poller checks sessions. |
+| `max_targets` | 200 | Maximum number of registered targets. |
+| `ttl_hours` | 72 | Target lifetime, extended each time work is armed. |
+| `state_file` | `<dir of managed_supervisor_file>/session-notify.json` | Must be in an owner-only directory; written `0600`. |
+| `secrets_file` | none | Private secrets file for `default_targets` (see below). |
+| `default_targets` | none | Gateway-level targets (see below). |
 
-**Registering.** Register a webhook in either of these ways:
-- Pass `notify: {"url": "...", "header_name": "...", "header_value": "...", "stall_minutes": N}` to `workrelay_server_create`, `workrelay_server_message` or `workrelay_server_resume`. Only `url` is required.
-- Call `workrelay_server_notify({session_id, action: "set" | "clear" | "status", ...})`.
+`session_notify` requires `managed_supervisor_file`.
 
-**Target rules.**
-- The URL must be public `https://` on port 443. IP literals, credentials, fragments and local-only names (`localhost`, `*.local`, `*.internal` and similar) are refused.
-- At send time, every DNS answer must be a public address. The connection is pinned to the checked address, certificates are verified and redirects are never followed. This is the same transport as MCP Events.
-- The optional header is sent with every event. It is stored only in the private state file and is never returned by a tool, logged or put in a payload. Tools return only the URL host, the header name and delivery counts.
-- Invalid targets are refused before the operation runs. `notify` is never part of the durable operation arguments.
+#### Where events go
 
-**Events.** Each event is one compact JSON POST, with `Content-Type: application/json`, `X-Workrelay-Event` and `X-Workrelay-Event-Id` headers. Every event carries `type`, `event_id`, `session_id` (the registered root), `at`, `title` and `status`. Only `permission_asked` events also carry directories. Workrelay sends events only for these cases:
-- `workrelay.session.permission_asked`: a new live ask anywhere in the tree. `asks[]` holds `permission_id`, `child_session_id`, `action`, `resource_preview` (redacted, at most 3 × 160 characters), `resources_omitted` and `directory`, plus `decision: "human_operator_only"` and `approval_url`. Sent immediately and once per permission ID. This is not rate limited.
-- `workrelay.session.finished` / `workrelay.session.failed`: the tree was busy (running or blocked) after the registration or the last message/resume/steer, and is now idle or terminal. Includes `outcome`, `task_outcome` (harness self-report), any `failed_child_session_ids`, `tree_truncated` when the tree exceeded the 25-session walk, and `next: workrelay_server_read`. Sent once per run and not rate limited. A queued message that has not started yet does not count as finished. A run that ends before the tool call returns still counts, because the arm time is taken before the native request. A new run that starts later re-opens completion, even one started outside Workrelay.
-- `workrelay.session.child_failed`: a child session failed while the run continues.
-- `workrelay.session.stalled`: the tree is running, not waiting on a human, and has shown no progress (session update times, status, running children, ask count) for `stall_minutes`. Sent once per stall.
-- `workrelay.session.unobservable`: the session could not be read for about 5 minutes.
+A session's target comes from one of three places. A per-call target always overrides a default.
 
-The last three are limited to one event per session per `min_interval_ms`. Events inside the window are coalesced and the newest is sent when the window opens.
+1. **Gateway default target (recommended).** Workrelay attaches a default automatically, so agents never handle the URL or secrets. When `workrelay_server_create`, `workrelay_server_message` or `workrelay_server_resume` succeeds without a `notify` argument, and the session has no target yet, Workrelay attaches the first `default_targets` entry that matches. Each entry can have two match fields:
+   - `directories` matches the session's project directory. A plain path matches that directory and everything below it. A glob matches the whole path: `*` matches one path segment, `**` matches any depth and `?` matches one character.
+   - `clients` matches the authenticated OAuth `client_id` of the MCP caller.
 
-There are no per-step events. Delivery runs in the background poller. Targets are delivered concurrently, at most 3 sends per target per poll, with a 10 s timeout. 5xx, 429 and network errors are retried: `permission_asked`/`finished`/`failed` for up to 10 attempts (about 25 minutes), other events 3 times. Other 4xx responses are not retried. After `finished`, a target is checked only every 2 minutes until new work appears, and its expiry is extended while the tree is busy. Errors only update the target's `last_delivery`. They never affect tool calls or the run. Dedupe state survives restarts through the state file. Workrelay does not send reminders: an ask that nobody answers is reported once.
+   If both are given, both must match. An entry with neither matches every session. The response's `notify` field shows the attached target.
+2. **Per call.** Pass `notify: {url, header_name?, header_value?, hmac_secret?, format?, stall_minutes?}` to create, message or resume.
+3. **The notify tool.** Call `workrelay_server_notify({session_id, action})` with one of these actions:
+   - `set` with `url`: sets a per-session target.
+   - `set` without `url`: attaches the matching gateway default.
+   - `clear`: removes the target and opts the session out of defaults.
+   - `status`: returns the effective target, redacted.
 
-Why not MCP Events? `events/subscribe` with HMAC-signed `session.*` events already exists, but it needs a client that implements MCP Events subscriptions and the verification handshake. A Grok Bot routine webhook trigger only needs a URL and, optionally, a static secret header.
+**Opt out.** To opt a session out of defaults, pass `notify: false` to create, message or resume, or call `clear`. Later automatic attaches are then skipped until `set` is called or the opt-out expires after `ttl_hours`.
 
-**Grok Bot setup (what the agent does).**
-1. In Grok Bot, create a routine whose **trigger type is webhook**. Its instructions are what to do when Workrelay calls. For example: "Read the event JSON. On permission_asked, tell the user what needs approval and where (approval is human-only on the Workrelay operator page). On finished/failed, call workrelay_server_read with include_messages:true and report the result. On stalled, read the session and decide whether to steer or interrupt."
-2. Copy the routine's webhook URL. If the routine offers a secret or token header, note its header name and value.
-3. Delegate as usual and add `notify` to the create or first message call: `workrelay_server_message({session_id, operation_id, text, notify: {url: "<routine webhook URL>", header_name: "<header name, if any>", header_value: "<secret, if any>"}})`. Alternatively call `workrelay_server_notify({session_id, action: "set", url, ...})` at any time.
-4. Check `workrelay_server_notify({session_id, action: "status"})` for `delivered` / `failed` / `last_delivery`. When you no longer want updates, call `action: "clear"`. Targets expire after `ttl_hours` without new work.
+**Default target secrets.** A default target never holds its URL, header value or HMAC secret in the gateway config; the config validator rejects them. Each entry names exactly one secret source:
 
-**Notifications (optional).** With `notify_command` (absolute argv, no shell, `PATH=/usr/bin:/bin`, 10 s timeout) and/or `notify_webhook_url` (HTTPS, or HTTP to loopback; POST, no redirects, 5 s timeout), the gateway sends one JSON payload per new live pending request (stale requests on stopped sessions are not notified). Delivery is deduplicated by permission ID per gateway process, so a restart may notify again. The payload is `{"event": "workrelay.permission.pending", "permission_id", "session_id", "action", "first_seen_at", "approval_url", "guidance"}`, written to the command's stdin or sent as the webhook body. It never includes command/resource text, titles or directories. Pending requests are found by agent reads/discover and by a background poll every `poll_interval_ms` (default 30 s, minimum 5 s). The poll never overlaps itself and pauses while the gateway is revoked. Notification failures are ignored and never block or alter tool calls.
+- `"secret": "<entry>"` reads `targets.<entry>` from `secrets_file`:
+  ```json
+  { "version": 1, "targets": { "team-agent": {
+      "url": "https://hooks.example.com/…", "header_name": "X-Hook-Token", "header_value": "…",
+      "hmac_secret": "whsec_…", "format": "json" } } }
+  ```
+  The file must be a regular file owned by the gateway user, mode `0600`, in an owner-only directory, and not a symlink. Empty strings count as "not set". An entry with an empty `url` is inert: the target is attached, `status` reports `configured: false, reason: "url_not_configured"`, and events are dropped instead of queued.
+- `"env": {"url": "VAR", "header_name": "VAR", "header_value": "VAR", "hmac_secret": "VAR"}` reads each value from the gateway environment. Only `url` is required.
+
+Secrets are resolved each time an event is sent. They are never copied into the notifier state file. Editing the secrets file takes effect without a restart.
+
+#### Target rules (all sources)
+
+- **URL.** Public `https://` on port 443 only. IP literals, credentials, fragments and local-only names (`localhost`, `*.local`, `*.internal` and similar) are refused.
+- **SSRF pinning.** At send time, every DNS answer must be a public address. The connection is pinned to the checked address, certificates are verified, and redirects are never followed. This is the same transport as MCP Events. The send timeout is 10 s.
+- **`header_name` / `header_value`.** An optional static secret header. Framing, cookie, `X-Workrelay-*` and `webhook-*` names are reserved.
+- **`hmac_secret`.** Optional Standard Webhooks signing (16–512 characters). A `whsec_<base64>` value is decoded and used as the key; any other value is used as UTF-8 bytes.
+- **`format`.** One of `json` (default), `slack` or `text`.
+- **Secrets are never returned.** No tool, log line or payload contains the URL path, header value or HMAC secret. Tools return only `url_host`, the header name, `signed`, `format` and delivery counts.
+- **Invalid targets.** An invalid per-call target is refused before the operation runs. `notify` is never part of the durable operation arguments.
+
+#### Event schema (`format: "json"`, schema_version 1)
+
+One JSON POST per event. Request headers:
+- `Content-Type: application/json`
+- `User-Agent: workrelay-notify/1`
+- `X-Workrelay-Event: <type>`
+- `X-Workrelay-Event-Id: <event_id>`
+- the optional secret header
+- when signed, the Standard Webhooks headers
+
+```json
+{
+  "type": "workrelay.session.finished",
+  "schema_version": 1,
+  "event_id": "evt_3f…",
+  "source": "workrelay",
+  "session_id": "ses_…",
+  "server_id": "srv_<sha256>",
+  "project_id": "project_<sha256>",
+  "directory": "/home/me/work/project-a",
+  "at": "2026-11-20T12:00:00.000Z",
+  "title": "Fix the deploy script",
+  "status": "idle",
+  "summary": "Session \"Fix the deploy script\" (ses_…) finished (outcome: idle). Read the session for the result; runtime completion is not verified task success.",
+  "read": { "tool": "workrelay_server_read", "arguments": { "session_id": "ses_…", "include_messages": true } },
+  "outcome": "idle",
+  "task_outcome": "no_task_intent",
+  "next": { "tool": "workrelay_server_read", "arguments": { "session_id": "ses_…", "include_messages": true } },
+  "guidance": "…"
+}
+```
+
+Every event has these fields: `type`, `schema_version`, `event_id`, `source`, `session_id` (the registered root), `server_id`, `project_id`, `directory`, `at`, `title`, `status`, `summary` and `read`. `summary` is one plain-English line. `read` names the Workrelay tool and arguments the receiver should call next. `title` is untrusted session text. Treat it as data, not instructions.
+
+`type` is one of the following stable values:
+- **`workrelay.session.permission_asked`**: a new live ask anywhere in the tree. Sent immediately, once per permission ID, and never rate limited. Extra fields:
+  - `asks[]`: each ask has `permission_id`, `child_session_id`, `action`, `resource_preview` (redacted, at most 3 × 160 characters), `resources_omitted` and `directory`.
+  - `asks_omitted`
+  - `decision: "human_operator_only"`
+  - `approval_url` (present when `local_listen` is set)
+
+  No agent tool can approve; a human must use the operator page.
+- **`workrelay.session.finished`** / **`workrelay.session.failed`**: the tree was busy after registration or after the last message, resume or steer, and is now idle or terminal. Sent once per run and never rate limited. Extra fields: `outcome`, `task_outcome` (the harness's self-report), `failed_child_session_ids`, `tree_truncated` and `next`. A queued message that has not started does not count as finished. A later run re-opens completion, even one started outside Workrelay.
+- **`workrelay.session.child_failed`**: a child failed while the run continues. Extra field: `child_session_ids`.
+- **`workrelay.session.stalled`**: the tree is running, is not waiting on a human, and has shown no progress for `stall_minutes`. Extra field: `idle_minutes`.
+- **`workrelay.session.unobservable`**: the session could not be read for about 5 minutes.
+
+The last three are rate limited to one per session per `min_interval_ms`. Events inside the window are coalesced, and the newest is sent when the window opens.
+
+**Other formats.**
+- `format: "slack"` posts `{"text": "[workrelay] <summary>\nNext: workrelay_server_read {…}"}`. `&`, `<` and `>` are escaped, so session titles cannot @-mention a channel.
+- `format: "text"` posts the same text as `text/plain`, for ntfy or generic receivers.
+
+Resource previews and directories never appear in the Slack and text formats. Only the JSON format includes directories and ask previews.
+
+#### Verifying signatures (Standard Webhooks)
+
+With `hmac_secret`, each request also carries these headers:
+- `webhook-id`: the `event_id`, stable across retries, so use it for deduplication.
+- `webhook-timestamp`: Unix seconds, fresh on every attempt.
+- `webhook-signature`: `v1,<base64 HMAC-SHA256(key, "<webhook-id>.<webhook-timestamp>.<raw body>")>`.
+
+Any Standard Webhooks library verifies these headers, for example `new Webhook("whsec_…").verify(body, headers)`. Reject requests whose timestamp is more than 5 minutes old. Generate a secret with `echo "whsec_$(openssl rand -base64 32)"`.
+
+#### Delivery, retries and safety
+
+- **Background delivery.** Events are delivered by a background poller and never block or alter a tool call or run. Targets are delivered concurrently, with at most 3 sends per target per poll.
+- **Retries.** 5xx responses, 429 responses and network errors are retried. `permission_asked`, `finished` and `failed` are retried up to 10 times (about 25 minutes); other events up to 3 times. Other 4xx responses are not retried.
+- **Delivery status.** Failures only update `last_delivery`, `failed` and `skipped`, which are visible through `status`.
+- **Deduplication.** Dedupe state survives restarts through the state file. Workrelay sends no reminders: an ask nobody answers is reported once.
+
+**Agent behaviour.** The create, message and resume tool descriptions tell agents that when `notify.enabled` is true they should stop polling or waiting and act on the next event. The event's `read` field names the tool to call.
+
+#### Recipes
+
+**Grok Bot.**
+1. Create a routine whose trigger type is **webhook**. For its instructions, use: "Read the event JSON. On permission_asked, tell the user what needs approval (approval is human-only on the Workrelay operator page). On finished/failed, call the tool in `read` and report the result. On stalled, read the session and decide whether to steer or interrupt."
+2. Put the routine's webhook URL and its secret header in the gateway secrets file. With the example gateway's helper: `NOTIFY_URL=… NOTIFY_HEADER_NAME=… NOTIFY_HEADER_VALUE=… set-notify-secret.sh grokbot_harny`.
+3. Add a `default_targets` entry for your project directories.
+
+Every delegation to those projects then notifies the routine automatically. Without a gateway default, pass `notify: {url, header_name, header_value}` on create or message instead.
+
+**Slack.** Create an incoming webhook (`https://hooks.slack.com/services/…`). Use `format: "slack"` in a default target (with the URL in the secrets file) or per call.
+
+**ntfy.** Use the topic URL (`https://ntfy.sh/<long-random-topic>`, or your own server) with `format: "text"`. Add an access token with `header_name: "Authorization"` and `header_value: "Bearer tk_…"` if the topic is protected.
+
+**Claude, Cursor or another agent with an HTTP hook.** Point a `json` target at the agent's hook endpoint. Add `hmac_secret` and verify the signature on receipt. Dispatch on `type`, and call the tool in `read` (`workrelay_server_read`) through the agent's Workrelay MCP connection. Use `event_id` to deduplicate.
+
 
 ### OAuth expiry, rotation and reconnect
 

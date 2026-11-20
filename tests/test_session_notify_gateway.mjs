@@ -16,7 +16,7 @@ const listen = s => new Promise(resolve => s.listen(0, '127.0.0.1', resolve));
 const close = s => new Promise(resolve => { s.close(resolve); s.closeAllConnections(); });
 const HOOK = 'https://hooks.grok.example.com/routines/r1/trigger';
 
-test('MCP create/message register a per-session webhook; events reach it; notify tool sets, reports and clears', async t => {
+async function setup(t, notifyExtra = () => ({}), gatewayOptions = {}) {
   const dir = await fs.mkdtemp(join(tmpdir(), 'workrelay-notify-gw-')); await fs.chmod(dir, 0o700);
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const keys = generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -46,7 +46,7 @@ test('MCP create/message register a per-session webhook; events reach it; notify
   const config = validateConfig({ public_origin: 'https://workrelay.test', issuer: origin, jwks_uri: origin + '/jwks', audience: 'https://workrelay.test/mcp',
     principal: 'alice', owner: 'alice', bridge_config: join(dir, 'bridge.json'), port, managed_supervisor_file: capability,
     managed_server: { server: origin, service_registration: registration, client_service_module: module },
-    session_notify: { enabled: true, stall_minutes: 10 } }, { testIssuer: true });
+    session_notify: { enabled: true, stall_minutes: 10, ...notifyExtra(dir) } }, { testIssuer: true });
   await fs.writeFile(capability, JSON.stringify({ ...config.managed_server, enabled: true, revoked: false, issuer: origin, audience: config.audience, subject: 'alice', client_id: client }), { mode: 0o600 });
   await fs.writeFile(config.bridge_config, JSON.stringify({ directory: dir, managed_allowed_directories: [dir] }), { mode: 0o600 });
   const invoked = [], delivered = [];
@@ -56,7 +56,7 @@ test('MCP create/message register a per-session webhook; events reach it; notify
       if (input.action === 'create') return { operation_id: input.operation_id, session_id: root, phase: 'created' };
       return { operation_id: input.operation_id, session_id: input.session_id, phase: 'queued' };
     },
-    notifyTransport: async (url, { body, headers }) => { delivered.push({ url, headers, event: JSON.parse(body) }); return { status: 202, body: '' }; } });
+    ...gatewayOptions, notifyTransport: async (url, { body, headers }) => { delivered.push({ url, headers, event: JSON.parse(body) }); return { status: 202, body: '' }; } });
   await new Promise(resolve => gateway.listen(port, '127.0.0.1', resolve)); t.after(() => close(gateway));
   const call = async (name, args) => {
     const token = await new SignJWT({ scope: 'workrelay:tasks', client_id: client }).setProtectedHeader({ alg: 'RS256', kid: 'test' })
@@ -69,6 +69,11 @@ test('MCP create/message register a per-session webhook; events reach it; notify
     } finally { await sdk.close(); }
   };
   const project = 'project_' + createHash('sha256').update('project').digest('hex');
+  return { dir, call, gateway, delivered, invoked, native, project };
+}
+
+test('MCP create/message register a per-session webhook; events reach it; notify tool sets, reports and clears', async t => {
+  const { dir, call, gateway, delivered, invoked, native, project } = await setup(t);
   // Invalid target: refused before any operation is attempted.
   const bad = await call('workrelay_server_create', { operation_id: 'op-bad', project_id: project, title: 'x', notify: { url: 'http://127.0.0.1/hook' } });
   assert.equal(bad.result.isError, true); assert.equal(bad.result.structuredContent.reason, 'invalid_url');
@@ -121,4 +126,52 @@ test('MCP create/message register a per-session webhook; events reach it; notify
 test('without session_notify the notify tool and argument do not exist', async () => {
   assert.throws(() => validateConfig({ public_origin: 'https://w.test', issuer: 'https://w.test', jwks_uri: 'https://w.test/jwks', audience: 'https://w.test/mcp',
     principal: 'a', owner: 'a', bridge_config: '/b', port: 1, session_notify: { enabled: true } }), /session_notify requires managed_supervisor_file/);
+});
+
+test('gateway default target: attached on create via MCP with secrets from a 0600 file; status redacted; notify:false opts out', async t => {
+  let secretsFile;
+  const { dir, call, gateway, delivered, native } = await setup(t, dir => {
+    secretsFile = join(dir, 'secrets', 'notify.json');
+    return { secrets_file: secretsFile, default_targets: [{ name: 'grokbot_harny', secret: 'grokbot_harny', directories: [dir], clients: [client] }] };
+  });
+  await fs.mkdir(dirname(secretsFile), { mode: 0o700 });
+  await fs.writeFile(secretsFile, JSON.stringify({ version: 1, targets: { grokbot_harny: { url: HOOK, header_name: 'X-Routine-Secret', header_value: 'default-secret-1',
+    hmac_secret: 'whsec_' + Buffer.from('0123456789abcdef0123456789abcdef').toString('base64') } } }), { mode: 0o600 });
+  const project = 'project_' + createHash('sha256').update('project').digest('hex');
+  const created = await call('workrelay_server_create', { operation_id: 'op-d1', project_id: project, title: 'Deploy fix' });
+  const notify = created.result.structuredContent.notify;
+  assert.equal(notify.enabled, true, JSON.stringify(created.result)); assert.equal(notify.source, 'default'); assert.equal(notify.default_target, 'grokbot_harny');
+  assert.equal(notify.url_host, 'hooks.grok.example.com'); assert.equal(notify.signed, true); assert.equal(notify.configured, true);
+  assert.doesNotMatch(JSON.stringify(created.result), /default-secret-1|whsec_|routines\/r1/);
+  for (const name of ['workrelay_server_create', 'workrelay_server_message', 'workrelay_server_resume'])
+    assert.match(created.tools.find(tool => tool.name === name).description, /do not poll or wait/);
+  assert.match(created.tools.find(tool => tool.name === 'workrelay_server_notify').description, /Slack/);
+  const state = await fs.readFile(join(dir, 'managed', 'session-notify.json'), 'utf8');
+  assert.doesNotMatch(state, /default-secret-1|whsec_|routines/);
+
+  await call('workrelay_server_message', { session_id: root, operation_id: 'op-d2', text: 'Deploy it' });
+  native.active = { [root]: { type: 'running' } };
+  await gateway.sessionNotifier.tick();
+  native.active = {}; native.root = { ...native.root, outcome: 'succeeded', time: { created: 1, updated: 10, idle: Date.now() } };
+  await gateway.sessionNotifier.tick();
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].url, HOOK); assert.equal(delivered[0].headers['X-Routine-Secret'], 'default-secret-1');
+  assert.match(delivered[0].headers['webhook-signature'], /^v1,/);
+  assert.equal(delivered[0].event.type, 'workrelay.session.finished'); assert.equal(delivered[0].event.directory, dir);
+  assert.match(delivered[0].event.server_id, /^srv_[a-f0-9]{64}$/);
+
+  const status = (await call('workrelay_server_notify', { session_id: root, action: 'status' })).result.structuredContent;
+  assert.equal(status.source, 'default'); assert.equal(status.delivered, 1);
+  assert.doesNotMatch(JSON.stringify(status), /default-secret-1|whsec_|routines/);
+  // Opt out per session; a later message does not re-attach the default.
+  const out = await call('workrelay_server_message', { session_id: root, operation_id: 'op-d3', text: 'more', notify: false });
+  assert.equal(out.result.structuredContent.notify.enabled, false); assert.equal(out.result.structuredContent.notify.opted_out, true);
+  const later = await call('workrelay_server_message', { session_id: root, operation_id: 'op-d4', text: 'again' });
+  assert.equal(later.result.structuredContent.notify, undefined);
+  const check = (await call('workrelay_server_notify', { session_id: root, action: 'status' })).result.structuredContent;
+  assert.equal(check.opted_out, true); assert.equal(check.default_available.default_target, 'grokbot_harny');
+  // set without url re-attaches the default; set with target fields but no url is refused.
+  assert.equal((await call('workrelay_server_notify', { session_id: root, action: 'set', header_name: 'X-A', header_value: 'v' })).result.structuredContent.reason, 'url_required_with_target_fields');
+  const again = (await call('workrelay_server_notify', { session_id: root, action: 'set' })).result.structuredContent;
+  assert.equal(again.source, 'default'); assert.equal(again.enabled, true);
 });

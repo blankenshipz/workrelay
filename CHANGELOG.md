@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Progress notifications work with any agent platform or receiver (`session_notify`):
+  - **Event schema:** `schema_version: 1`, `source`, `server_id`, `project_id`, `directory`, a one-line `summary`, and a `read` hint (`workrelay_server_read`) on every event. The schema is documented.
+  - **Signing:** optional Standard Webhooks HMAC signing (`hmac_secret`: `webhook-id`, `webhook-timestamp`, `webhook-signature`). `webhook-id` is stable across retries; the timestamp and signature are fresh on each attempt.
+  - **Formats:** `format: "slack"` (`{text}`, escaped) and `format: "text"` (plain text, for ntfy and generic receivers), alongside the default `json`.
+  - **Gateway default targets:** `session_notify.default_targets`, matched by session directory (path or glob) and/or OAuth `client_id`. URL, header and HMAC secrets come only from a private `0600` `secrets_file` or from environment variables, are resolved at send time and never enter the config or state file. A placeholder entry with an empty URL is inert.
+  - **Automatic attach and opt-out:** a matching default is attached automatically on create/message/resume. A per-call `notify` overrides it. `notify: false` or `workrelay_server_notify` `clear` opts the session out. `set` without `url` re-attaches the default.
+  - **Agent awareness:** `workrelay_server_notify` `status` reports the effective target, redacted (source, default name, `url_host`, `configured`, `signed`, `format`, delivery counts), and whether a default is available. The create/message/resume descriptions tell agents to rely on events instead of polling.
 - Per-session progress notifications for the delegating agent (`session_notify`, opt-in):
   - **Registering:** pass an optional `notify` to `workrelay_server_create`/`message`/`resume`, or use the new `workrelay_server_notify` tool (set, clear, status). It takes a public HTTPS webhook URL, such as a Grok Bot routine webhook trigger, an optional secret header and an optional stall threshold.
   - **Events:** `permission_asked` (permission id, child session, action, redacted preview, directory; immediate, deduped), `finished`/`failed` (once per run), `child_failed`, `stalled` (default 10 min without progress) and `unobservable`. The last three are limited to one per session per 2 minutes and coalesced. There are no per-step events.

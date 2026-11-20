@@ -21,7 +21,7 @@ import { createIssuerAdapter } from './oidc_adapter.mjs';
 import { createUnexposedIssuerPolicy, createPreapprovalDiagnostic, createAuthorizationOutcomeDiagnostic, createTokenErrorDiagnostic } from './issuer_policy.mjs';
 import { createLocalInteractions, createOriginDiagnostic, ACTIVITY_PATHS } from './issuer_interactions.mjs';
 import { createPermissionNotifier, validateNotifySettings } from './permission_notify.mjs';
-import { createSessionNotifier, validateSessionNotifySettings, validateNotifyTarget } from './session_notify.mjs';
+import { createSessionNotifier, createDefaultTargets, validateSessionNotifySettings, validateNotifyTarget, NOTIFY_FORMATS } from './session_notify.mjs';
 const loopback = new Set(['127.0.0.1', '::1']);
 const key = z.string().regex(/^[A-Za-z0-9_-]{1,80}$/);
 const grantId = z.string().regex(/^grant_[0-9a-f]{32}$/);
@@ -327,9 +327,11 @@ function bridge(config, command, input) {
   });
 }
 
-const notifyInput = z.object({ url: z.string().min(1).max(2048), header_name: z.string().min(1).max(64).optional(),
-  header_value: z.string().min(1).max(1024).optional(), stall_minutes: z.number().int().min(1).max(1440).optional() }).strict();
-const NOTIFY_DESCRIPTION = ' Optional notify {url, header_name?, header_value?, stall_minutes?} registers a public HTTPS webhook (e.g. a Grok Bot routine webhook trigger URL) that receives a compact JSON event only when a permission ask appears, the run finishes or fails, or it stalls; the header is sent with each event and never returned.';
+const notifyTargetFields = { url: z.string().min(1).max(2048), header_name: z.string().min(1).max(64).optional(),
+  header_value: z.string().min(1).max(1024).optional(), hmac_secret: z.string().min(16).max(512).optional(), format: z.enum(NOTIFY_FORMATS).optional(),
+  stall_minutes: z.number().int().min(1).max(1440).optional() };
+const notifyInput = z.union([z.literal(false), z.object(notifyTargetFields).strict()]);
+const NOTIFY_DESCRIPTION = ' Progress events: when the gateway has a default notify target for this project (or you pass notify), Workrelay POSTs a compact JSON event to it (any platform: Grok Bot routine webhook, Slack, ntfy, an agent HTTP hook) only when a permission ask appears, the run finishes or fails, a child fails, or it stalls. The response field notify shows the effective target (enabled, source, url_host; secrets never returned). When notify.enabled is true, do not poll or wait in a loop: end your turn and act on the event (it names the workrelay tool to call next). Optional notify {url, header_name?, header_value?, hmac_secret? (Standard Webhooks signature), format? json|slack|text, stall_minutes?} sets a per-session target that overrides the default; notify:false opts this session out.';
 const notifyFailure = reason => ({ isError: true, content: [{ type: 'text', text: JSON.stringify({ error: 'invalid_notify_target', reason }) }],
   structuredContent: { error: 'invalid_notify_target', reason } });
 
@@ -443,7 +445,7 @@ function mcp(config, invoke, events, managedReader, eventTools, audit, notifier)
       // notify is a workrelay-side registration only; never part of the
       // durable operation arguments or the native request.
       const { notify, ...input } = rawInput;
-      if (notify !== undefined) { try { validateNotifyTarget(notify); } catch (error) { return notifyFailure(error.reason ?? 'invalid_target'); } }
+      if (notify !== undefined && notify !== false) { try { validateNotifyTarget(notify); } catch (error) { return notifyFailure(error.reason ?? 'invalid_target'); } }
       const startedAt = Date.now(); // before the native request: see notifier.armed
       try {
         const claims = ctx.http?.authInfo?.extra?.managedClaims;
@@ -454,10 +456,16 @@ function mcp(config, invoke, events, managedReader, eventTools, audit, notifier)
         const target = action === 'create' ? output?.session_id : input.session_id;
         if (notifier && !output?.error && typeof target === 'string' && /^ses[A-Za-z0-9_-]{1,160}$/.test(target)) {
           try {
-            if (notify !== undefined) notifier.set(target, notify, startedAt);
+            let status = null;
+            if (notify === false) status = notifier.clear(target);
+            else if (notify !== undefined) status = notifier.set(target, notify, startedAt);
+            else if (['create', 'message', 'resume'].includes(action)) {
+              // Gateway default target (on unless this session opted out).
+              status = await notifier.attachDefault(target, { client_id: claims?.client_id, at: startedAt });
+            }
             if (['message', 'resume', 'steer'].includes(action)) notifier.armed(target, startedAt);
-            if (notify !== undefined) output = { ...output, notify: notifier.get(target) };
-          } catch { if (notify !== undefined) output = { ...output, notify: { session_id: target, enabled: false, reason: 'registration_failed' } }; }
+            if (status) output = { ...output, notify: notify === false ? status : notifier.get(target) };
+          } catch { if (notify !== undefined || notifier.hasDefaults()) output = { ...output, notify: { session_id: target, enabled: false, reason: 'registration_failed' } }; }
         }
         return { content: [{ type: 'text', text: JSON.stringify(output) }], structuredContent: output, isError: Boolean(output.error) };
       } catch { return { isError: true, content: [{ type: 'text', text: 'Managed control unavailable or denied.' }] }; }
@@ -465,17 +473,23 @@ function mcp(config, invoke, events, managedReader, eventTools, audit, notifier)
   }
   if (managedReader && notifier) {
     register('workrelay_server_notify', {
-      description: 'Set, clear or check the progress webhook for one session you delegated. set needs url (public HTTPS, e.g. a Grok Bot routine webhook trigger URL) and optionally header_name/header_value (a secret header sent with every event, never returned) and stall_minutes (default from gateway, 10). Events: workrelay.session.permission_asked (permission id, child session, action, redacted preview, directory; a human must approve), .finished / .failed (run ended; read the session for the result), .child_failed, .stalled, .unobservable. Never per step; non-ask/non-completion events are limited to one per session per 2 minutes. Notification failures never affect the run.',
+      description: 'Set, clear or check progress notifications for one session you delegated. Works with any receiver that accepts an HTTPS POST: a Grok Bot routine webhook, a Slack incoming webhook (format slack), ntfy or a generic endpoint (format text), or another agent\'s HTTP hook (format json, the default). check (status) reports the effective target, redacted: source (call or gateway default), default_target name, url_host, secret_header name, signed, format, delivery counts; secrets are never returned. set without url attaches the gateway default target that matches this session\'s project (gateway defaults are attached automatically on create/message/resume). set with url (public HTTPS only) sets a per-session target: optional header_name/header_value (secret header), hmac_secret (Standard Webhooks webhook-id/webhook-timestamp/webhook-signature), format json|slack|text, stall_minutes. clear removes the target and opts this session out of gateway defaults. Events (JSON type): workrelay.session.permission_asked (a human must approve on the operator page), .finished / .failed (read the session for the result), .child_failed, .stalled, .unobservable; each has summary and read {tool, arguments}. Never per step; non-ask/non-completion events are limited to one per session per 2 minutes. While enabled, rely on the events instead of polling. Notification failures never affect the run.',
       inputSchema: z.object({ session_id: z.string().regex(/^ses[A-Za-z0-9_-]{1,160}$/), action: z.enum(['set', 'clear', 'status']),
-        url: z.string().min(1).max(2048).optional(), header_name: z.string().min(1).max(64).optional(), header_value: z.string().min(1).max(1024).optional(),
-        stall_minutes: z.number().int().min(1).max(1440).optional() }).strict(),
+        url: notifyTargetFields.url.optional(), header_name: notifyTargetFields.header_name, header_value: notifyTargetFields.header_value,
+        hmac_secret: notifyTargetFields.hmac_secret, format: notifyTargetFields.format, stall_minutes: notifyTargetFields.stall_minutes }).strict(),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     }, async ({ session_id, action, ...target }, ctx) => {
       if (action !== 'set' && Object.keys(target).length) return notifyFailure('fields_only_for_set');
-      if (action === 'set') { try { validateNotifyTarget(target); } catch (error) { return notifyFailure(error.reason ?? 'invalid_target'); } }
+      const useDefault = action === 'set' && target.url === undefined;
+      if (useDefault && Object.keys(target).length) return notifyFailure('url_required_with_target_fields');
+      if (action === 'set' && !useDefault) { try { validateNotifyTarget(target); } catch (error) { return notifyFailure(error.reason ?? 'invalid_target'); } }
       try {
-        await managedReader('session_check', { session_id }, ctx.http?.authInfo?.extra?.managedClaims);
-        const output = action === 'set' ? notifier.set(session_id, target) : action === 'clear' ? notifier.clear(session_id) : notifier.get(session_id);
+        const claims = ctx.http?.authInfo?.extra?.managedClaims;
+        await managedReader('session_check', { session_id }, claims);
+        const output = useDefault ? await notifier.attachDefault(session_id, { client_id: claims?.client_id, explicit: true }) :
+          action === 'set' ? notifier.set(session_id, target) : action === 'clear' ? notifier.clear(session_id) :
+          await notifier.status(session_id, { client_id: claims?.client_id });
+        if (output?.error) return notifyFailure(output.error);
         return { content: [{ type: 'text', text: JSON.stringify(output) }], structuredContent: output };
       } catch { return { isError: true, content: [{ type: 'text', text: 'Managed server capability unavailable or denied.' }] }; }
     });
@@ -555,7 +569,8 @@ export function createGateway(rawConfig, options = {}) {
       return promise;
     } } : {}),
   } : undefined;
-  const sessionNotifier = notifySettings ? createSessionNotifier({ settings: notifySettings,
+  const sessionNotifier = notifySettings ? createSessionNotifier({ settings: notifySettings, serverId: managedServerID(config.managed_server),
+    defaults: createDefaultTargets({ entries: notifySettings.default_targets ?? [], secretsFile: notifySettings.secrets_file, ...(options.notifyEnv ? { env: options.notifyEnv } : {}) }),
     statePath: notifySettings.state_file ?? join(dirname(config.managed_supervisor_file), 'session-notify.json'),
     approvalUrl: localOperatorPort ? `http://127.0.0.1:${localOperatorPort}/operator/permissions` : undefined,
     watch: sessionID => activityReader('session_watch', { session_id: sessionID, directories: activityDirectories() }, operatorClaims()),

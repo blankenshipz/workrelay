@@ -337,6 +337,7 @@ export function createManagedReader(expected, readBinding, { loadService = path 
         const outcome = await taskOutcomeFor(session);
         stillBound();
         return { session_id: session.id, title: managedText(session.title, 120).text, directory: session.location.directory,
+          project_id: typeof session.projectID === 'string' && session.projectID.length <= 160 ? 'project_' + createHash('sha256').update(session.projectID).digest('hex') : null,
           runtime_status: sessionStatus(session, rootActive, 0), aggregate_status: fields.aggregate_status, root_active: rootActive, tree_truncated: tree.truncated,
           last_activity_at: Math.max(0, ...[...tree.meta.values()].map(item => item.updated)),
           idle_at: Number.isSafeInteger(session.time?.idle) ? session.time.idle : null,
