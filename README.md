@@ -206,13 +206,14 @@ Workrelay can tell the agent (or person) that delegated work when that work need
 - **What is sent.** One compact event when a live permission ask appears, a run finishes or fails, a child fails, or a run stalls. There are no per-step events.
 - **Event format.** Every event is JSON with a stable `type` (for example `workrelay.session.finished`), `event_id`, `session_id`, `server_id`, `project_id`, `directory`, a one-line `summary`, and a `read` hint naming the Workrelay tool to call next.
 - **Other formats.** `format: "slack"` sends `{text}`; `format: "text"` sends plain text for ntfy and generic receivers.
-- **Gateway defaults.** Operators can configure `session_notify.default_targets`, matched by project directory glob and/or MCP OAuth client. The URL and secrets live in a private `0600` secrets file or in environment variables, never in the config. Matching defaults are attached automatically when an agent creates, messages or resumes a session.
-- **Per-call targets.** An agent can still pass its own `notify` target, or `notify: false` to opt a session out.
+- **Register your own listener once.** Each agent calls `workrelay_server_notify` with `action: "set", scope: "client"` and its URL (or the operator runs `node src/workrelay/notify-register.mjs` on the Workrelay host, reading secrets only from env), then `action: "test", scope: "client"` to receive a signed `workrelay.test` event. Every session that agent creates, messages or resumes reports there from then on.
+- **Per-call targets and opt-out.** A `notify` argument on create/message/resume overrides any default; `notify: false` opts a session out.
+- **Optional operator fallback.** `session_notify.default_targets`, matched by project directory glob and/or MCP OAuth client, with URL and secrets in a private `0600` secrets file or environment variables.
 - **Signing.** Optional [Standard Webhooks](https://www.standardwebhooks.com) HMAC signing (`webhook-id`, `webhook-timestamp`, `webhook-signature`). An optional static secret header is also supported.
-- **Checking.** `workrelay_server_notify` with `action: "status"` shows the effective target, redacted. Secrets are never returned, logged or put in an event.
+- **Checking.** `workrelay_server_notify` with `action: "check"` shows the effective target, redacted, and its source (`per_call`, `client_default`, `gateway_default`). Secrets are never returned, logged or put in an event.
 - **Security.** Delivery is public HTTPS only and SSRF-pinned: every DNS answer must be public, the connection is pinned to it, and redirects are never followed. Non-ask, non-completion events are rate limited. Permission asks and completion are never rate limited. Failures never affect tool calls or runs.
 
-Setup, the full event schema, signature verification and recipes for Grok Bot, Slack, ntfy and other agents are in [docs/mcp-local.md](docs/mcp-local.md#progress-notifications-session_notify).
+The 3-step setup (create a listener, register, test), the event schema, signature verification and per-platform notes for Grok Bot, Slack, ntfy, generic HTTPS and Claude Code/Cursor are in [docs/mcp-local.md](docs/mcp-local.md#listen-for-progress-events-any-platform).
 
 ## Stay safe and recover
 

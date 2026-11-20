@@ -41,17 +41,18 @@ function harness({ statePath, settings = {}, defaults, directory = '/home/u/work
 test('Standard Webhooks signature matches the reference test vector', () => {
   assert.equal(signStandardWebhook('whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw', 'msg_p5jXN8AQM9LWM0D4loKWxJek', '1614265330', '{"test": 2432232314}'),
     'v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE=');
-  const raw = signStandardWebhook('plain-secret-0123456789', 'evt_1', '10', 'body');
-  assert.equal(raw, 'v1,' + createHmac('sha256', 'plain-secret-0123456789').update('evt_1.10.body').digest('base64'));
 });
 
 test('target validation: hmac_secret and format; webhook-* headers stay reserved', () => {
   assert.deepEqual(validateNotifyTarget({ url: HOOK, hmac_secret: 'whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw', format: 'slack' }),
     { url: HOOK, hmac_secret: 'whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw', format: 'slack' });
   assert.deepEqual(validateNotifyTarget({ url: HOOK, format: 'json' }), { url: HOOK });
-  for (const bad of [{ hmac_secret: 'short' }, { hmac_secret: 'has space in it 0123456' }, { hmac_secret: 'whsec_!!notbase64!!!!!!' }, { hmac_secret: 'whsec_AAAA' },
+  for (const bad of [{ hmac_secret: 'short' }, { hmac_secret: 'plain-secret-without-prefix-0123456789' }, { hmac_secret: 'whsec_' + Buffer.alloc(16).toString('base64') },
+    { hmac_secret: 'whsec_' + Buffer.alloc(65).toString('base64') }, { hmac_secret: 'whsec_!!notbase64!!!!!!' }, { hmac_secret: 'whsec_AAAA' },
     { format: 'xml' }, { header_name: 'webhook-signature', header_value: 'x' }])
     assert.throws(() => validateNotifyTarget({ url: HOOK, ...bad }), /invalid notify target/, JSON.stringify(bad));
+  for (const url of ['https://localhost./x', 'https://metadata.google.internal./x', 'https://hooks.example.com./x'])
+    assert.throws(() => validateNotifyTarget({ url }), /invalid notify target/, url);
 });
 
 test('gateway config: default targets never carry secrets; secret refs need secrets_file', () => {
@@ -75,6 +76,7 @@ test('gateway config: default targets never carry secrets; secret refs need secr
 });
 
 test('directory matching: plain paths cover subdirectories, globs match whole paths', () => {
+  assert.ok(directoryMatcher(['/a/b/'])('/a/b')); assert.ok(directoryMatcher(['/a/b/'])('/a/b/c')); assert.ok(directoryMatcher(['/a/*/'])('/a/x'));
   const match = directoryMatcher(['/w/demodirector', '/w/projects/*/app', '/srv/**/repo']);
   for (const yes of ['/w/demodirector', '/w/demodirector/sub/x', '/w/projects/a/app', '/srv/repo', '/srv/a/b/repo']) assert.ok(match(yes), yes);
   for (const no of ['/w/demodirector2', '/w', '/w/projects/a/b/app', '/w/projects/a/app/x', '/srv/a/repox', null]) assert.ok(!match(no), String(no));
@@ -121,7 +123,7 @@ test('signed delivery: verifiable Standard Webhooks headers; id stable across re
   assert.notEqual(h.sent[1].headers['webhook-timestamp'], h.sent[0].headers['webhook-timestamp']);
   assert.ok(verify(h.sent[1]));
   const status = h.notifier.get(S);
-  assert.equal(status.signed, true); assert.equal(status.source, 'call');
+  assert.equal(status.signed, true); assert.equal(status.source, 'per_call');
   assert.doesNotMatch(JSON.stringify(status), /whsec_|tok-123|routines/);
 });
 
@@ -132,7 +134,7 @@ test('gateway default: attached automatically, inert placeholder, filled secrets
   const defaults = createDefaultTargets({ secretsFile, entries: [{ name: 'grokbot_harny', secret: 'grokbot_harny', directories: ['/home/u/work/demodirector', '/home/u/work/yrdsale'] }] });
   const h = harness({ statePath, defaults });
   const attached = await h.notifier.attachDefault(S, { client_id: 'grokbot-mcp', at: h.now() });
-  assert.equal(attached.enabled, true); assert.equal(attached.source, 'default'); assert.equal(attached.default_target, 'grokbot_harny');
+  assert.equal(attached.enabled, true); assert.equal(attached.source, 'gateway_default'); assert.equal(attached.default_target, 'grokbot_harny');
   assert.equal(attached.configured, false); assert.equal(attached.reason, 'url_not_configured');
   await h.run();
   assert.equal(h.sent.length, 0, 'placeholder target is inert');
@@ -165,15 +167,14 @@ test('gateway default: directory/client matching, per-call override, opt-out and
   // Other client or other directory: nothing attached.
   assert.equal(await harness({ defaults }).notifier.attachDefault(S, { client_id: 'other-client' }), null);
   const elsewhere = harness({ defaults, directory: '/home/u/work/private' });
-  const none = await elsewhere.notifier.attachDefault(S, { client_id: 'grokbot-mcp' });
-  assert.equal(none.enabled, false); assert.equal(elsewhere.notifier.size(), 0);
+  assert.equal(await elsewhere.notifier.attachDefault(S, { client_id: 'grokbot-mcp' }), null); assert.equal(elsewhere.notifier.size(), 0);
 
   const h = harness({ defaults });
   await h.notifier.attachDefault(S, { client_id: 'grokbot-mcp' });
   assert.equal(h.notifier.get(S).default_target, 'grok');
   // Per-call target overrides the default; a later automatic attach keeps it.
   h.notifier.set(S, { url: 'https://other.example.com/hook', format: 'text' });
-  assert.equal((await h.notifier.attachDefault(S, { client_id: 'grokbot-mcp' })).source, 'call');
+  assert.equal((await h.notifier.attachDefault(S, { client_id: 'grokbot-mcp' })).source, 'per_call');
   // Opt out: clear, then automatic attaches are skipped.
   assert.equal(h.notifier.clear(S).opted_out, true);
   assert.equal(await h.notifier.attachDefault(S, { client_id: 'grokbot-mcp' }), null);
@@ -181,12 +182,85 @@ test('gateway default: directory/client matching, per-call override, opt-out and
   assert.equal(status.opted_out, true); assert.equal(status.default_available.default_target, 'grok');
   // Explicit set without url re-attaches.
   const explicit = await h.notifier.attachDefault(S, { client_id: 'grokbot-mcp', explicit: true });
-  assert.equal(explicit.source, 'default'); assert.equal(h.notifier.get(S).opted_out, undefined);
+  assert.equal(explicit.source, 'gateway_default'); assert.equal(h.notifier.get(S).opted_out, undefined);
   assert.equal((await elsewhere.notifier.attachDefault(S, { client_id: 'grokbot-mcp', explicit: true })).error, 'no_default_target');
 
   // Env-sourced default.
-  const envDefaults = createDefaultTargets({ env: { WR_URL: HOOK, WR_SIG: 'env-secret-0123456789' }, entries: [{ name: 'env', env: { url: 'WR_URL', hmac_secret: 'WR_SIG' }, format: 'slack' }] });
+  const envSig = 'whsec_' + Buffer.from('0123456789abcdef01234567').toString('base64');
+  const envDefaults = createDefaultTargets({ env: { WR_URL: HOOK, WR_SIG: envSig }, entries: [{ name: 'env', env: { url: 'WR_URL', hmac_secret: 'WR_SIG' }, format: 'slack' }] });
   const resolved = envDefaults.resolve('env');
-  assert.deepEqual(resolved.target, { url: HOOK, hmac_secret: 'env-secret-0123456789', format: 'slack' });
+  assert.deepEqual(resolved.target, { url: HOOK, hmac_secret: envSig, format: 'slack' });
   assert.equal(createDefaultTargets({ env: {}, entries: [{ name: 'env', env: { url: 'WR_URL' } }] }).resolve('env').reason, 'url_not_configured');
+});
+
+test('review: a transient secrets-file failure retries instead of dropping the ask', async t => {
+  const dir = await privateDir(t);
+  const secretsFile = join(dir, 'notify.json');
+  await writeSecrets(secretsFile, { grok: { url: HOOK } });
+  const h = harness({ defaults: createDefaultTargets({ secretsFile, entries: [{ name: 'grok', secret: 'grok' }] }) });
+  await h.notifier.attachDefault(S, { client_id: 'c' });
+  await fs.writeFile(secretsFile, '{ not json');
+  Object.assign(h.view, { aggregate_status: 'blocked_on_permission', pending: [{ permission_id: 'per_1', session_id: S, action: 'shell', resource_preview: [], resources_omitted: 0, directory: '/x' }] });
+  await h.notifier.tick();
+  assert.equal(h.sent.length, 0); assert.match(h.notifier.get(S).last_delivery.error, /^secrets_file_/); assert.equal(h.notifier.get(S).skipped, 0);
+  await writeSecrets(secretsFile, { grok: { url: HOOK } });
+  h.advance(60000); await h.notifier.tick();
+  assert.equal(h.sent.length, 1); assert.equal(JSON.parse(h.sent[0].body).type, 'workrelay.session.permission_asked');
+});
+
+test('review: an unmatched session never evicts a live target at max_targets', async t => {
+  const dir = await privateDir(t);
+  const secretsFile = join(dir, 'notify.json'); await writeSecrets(secretsFile, { grok: { url: HOOK } });
+  const h = harness({ settings: { max_targets: 1 }, directory: '/elsewhere',
+    defaults: createDefaultTargets({ secretsFile, entries: [{ name: 'grok', secret: 'grok', directories: ['/home/u/work/demodirector'] }] }) });
+  h.notifier.set('ses_other00000000000000001', { url: HOOK });
+  assert.equal(await h.notifier.attachDefault(S, { client_id: 'c' }), null);
+  assert.equal(h.notifier.get('ses_other00000000000000001').enabled, true); assert.equal(h.notifier.size(), 1);
+});
+
+test('review: attached defaults re-match against current config (narrowed or removed entries detach)', async t => {
+  const dir = await privateDir(t);
+  const secretsFile = join(dir, 'notify.json'), statePath = join(dir, 'state.json');
+  await writeSecrets(secretsFile, { grok: { url: HOOK }, slack: { url: SECRET_URL } });
+  const first = harness({ statePath, defaults: createDefaultTargets({ secretsFile, entries: [{ name: 'grok', secret: 'grok' }] }) });
+  await first.notifier.attachDefault(S, { client_id: 'c' });
+  // Restart with the entry renamed: re-attached to the new matching entry.
+  const renamed = harness({ statePath, defaults: createDefaultTargets({ secretsFile, entries: [{ name: 'slack', secret: 'slack', format: 'slack' }] }) });
+  assert.equal(renamed.notifier.get(S).reason, 'default_target_removed');
+  await renamed.notifier.tick();
+  assert.equal(renamed.notifier.get(S).default_target, 'slack');
+  // Restart with the entry narrowed away from this directory: detached.
+  const narrowed = harness({ statePath, defaults: createDefaultTargets({ secretsFile, entries: [{ name: 'slack', secret: 'slack', directories: ['/nowhere'] }] }) });
+  await narrowed.notifier.tick();
+  assert.equal(narrowed.notifier.get(S).enabled, false);
+  // A stale (removed) default does not block automatic attach of a current one.
+  const statePath2 = join(dir, 'state2.json');
+  await harness({ statePath: statePath2, defaults: createDefaultTargets({ secretsFile, entries: [{ name: 'grok', secret: 'grok' }] }) }).notifier.attachDefault(S, { client_id: 'c' });
+  const again = harness({ statePath: statePath2, defaults: createDefaultTargets({ secretsFile, entries: [{ name: 'slack', secret: 'slack' }] }) });
+  assert.equal((await again.notifier.attachDefault(S, { client_id: 'c' })).default_target, 'slack');
+});
+
+test('review: clear/set during an in-flight delivery is honoured before the next send', async () => {
+  let clock = 1_000_000, mode = 'fail', release;
+  const sent = [];
+  const ask = n => ({ permission_id: 'per_' + n, session_id: S, action: 'shell', resource_preview: [], resources_omitted: 0, directory: '/d' });
+  const view = { session_id: S, title: 't', directory: '/d', runtime_status: 'running', aggregate_status: 'blocked_on_permission', last_activity_at: 1,
+    idle_at: null, running_children: 0, failed_children: [], task_outcome: 'x', pending: [ask(1)] };
+  const notifier = createSessionNotifier({ now: () => clock, watch: async () => structuredClone(view),
+    transport: async url => {
+      sent.push(url);
+      if (mode === 'fail') return { status: 503 };
+      if (mode === 'block') { mode = 'ok'; await new Promise(done => { release = done; }); }
+      return { status: 200 };
+    } });
+  notifier.set(S, { url: HOOK });
+  await notifier.tick();               // ask 1 queued, send fails -> retry later
+  view.pending.push(ask(2)); clock += 1000;
+  await notifier.tick();               // ask 2 queued, fails too: outbox now holds 2 events
+  sent.length = 0; mode = 'block'; clock += 120000;
+  const ticking = notifier.tick();     // first send blocks in flight
+  while (!release) await new Promise(done => setImmediate(done));
+  notifier.set(S, { url: 'https://new.example.com/hook' });
+  release(); await ticking;
+  assert.deepEqual(sent, [HOOK, 'https://new.example.com/hook']);
 });

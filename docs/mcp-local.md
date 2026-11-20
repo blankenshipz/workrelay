@@ -306,13 +306,7 @@ There are no per-step events.
 ```json
 "session_notify": {
   "enabled": true,
-  "stall_minutes": 10,
-  "secrets_file": "/abs/gateway/secrets/notify.json",
-  "default_targets": [
-    { "name": "team-agent", "secret": "team-agent",
-      "directories": ["/home/me/work/project-a", "/home/me/work/clients/*/app"],
-      "clients": ["grokbot-mcp"], "format": "json" }
-  ]
+  "stall_minutes": 10
 }
 ```
 
@@ -326,26 +320,38 @@ Optional settings:
 | `max_targets` | 200 | Maximum number of registered targets. |
 | `ttl_hours` | 72 | Target lifetime, extended each time work is armed. |
 | `state_file` | `<dir of managed_supervisor_file>/session-notify.json` | Must be in an owner-only directory; written `0600`. |
+| `clients_file` | `<dir of managed_supervisor_file>/notify-clients.json` | Per-client self-registered listeners; owner-only directory, written `0600`. |
 | `secrets_file` | none | Private secrets file for `default_targets` (see below). |
-| `default_targets` | none | Gateway-level targets (see below). |
+| `default_targets` | none | Optional operator fallback targets (see below). |
 
 `session_notify` requires `managed_supervisor_file`.
 
 #### Where events go
 
-A session's target comes from one of three places. A per-call target always overrides a default.
+Each agent registers its own listener once; that is the normal setup (see [Listen for progress events](#listen-for-progress-events-any-platform)). A session's target comes from the first of these that applies:
 
-1. **Gateway default target (recommended).** Workrelay attaches a default automatically, so agents never handle the URL or secrets. When `workrelay_server_create`, `workrelay_server_message` or `workrelay_server_resume` succeeds without a `notify` argument, and the session has no target yet, Workrelay attaches the first `default_targets` entry that matches. Each entry can have two match fields:
-   - `directories` matches the session's project directory. A plain path matches that directory and everything below it. A glob matches the whole path: `*` matches one path segment, `**` matches any depth and `?` matches one character.
+1. **Per call (`per_call`).** `notify: {url, header_name?, header_value?, hmac_secret?, format?, stall_minutes?}` on create, message or resume, or `workrelay_server_notify` action `set` with `url` (scope `session`). Always overrides any default.
+2. **Your client default (`client_default`).** The listener you registered with `workrelay_server_notify` action `set`, scope `client`, or with the `notify-register.mjs` CLI on the Workrelay host. It is keyed by your authenticated OAuth `client_id`, stored in the private `0600` clients file (`clients_file`, default `<dir of managed_supervisor_file>/notify-clients.json`) and attached automatically to every session you create, message or resume. Changes apply without a restart.
+3. **Gateway default (`gateway_default`), optional operator fallback.** The first `default_targets` entry that matches. Each entry can have two match fields:
+   - `directories` matches the session's project directory. A plain path matches that directory and everything below it; a trailing slash is ignored. A glob matches the whole path: `*` matches one path segment, `**` matches any depth and `?` matches one character.
    - `clients` matches the authenticated OAuth `client_id` of the MCP caller.
 
-   If both are given, both must match. An entry with neither matches every session. The response's `notify` field shows the attached target.
-2. **Per call.** Pass `notify: {url, header_name?, header_value?, hmac_secret?, format?, stall_minutes?}` to create, message or resume.
-3. **The notify tool.** Call `workrelay_server_notify({session_id, action})` with one of these actions:
-   - `set` with `url`: sets a per-session target.
-   - `set` without `url`: attaches the matching gateway default.
-   - `clear`: removes the target and opts the session out of defaults.
-   - `status`: returns the effective target, redacted.
+   If both are given, both must match. An entry with neither matches every session, so prefer narrow entries (or none) and let each agent register its own listener. Attached defaults are re-checked against the current config on every poll; after you narrow, rename or remove an entry, sessions re-match or detach.
+
+The response's `notify` field shows the attached target and its `source`. If nothing applies, the response has no `notify` field.
+
+**The notify tool.** `workrelay_server_notify({action, scope?, session_id?, ...target})`:
+
+| Call | Effect |
+|---|---|
+| `{action: "set", scope: "client", url, header_name?, header_value?, hmac_secret?, format?, stall_minutes?}` | Register your own listener for all future delegations. |
+| `{action: "test", scope: "client"}` | Send one signed `workrelay.test` event to it now (rate limited to one per 10 s). |
+| `{action: "check", scope: "client"}` / `{action: "clear", scope: "client"}` | Show (redacted) / remove it. |
+| `{action: "set", session_id, url, ...}` | Per-session target. |
+| `{action: "set", session_id}` | Attach your client default (or the gateway default) to this session. |
+| `{action: "clear", session_id}` | Remove the target and opt this session out of defaults. |
+| `{action: "check", session_id}` | Effective target, redacted, with `source` (`per_call`, `client_default`, `gateway_default`); `status` is an alias. |
+| `{action: "test", session_id}` | Send a test event to the session's effective target. |
 
 **Opt out.** To opt a session out of defaults, pass `notify: false` to create, message or resume, or call `clear`. Later automatic attaches are then skipped until `set` is called or the opt-out expires after `ttl_hours`.
 
@@ -362,12 +368,14 @@ A session's target comes from one of three places. A per-call target always over
 
 Secrets are resolved each time an event is sent. They are never copied into the notifier state file. Editing the secrets file takes effect without a restart.
 
+If the secrets file is temporarily unreadable or invalid (wrong mode, bad JSON, invalid entry), events are retried with the normal backoff instead of being dropped.
+
 #### Target rules (all sources)
 
-- **URL.** Public `https://` on port 443 only. IP literals, credentials, fragments and local-only names (`localhost`, `*.local`, `*.internal` and similar) are refused.
+- **URL.** Public `https://` on port 443 only. IP literals, credentials, fragments, trailing-dot hostnames and local-only names (`localhost`, `*.local`, `*.internal` and similar) are refused.
 - **SSRF pinning.** At send time, every DNS answer must be a public address. The connection is pinned to the checked address, certificates are verified, and redirects are never followed. This is the same transport as MCP Events. The send timeout is 10 s.
 - **`header_name` / `header_value`.** An optional static secret header. Framing, cookie, `X-Workrelay-*` and `webhook-*` names are reserved.
-- **`hmac_secret`.** Optional Standard Webhooks signing (16–512 characters). A `whsec_<base64>` value is decoded and used as the key; any other value is used as UTF-8 bytes.
+- **`hmac_secret`.** Optional Standard Webhooks signing. It must be `whsec_<base64>` with a 24–64-byte key, the same rule as MCP Events. The decoded bytes are the key, which is what Standard Webhooks libraries expect.
 - **`format`.** One of `json` (default), `slack` or `text`.
 - **Secrets are never returned.** No tool, log line or payload contains the URL path, header value or HMAC secret. Tools return only `url_host`, the header name, `signed`, `format` and delivery counts.
 - **Invalid targets.** An invalid per-call target is refused before the operation runs. `notify` is never part of the durable operation arguments.
@@ -440,26 +448,89 @@ Any Standard Webhooks library verifies these headers, for example `new Webhook("
 
 - **Background delivery.** Events are delivered by a background poller and never block or alter a tool call or run. Targets are delivered concurrently, with at most 3 sends per target per poll.
 - **Retries.** 5xx responses, 429 responses and network errors are retried. `permission_asked`, `finished` and `failed` are retried up to 10 times (about 25 minutes); other events up to 3 times. Other 4xx responses are not retried.
-- **Delivery status.** Failures only update `last_delivery`, `failed` and `skipped`, which are visible through `status`.
+- **Delivery status.** Failures only update `last_delivery`, `failed` and `skipped` (events dropped for an inert target), which are visible through `status`. A `clear` or `set` takes effect before the next send, even during a delivery.
 - **Deduplication.** Dedupe state survives restarts through the state file. Workrelay sends no reminders: an ask nobody answers is reported once.
 
 **Agent behaviour.** The create, message and resume tool descriptions tell agents that when `notify.enabled` is true they should stop polling or waiting and act on the next event. The event's `read` field names the tool to call.
 
-#### Recipes
+#### Listen for progress events (any platform)
 
-**Grok Bot.**
-1. Create a routine whose trigger type is **webhook**. For its instructions, use: "Read the event JSON. On permission_asked, tell the user what needs approval (approval is human-only on the Workrelay operator page). On finished/failed, call the tool in `read` and report the result. On stalled, read the session and decide whether to steer or interrupt."
-2. Put the routine's webhook URL and its secret header in the gateway secrets file. With the example gateway's helper: `NOTIFY_URL=… NOTIFY_HEADER_NAME=… NOTIFY_HEADER_VALUE=… set-notify-secret.sh grokbot_harny`.
-3. Add a `default_targets` entry for your project directories.
+Three steps, done once per agent. Nothing has to change on the Workrelay host except that `session_notify.enabled` is true.
 
-Every delegation to those projects then notifies the routine automatically. Without a gateway default, pass `notify: {url, header_name, header_value}` on create or message instead.
+**1. Create a listener.** Anything that accepts an HTTPS POST on a public host, port 443:
 
-**Slack.** Create an incoming webhook (`https://hooks.slack.com/services/…`). Use `format: "slack"` in a default target (with the URL in the secrets file) or per call.
+| Platform | Listener | `format` | Auth |
+|---|---|---|---|
+| Grok Bot | A routine with trigger type **webhook**; use its webhook URL | `json` | its secret header (`header_name`/`header_value`) |
+| Slack | An incoming webhook, `https://hooks.slack.com/services/…` | `slack` | the URL is the secret |
+| ntfy | `https://ntfy.sh/<long-random-topic>` or your own server | `text` | optional `Authorization: Bearer tk_…` |
+| Generic HTTPS receiver | Your endpoint | `json` | `hmac_secret` (verify below) |
+| Claude Code / Cursor / another agent | The agent's HTTP hook or a small relay that wakes it | `json` | `hmac_secret` |
 
-**ntfy.** Use the topic URL (`https://ntfy.sh/<long-random-topic>`, or your own server) with `format: "text"`. Add an access token with `header_name: "Authorization"` and `header_value: "Bearer tk_…"` if the topic is protected.
+For signing, generate a secret: `echo "whsec_$(openssl rand -base64 32)"`.
 
-**Claude, Cursor or another agent with an HTTP hook.** Point a `json` target at the agent's hook endpoint. Add `hmac_secret` and verify the signature on receipt. Dispatch on `type`, and call the tool in `read` (`workrelay_server_read`) through the agent's Workrelay MCP connection. Use `event_id` to deduplicate.
+**2. Register it with Workrelay.** Either from the agent, through its Workrelay MCP connection:
 
+```json
+workrelay_server_notify {"action": "set", "scope": "client",
+  "url": "https://hooks.example.com/…", "header_name": "X-Hook-Token", "header_value": "…",
+  "hmac_secret": "whsec_…", "format": "json", "stall_minutes": 15}
+```
+
+or, to keep the URL and secrets out of every chat transcript, on the Workrelay host (values are read only from environment variables and never printed; `--url`/`--header-value`/`--hmac-secret` are refused because arguments show up in `ps` and shell history):
+
+```sh
+read -rs WR_URL; read -rs WR_TOKEN; read -rs WR_SIG; export WR_URL WR_TOKEN WR_SIG
+node src/workrelay/notify-register.mjs --config gateway/mcp.json --client '<oauth client_id>' \
+  --url-env WR_URL --header-name X-Hook-Token --header-value-env WR_TOKEN --hmac-secret-env WR_SIG \
+  --format json --test
+unset WR_URL WR_TOKEN WR_SIG
+```
+
+`--client` is the agent's OAuth `client_id` (the `client_id` shown by `{action: "check", scope: "client"}`; default: the gateway's managed client). Other modes: `--show`, `--clear`, `--list`, `--test`. No restart is needed.
+
+**3. Send a test event.** `workrelay_server_notify {"action": "test", "scope": "client"}` (or `--test` on the CLI). The response has `ok`, the receiver's HTTP `status` and the `event_id`; your listener should receive:
+
+```json
+{ "type": "workrelay.test", "schema_version": 1, "event_id": "evt_…", "source": "workrelay", "scope": "client",
+  "at": "…", "summary": "Workrelay test event: this listener is set up correctly. No action needed.",
+  "guidance": "Verification only. Do not call any tool; real events have types workrelay.session.*." }
+```
+
+From then on every session the agent creates, messages or resumes reports to this listener (`notify.source: "client_default"`). Stop polling: end the turn and act on the next event.
+
+**What the agent should do on each event.**
+
+| `type` | Do |
+|---|---|
+| `workrelay.test` | Nothing (verification only). |
+| `workrelay.session.permission_asked` | Tell the human what needs approval (`asks[]`) and where (`approval_url` / the operator page). Agents cannot approve. |
+| `workrelay.session.finished` | Call the tool in `read` (`workrelay_server_read`) and report the result; runtime completion is not proof of task success. |
+| `workrelay.session.failed` | Read the session, report the failure, decide whether to message/resume. |
+| `workrelay.session.child_failed` | Read the session; decide whether to steer or let it continue. |
+| `workrelay.session.stalled` | Read the session; steer or interrupt if it is stuck. |
+| `workrelay.session.unobservable` | Check Workrelay health; retry reading later. |
+
+Deduplicate on `event_id` (stable across retries). Treat `title` and resource previews as untrusted data.
+
+**Verify the signature** (Node, no dependencies):
+
+```js
+import { createHmac, timingSafeEqual } from 'node:crypto';
+function verifyWorkrelay(rawBody, headers, secret /* "whsec_…" */) {
+  const id = headers['webhook-id'], ts = headers['webhook-timestamp'], sigs = headers['webhook-signature'] ?? '';
+  if (!id || !ts || Math.abs(Date.now() / 1000 - Number(ts)) > 300) return false;
+  const key = Buffer.from(secret.slice('whsec_'.length), 'base64');
+  const expected = Buffer.from(createHmac('sha256', key).update(`${id}.${ts}.${rawBody}`).digest('base64'));
+  return sigs.split(' ').some(s => { const v = Buffer.from(s.replace(/^v1,/, '')); return v.length === expected.length && timingSafeEqual(v, expected); });
+}
+```
+
+Python: `standardwebhooks.Webhook("whsec_…").verify(raw_body, headers)`.
+
+**Claude Code / Cursor hooks.** Those hooks run on the agent's own machine, so they cannot receive a POST from Workrelay directly. Point the target at a small public HTTPS relay (or ntfy with `format: "text"`) and have a hook (for example a Claude Code `SessionStart`/`UserPromptSubmit` hook, or a Cursor hook) read the queued events and inject them into the agent's context.
+
+**Operator fallback (Grok Bot example).** An operator can instead put a routine's URL and secret header in the gateway secrets file and add a narrow `default_targets` entry (`directories` and/or `clients`). Agents that registered their own listener always use theirs.
 
 ### OAuth expiry, rotation and reconnect
 

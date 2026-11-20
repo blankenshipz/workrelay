@@ -140,7 +140,7 @@ test('gateway default target: attached on create via MCP with secrets from a 060
   const project = 'project_' + createHash('sha256').update('project').digest('hex');
   const created = await call('workrelay_server_create', { operation_id: 'op-d1', project_id: project, title: 'Deploy fix' });
   const notify = created.result.structuredContent.notify;
-  assert.equal(notify.enabled, true, JSON.stringify(created.result)); assert.equal(notify.source, 'default'); assert.equal(notify.default_target, 'grokbot_harny');
+  assert.equal(notify.enabled, true, JSON.stringify(created.result)); assert.equal(notify.source, 'gateway_default'); assert.equal(notify.default_target, 'grokbot_harny');
   assert.equal(notify.url_host, 'hooks.grok.example.com'); assert.equal(notify.signed, true); assert.equal(notify.configured, true);
   assert.doesNotMatch(JSON.stringify(created.result), /default-secret-1|whsec_|routines\/r1/);
   for (const name of ['workrelay_server_create', 'workrelay_server_message', 'workrelay_server_resume'])
@@ -161,7 +161,7 @@ test('gateway default target: attached on create via MCP with secrets from a 060
   assert.match(delivered[0].event.server_id, /^srv_[a-f0-9]{64}$/);
 
   const status = (await call('workrelay_server_notify', { session_id: root, action: 'status' })).result.structuredContent;
-  assert.equal(status.source, 'default'); assert.equal(status.delivered, 1);
+  assert.equal(status.source, 'gateway_default'); assert.equal(status.delivered, 1);
   assert.doesNotMatch(JSON.stringify(status), /default-secret-1|whsec_|routines/);
   // Opt out per session; a later message does not re-attach the default.
   const out = await call('workrelay_server_message', { session_id: root, operation_id: 'op-d3', text: 'more', notify: false });
@@ -173,5 +173,46 @@ test('gateway default target: attached on create via MCP with secrets from a 060
   // set without url re-attaches the default; set with target fields but no url is refused.
   assert.equal((await call('workrelay_server_notify', { session_id: root, action: 'set', header_name: 'X-A', header_value: 'v' })).result.structuredContent.reason, 'url_required_with_target_fields');
   const again = (await call('workrelay_server_notify', { session_id: root, action: 'set' })).result.structuredContent;
-  assert.equal(again.source, 'default'); assert.equal(again.enabled, true);
+  assert.equal(again.source, 'gateway_default'); assert.equal(again.enabled, true);
+});
+
+test('client scope: an agent registers its own listener once; it applies to every session it delegates; test action verifies it', async t => {
+  const { call, gateway, delivered, native, project } = await setup(t);
+  const sig = 'whsec_' + Buffer.from('client-own-secret-0123456789abcd').toString('base64');
+  // Nothing registered yet: create attaches nothing, client test has nothing to send.
+  assert.equal((await call('workrelay_server_notify', { action: 'check', scope: 'client' })).result.structuredContent.client_default, null);
+  assert.equal((await call('workrelay_server_notify', { action: 'test', scope: 'client' })).result.structuredContent.reason, 'no_client_default');
+  // Scope/field validation.
+  assert.equal((await call('workrelay_server_notify', { action: 'set', url: HOOK })).result.structuredContent.reason, 'session_id_required');
+  assert.equal((await call('workrelay_server_notify', { action: 'set', scope: 'client', session_id: root, url: HOOK })).result.structuredContent.reason, 'session_id_not_allowed_for_client_scope');
+  assert.equal((await call('workrelay_server_notify', { action: 'set', scope: 'client', url: 'https://127.0.0.1/x' })).result.structuredContent.reason, 'invalid_url');
+
+  const set = (await call('workrelay_server_notify', { action: 'set', scope: 'client', url: HOOK, header_name: 'X-Routine-Secret', header_value: 'client-secret-1', hmac_secret: sig })).result;
+  assert.ok(!set.isError);
+  assert.equal(set.structuredContent.client_id, client); assert.equal(set.structuredContent.configured, true); assert.equal(set.structuredContent.signed, true);
+  assert.doesNotMatch(JSON.stringify(set), /client-secret-1|whsec_|routines\/r1/);
+  const check = (await call('workrelay_server_notify', { action: 'check', scope: 'client' })).result.structuredContent;
+  assert.equal(check.client_default.url_host, 'hooks.grok.example.com'); assert.equal(check.client_default.updated_by, 'mcp');
+
+  // Test action: one signed workrelay.test event, not counted as a session delivery.
+  const tested = (await call('workrelay_server_notify', { action: 'test', scope: 'client' })).result;
+  assert.equal(tested.structuredContent.ok, true); assert.equal(tested.structuredContent.status, 202);
+  assert.equal(delivered.length, 1); assert.equal(delivered[0].event.type, 'workrelay.test');
+  assert.equal(delivered[0].headers['X-Routine-Secret'], 'client-secret-1'); assert.match(delivered[0].headers['webhook-signature'], /^v1,/);
+  assert.equal((await call('workrelay_server_notify', { action: 'test', scope: 'client' })).result.structuredContent.reason, 'test_rate_limited');
+
+  // Every session this client delegates gets it automatically (no notify argument).
+  const created = (await call('workrelay_server_create', { operation_id: 'op-c1', project_id: project, title: 'Deploy fix' })).result.structuredContent;
+  assert.equal(created.notify.enabled, true); assert.equal(created.notify.source, 'client_default'); assert.equal(created.notify.client_id, client);
+  assert.doesNotMatch(JSON.stringify(created), /client-secret-1|whsec_|routines\/r1/);
+  const status = (await call('workrelay_server_notify', { session_id: root, action: 'check' })).result.structuredContent;
+  assert.equal(status.source, 'client_default');
+  native.root = { ...native.root, outcome: 'succeeded', time: { created: 1, updated: 10, idle: Date.now() } };
+  await gateway.sessionNotifier.tick();
+  // A per-call notify still overrides.
+  const override = (await call('workrelay_server_message', { session_id: root, operation_id: 'op-c2', text: 'x', notify: { url: 'https://other.example.com/hook' } })).result.structuredContent;
+  assert.equal(override.notify.source, 'per_call');
+  // Clearing the client default: new sessions get nothing.
+  assert.equal((await call('workrelay_server_notify', { action: 'clear', scope: 'client' })).result.structuredContent.cleared, true);
+  assert.equal((await call('workrelay_server_notify', { action: 'check', scope: 'client' })).result.structuredContent.client_default, null);
 });

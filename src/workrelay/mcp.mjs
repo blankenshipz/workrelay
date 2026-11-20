@@ -21,7 +21,7 @@ import { createIssuerAdapter } from './oidc_adapter.mjs';
 import { createUnexposedIssuerPolicy, createPreapprovalDiagnostic, createAuthorizationOutcomeDiagnostic, createTokenErrorDiagnostic } from './issuer_policy.mjs';
 import { createLocalInteractions, createOriginDiagnostic, ACTIVITY_PATHS } from './issuer_interactions.mjs';
 import { createPermissionNotifier, validateNotifySettings } from './permission_notify.mjs';
-import { createSessionNotifier, createDefaultTargets, validateSessionNotifySettings, validateNotifyTarget, NOTIFY_FORMATS } from './session_notify.mjs';
+import { createSessionNotifier, createDefaultTargets, createClientDefaults, sessionNotifyPaths, validateSessionNotifySettings, validateNotifyTarget, NOTIFY_FORMATS } from './session_notify.mjs';
 const loopback = new Set(['127.0.0.1', '::1']);
 const key = z.string().regex(/^[A-Za-z0-9_-]{1,80}$/);
 const grantId = z.string().regex(/^grant_[0-9a-f]{32}$/);
@@ -331,7 +331,7 @@ const notifyTargetFields = { url: z.string().min(1).max(2048), header_name: z.st
   header_value: z.string().min(1).max(1024).optional(), hmac_secret: z.string().min(16).max(512).optional(), format: z.enum(NOTIFY_FORMATS).optional(),
   stall_minutes: z.number().int().min(1).max(1440).optional() };
 const notifyInput = z.union([z.literal(false), z.object(notifyTargetFields).strict()]);
-const NOTIFY_DESCRIPTION = ' Progress events: when the gateway has a default notify target for this project (or you pass notify), Workrelay POSTs a compact JSON event to it (any platform: Grok Bot routine webhook, Slack, ntfy, an agent HTTP hook) only when a permission ask appears, the run finishes or fails, a child fails, or it stalls. The response field notify shows the effective target (enabled, source, url_host; secrets never returned). When notify.enabled is true, do not poll or wait in a loop: end your turn and act on the event (it names the workrelay tool to call next). Optional notify {url, header_name?, header_value?, hmac_secret? (Standard Webhooks signature), format? json|slack|text, stall_minutes?} sets a per-session target that overrides the default; notify:false opts this session out.';
+const NOTIFY_DESCRIPTION = ' Progress events: if you registered your own listener once (workrelay_server_notify action set, scope client) or the operator configured a default for this project, Workrelay POSTs a compact JSON event to it (any platform: Grok Bot routine webhook, Slack, ntfy, an agent HTTP hook) only when a permission ask appears, the run finishes or fails, a child fails, or it stalls. The response field notify shows the effective target (enabled, source per_call|client_default|gateway_default, url_host; secrets never returned). When notify.enabled is true, do not poll or wait in a loop: end your turn and act on the event (it names the workrelay tool to call next). Optional notify {url, header_name?, header_value?, hmac_secret? (Standard Webhooks signature), format? json|slack|text, stall_minutes?} sets a per-session target that overrides any default; notify:false opts this session out.';
 const notifyFailure = reason => ({ isError: true, content: [{ type: 'text', text: JSON.stringify({ error: 'invalid_notify_target', reason }) }],
   structuredContent: { error: 'invalid_notify_target', reason } });
 
@@ -473,24 +473,46 @@ function mcp(config, invoke, events, managedReader, eventTools, audit, notifier)
   }
   if (managedReader && notifier) {
     register('workrelay_server_notify', {
-      description: 'Set, clear or check progress notifications for one session you delegated. Works with any receiver that accepts an HTTPS POST: a Grok Bot routine webhook, a Slack incoming webhook (format slack), ntfy or a generic endpoint (format text), or another agent\'s HTTP hook (format json, the default). check (status) reports the effective target, redacted: source (call or gateway default), default_target name, url_host, secret_header name, signed, format, delivery counts; secrets are never returned. set without url attaches the gateway default target that matches this session\'s project (gateway defaults are attached automatically on create/message/resume). set with url (public HTTPS only) sets a per-session target: optional header_name/header_value (secret header), hmac_secret (Standard Webhooks webhook-id/webhook-timestamp/webhook-signature), format json|slack|text, stall_minutes. clear removes the target and opts this session out of gateway defaults. Events (JSON type): workrelay.session.permission_asked (a human must approve on the operator page), .finished / .failed (read the session for the result), .child_failed, .stalled, .unobservable; each has summary and read {tool, arguments}. Never per step; non-ask/non-completion events are limited to one per session per 2 minutes. While enabled, rely on the events instead of polling. Notification failures never affect the run.',
-      inputSchema: z.object({ session_id: z.string().regex(/^ses[A-Za-z0-9_-]{1,160}$/), action: z.enum(['set', 'clear', 'status']),
+      description: 'Register, check and test where Workrelay sends progress events for sessions you delegate. Works with any receiver that accepts an HTTPS POST: a Grok Bot routine webhook, a Slack incoming webhook (format slack), ntfy or a generic endpoint (format text), or another agent\'s HTTP hook (format json, the default). ' +
+        'Set up your own listener once: action set, scope client, with url (public HTTPS only) and optional header_name/header_value (secret header), hmac_secret (whsec_..., Standard Webhooks webhook-id/webhook-timestamp/webhook-signature), format json|slack|text, stall_minutes. It is stored privately for your MCP client and used for every session you create, message or resume from then on. Then call action test, scope client, to send a signed workrelay.test event and confirm it arrives. clear with scope client removes it; check with scope client shows it, redacted. (An operator can also register it on the Workrelay host with the notify-register CLI, so the secret never enters a chat.) ' +
+        'scope session (the default, needs session_id): set with url sets a target for that session only; set without url attaches your client default (or the operator default for the project); clear removes the target and opts the session out of defaults; check reports the effective target, redacted, with source per_call, client_default or gateway_default; test sends a test event to it. A per-call notify argument always overrides defaults. Secrets are never returned. ' +
+        'Events (JSON type): workrelay.session.permission_asked (a human must approve on the operator page), .finished / .failed (read the session for the result), .child_failed, .stalled, .unobservable; each has summary and read {tool, arguments}. Never per step; non-ask/non-completion events are limited to one per session per 2 minutes. While enabled, rely on the events instead of polling. Notification failures never affect the run.',
+      inputSchema: z.object({ action: z.enum(['set', 'clear', 'check', 'status', 'test']), scope: z.enum(['session', 'client']).optional(),
+        session_id: z.string().regex(/^ses[A-Za-z0-9_-]{1,160}$/).optional(),
         url: notifyTargetFields.url.optional(), header_name: notifyTargetFields.header_name, header_value: notifyTargetFields.header_value,
         hmac_secret: notifyTargetFields.hmac_secret, format: notifyTargetFields.format, stall_minutes: notifyTargetFields.stall_minutes }).strict(),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    }, async ({ session_id, action, ...target }, ctx) => {
+    }, async ({ session_id, action: rawAction, scope = 'session', ...target }, ctx) => {
+      const action = rawAction === 'status' ? 'check' : rawAction;
       if (action !== 'set' && Object.keys(target).length) return notifyFailure('fields_only_for_set');
-      const useDefault = action === 'set' && target.url === undefined;
+      if (scope === 'session' && !session_id) return notifyFailure('session_id_required');
+      if (scope === 'client' && session_id) return notifyFailure('session_id_not_allowed_for_client_scope');
+      const useDefault = scope === 'session' && action === 'set' && target.url === undefined;
       if (useDefault && Object.keys(target).length) return notifyFailure('url_required_with_target_fields');
       if (action === 'set' && !useDefault) { try { validateNotifyTarget(target); } catch (error) { return notifyFailure(error.reason ?? 'invalid_target'); } }
       try {
         const claims = ctx.http?.authInfo?.extra?.managedClaims;
-        await managedReader('session_check', { session_id }, claims);
-        const output = useDefault ? await notifier.attachDefault(session_id, { client_id: claims?.client_id, explicit: true }) :
-          action === 'set' ? notifier.set(session_id, target) : action === 'clear' ? notifier.clear(session_id) :
-          await notifier.status(session_id, { client_id: claims?.client_id });
-        if (output?.error) return notifyFailure(output.error);
-        return { content: [{ type: 'text', text: JSON.stringify(output) }], structuredContent: output };
+        let output;
+        if (scope === 'client') {
+          await managedReader('authorize', {}, claims);
+          const clientID = claims?.client_id;
+          if (typeof clientID !== 'string' || !clientID) return notifyFailure('client_identity_unavailable');
+          try {
+            output = action === 'set' ? { scope, ...notifier.clients.set(clientID, target, { by: 'mcp' }), applies_to: 'every session this client creates, messages or resumes; a per-call notify still overrides' } :
+              action === 'clear' ? { scope, ...notifier.clients.clear(clientID) } :
+              action === 'test' ? { scope, ...await notifier.test({ client_id: clientID }) } :
+              { scope, client_id: clientID, client_default: notifier.clients.get(clientID),
+                fallback: notifier.hasGatewayDefaults() ? 'gateway default for the session project, if one matches' : null };
+          } catch (error) { if (error.reason) return notifyFailure(error.reason); throw error; }
+        } else {
+          await managedReader('session_check', { session_id }, claims);
+          output = useDefault ? await notifier.attachDefault(session_id, { client_id: claims?.client_id, explicit: true }) :
+            action === 'set' ? notifier.set(session_id, target) : action === 'clear' ? notifier.clear(session_id) :
+            action === 'test' ? await notifier.test({ session_id, client_id: claims?.client_id }) :
+            await notifier.status(session_id, { client_id: claims?.client_id });
+        }
+        if (output?.error && typeof output.error === 'string') return notifyFailure(output.error);
+        return { content: [{ type: 'text', text: JSON.stringify(output) }], structuredContent: output, isError: action === 'test' && output.ok === false };
       } catch { return { isError: true, content: [{ type: 'text', text: 'Managed server capability unavailable or denied.' }] }; }
     });
   }
@@ -548,7 +570,8 @@ export function createGateway(rawConfig, options = {}) {
   };
   const operatorClaims = () => ({ iss: config.issuer, aud: config.audience, sub: config.principal, client_id: managedClientID(config) });
   // Operator-only activity views (session notifier poller, loopback live log).
-  // Separate reader instance: never reachable from MCP tools.
+  // Separate reader instance; MCP tools never see its output. workrelay_server_notify
+  // status/set-default use it (after session_check) only to match a default target.
   const notifySettings = config.session_notify?.enabled === true ? config.session_notify : null;
   const activityReader = notifySettings || localOperatorPort ? createManagedReader(config, readManagedBinding, { operatorActions: true,
     harnessStateDir: config.harness_state_dir }) : null;
@@ -571,7 +594,8 @@ export function createGateway(rawConfig, options = {}) {
   } : undefined;
   const sessionNotifier = notifySettings ? createSessionNotifier({ settings: notifySettings, serverId: managedServerID(config.managed_server),
     defaults: createDefaultTargets({ entries: notifySettings.default_targets ?? [], secretsFile: notifySettings.secrets_file, ...(options.notifyEnv ? { env: options.notifyEnv } : {}) }),
-    statePath: notifySettings.state_file ?? join(dirname(config.managed_supervisor_file), 'session-notify.json'),
+    clients: createClientDefaults({ file: sessionNotifyPaths(config).clientsPath }),
+    statePath: sessionNotifyPaths(config).statePath,
     approvalUrl: localOperatorPort ? `http://127.0.0.1:${localOperatorPort}/operator/permissions` : undefined,
     watch: sessionID => activityReader('session_watch', { session_id: sessionID, directories: activityDirectories() }, operatorClaims()),
     ...(options.notifyTransport ? { transport: options.notifyTransport } : {}),

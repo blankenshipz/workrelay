@@ -1,10 +1,15 @@
 // Per-session progress notifications to the delegating agent, on any agent
 // platform: a Grok Bot routine webhook, a Slack incoming webhook, ntfy, or any
 // agent's HTTP hook. Opt-in by gateway config (session_notify.enabled).
-// Targets come from either
+// Targets come from, in order of precedence:
 //  - the caller, per session (workrelay_server_create/message/resume `notify`,
-//    or workrelay_server_notify), or
-//  - a gateway default target (session_notify.default_targets), matched by
+//    or workrelay_server_notify scope session),
+//  - the caller's own client default: each MCP client (OAuth client_id)
+//    registers its listener once (workrelay_server_notify scope client, or the
+//    notify-register.mjs CLI on the workrelay host) and it applies to every
+//    session that client creates, messages or resumes. Stored in a private
+//    0600 clients file, resolved at send time, never returned, or
+//  - an optional operator fallback (session_notify.default_targets), matched by
 //    session directory glob and/or OAuth client id. Its URL/header/HMAC secrets
 //    live in a private 0600 secrets file or environment variables, never in the
 //    gateway config, and are resolved at send time (never copied to state).
@@ -62,9 +67,9 @@ export function validateSessionNotifySettings(value) {
   const ints = { stall_minutes: [1, 1440], min_interval_ms: [30000, 3600000], poll_interval_ms: [5000, 600000], max_targets: [1, 1000], ttl_hours: [1, 720] };
   const defaults = value?.default_targets;
   const ok = value && typeof value === 'object' && !Array.isArray(value) && value.enabled === true &&
-    Object.keys(value).every(key => ['enabled', 'state_file', 'secrets_file', 'default_targets', ...Object.keys(ints)].includes(key)) &&
+    Object.keys(value).every(key => ['enabled', 'state_file', 'secrets_file', 'clients_file', 'default_targets', ...Object.keys(ints)].includes(key)) &&
     (value.state_file === undefined || typeof value.state_file === 'string' && value.state_file.startsWith('/') && !value.state_file.split('/').includes('..')) &&
-    (value.secrets_file === undefined || safePath(value.secrets_file)) &&
+    (value.secrets_file === undefined || safePath(value.secrets_file)) && (value.clients_file === undefined || safePath(value.clients_file)) &&
     (defaults === undefined || Array.isArray(defaults) && defaults.length <= 50 && defaults.every(validateDefaultTarget) &&
       new Set(defaults.map(entry => entry.name)).size === defaults.length &&
       (value.secrets_file !== undefined || defaults.every(entry => entry.secret === undefined))) &&
@@ -72,13 +77,28 @@ export function validateSessionNotifySettings(value) {
   if (!ok) throw Error('invalid session_notify configuration');
 }
 
+// Where the notifier keeps its private files for a validated gateway config:
+// the state file and the per-client defaults file (shared with the CLI).
+export function sessionNotifyPaths(config) {
+  const settings = config?.session_notify ?? {};
+  const base = config?.managed_supervisor_file ? dirname(config.managed_supervisor_file) : null;
+  return { statePath: settings.state_file ?? (base && join(base, 'session-notify.json')),
+    clientsPath: settings.clients_file ?? (base && join(base, 'notify-clients.json')) };
+}
+
 // Standard Webhooks (https://www.standardwebhooks.com) HMAC-SHA256 signature:
-// base64(HMAC(key, `${id}.${timestamp}.${body}`)), sent as `v1,<sig>`. A
-// `whsec_<base64>` secret uses the decoded bytes as key; any other secret is
-// used as UTF-8 bytes.
+// base64(HMAC(key, `${id}.${timestamp}.${body}`)), sent as `v1,<sig>`. The
+// secret is `whsec_<base64>` (24-64 key bytes, as for MCP Events); the decoded
+// bytes are the key, exactly as Standard Webhooks libraries expect.
 export function signStandardWebhook(secret, id, timestamp, body) {
-  const key = secret.startsWith('whsec_') ? Buffer.from(secret.slice(6), 'base64') : Buffer.from(secret, 'utf8');
+  const key = Buffer.from(secret.slice(6), 'base64');
   return 'v1,' + createHmac('sha256', key).update(`${id}.${timestamp}.${body}`).digest('base64');
+}
+
+function validHmacSecret(secret) {
+  if (typeof secret !== 'string' || !/^whsec_[A-Za-z0-9+/]+={0,2}$/.test(secret)) return false;
+  const bytes = Buffer.from(secret.slice(6), 'base64');
+  return bytes.length >= 24 && bytes.length <= 64 && bytes.toString('base64') === secret.slice(6);
 }
 
 // Caller-supplied target. Public HTTPS only (no IP literals, credentials,
@@ -90,6 +110,8 @@ export function validateNotifyTarget(input) {
   if (Object.keys(input).some(key => !TARGET_FIELDS.includes(key))) fail('unknown_field');
   let url;
   try { url = new URL(input.url); } catch { fail('invalid_url'); }
+  // A trailing-dot FQDN (`localhost.`) must not slip past the name checks.
+  if (url.hostname.endsWith('.')) fail('invalid_url');
   if (typeof input.url !== 'string' || input.url.length > 2048 || url.protocol !== 'https:' || url.username || url.password || url.hash ||
       (url.port && url.port !== '443') || isIP(url.hostname) || url.hostname.startsWith('[') || !url.hostname.includes('.') ||
       /(^|\.)(localhost|local|internal|invalid|test|example|lan|home|arpa)$/i.test(url.hostname)) fail('invalid_url');
@@ -98,9 +120,7 @@ export function validateNotifyTarget(input) {
       RESERVED_HEADERS.has(input.header_name.toLowerCase()) || /^x-workrelay-/i.test(input.header_name) || /^webhook-/i.test(input.header_name))) fail('invalid_header_name');
   if (input.header_value !== undefined && (typeof input.header_value !== 'string' || !input.header_value.length || input.header_value.length > 1024 ||
       !/^[\x20-\x7e]+$/.test(input.header_value))) fail('invalid_header_value');
-  if (input.hmac_secret !== undefined && (typeof input.hmac_secret !== 'string' || input.hmac_secret.length < 16 || input.hmac_secret.length > 512 ||
-      !/^[\x21-\x7e]+$/.test(input.hmac_secret) ||
-      input.hmac_secret.startsWith('whsec_') && (!/^[A-Za-z0-9+/]+={0,2}$/.test(input.hmac_secret.slice(6)) || Buffer.from(input.hmac_secret.slice(6), 'base64').length < 16))) fail('invalid_hmac_secret');
+  if (input.hmac_secret !== undefined && !validHmacSecret(input.hmac_secret)) fail('invalid_hmac_secret');
   if (input.format !== undefined && !NOTIFY_FORMATS.includes(input.format)) fail('invalid_format');
   if (input.stall_minutes !== undefined && (!Number.isSafeInteger(input.stall_minutes) || input.stall_minutes < 1 || input.stall_minutes > 1440)) fail('invalid_stall_minutes');
   return { url: url.href, ...(input.header_name ? { header_name: input.header_name, header_value: input.header_value } : {}),
@@ -127,8 +147,9 @@ function readPrivateJSON(path, maxBytes = 65536) {
 // `/a/b` matches /a/b and anything below it; globs (`*` one segment, `**` any
 // depth, `?` one character) match the whole path.
 export function directoryMatcher(globs) {
-  const patterns = globs.map(glob => {
-    if (!/[*?]/.test(glob)) return directory => directory === glob || directory.startsWith(glob.replace(/\/$/, '') + '/');
+  const patterns = globs.map(raw => {
+    const glob = raw.length > 1 ? raw.replace(/\/+$/, '') : raw; // `/a/b/` means `/a/b`
+    if (!/[*?]/.test(glob)) return directory => directory === glob || directory.startsWith(glob === '/' ? '/' : glob + '/');
     let source = '';
     for (let i = 0; i < glob.length; i++) {
       if (glob.startsWith('/**', i) && (i + 3 === glob.length || glob[i + 3] === '/')) { source += '(?:/.*)?'; i += 2; }
@@ -180,6 +201,96 @@ export function createDefaultTargets({ entries = [], secretsFile, env = process.
   };
 }
 
+// Redacted view of a resolved target: never the URL path, header value or HMAC secret.
+export function redactTarget(target) {
+  return { url_host: target ? new URL(target.url).host : null, secret_header: target?.header_name ?? null, signed: Boolean(target?.hmac_secret),
+    format: target?.format ?? 'json' };
+}
+
+const CLIENT_ID = /^[\x21-\x7e]{1,512}$/;
+export const validClientID = value => typeof value === 'string' && CLIENT_ID.test(value) && !['__proto__', 'constructor', 'prototype'].includes(value);
+const MAX_CLIENTS = 100;
+
+/**
+ * Per-client default targets ("register your own listener once"). Keyed by the
+ * authenticated OAuth client_id. Stored in a private 0600 file (owner-only
+ * directory, no symlinks, atomic replace) that both the gateway and the
+ * notify-register CLI write; read at use time, so CLI changes apply without a
+ * restart. Secrets are never returned: callers see only redacted views.
+ */
+export function createClientDefaults({ file, now = Date.now } = {}) {
+  // { state: 'present', entry } | { state: 'absent' } | { state: 'error', reason }
+  function readAll() {
+    if (!file) return { clients: new Map() };
+    let data;
+    try { data = readPrivateJSON(file, 524288); }
+    catch (error) { return error?.code === 'ENOENT' ? { clients: new Map() } : { error: error.reason ?? 'clients_file_unavailable' }; }
+    if (data?.version !== 1 || !data.clients || typeof data.clients !== 'object' || Array.isArray(data.clients)) return { error: 'clients_file_invalid' };
+    return { clients: new Map(Object.entries(data.clients).filter(([id, entry]) => validClientID(id) && entry && typeof entry === 'object' && !Array.isArray(entry))) };
+  }
+  function lookup(clientID) {
+    if (!validClientID(clientID)) return { state: 'absent' };
+    const all = readAll();
+    if (all.error) return { state: 'error', reason: all.error };
+    const entry = all.clients.get(clientID);
+    return entry ? { state: 'present', entry } : { state: 'absent' };
+  }
+  function resolveEntry(entry) {
+    const { stall_minutes: stall, ...fields } = Object.fromEntries(Object.entries(entry).filter(([key]) => TARGET_FIELDS.includes(key)));
+    try { return { target: validateNotifyTarget(fields), ...(stall ? { stall_minutes: stall } : {}) }; }
+    catch (error) { return { reason: `client_default_${error.reason ?? 'invalid'}` }; }
+  }
+  function view(clientID, entry) {
+    const resolved = resolveEntry(entry);
+    return { client_id: clientID, configured: Boolean(resolved.target), ...(resolved.reason ? { reason: resolved.reason } : {}), ...redactTarget(resolved.target),
+      ...(entry.stall_minutes ? { stall_minutes: entry.stall_minutes } : {}), updated_at: entry.updated_at ?? null, updated_by: entry.updated_by ?? null };
+  }
+  function write(clients) {
+    writePrivateJSON(file, { version: 1, clients: Object.fromEntries(clients) });
+  }
+  const fail = reason => { throw Object.assign(Error('client default unavailable'), { reason }); };
+  return {
+    lookup,
+    any: () => { const all = readAll(); return Boolean(all.error || all.clients.size); },
+    resolve(clientID) {
+      const found = lookup(clientID);
+      if (found.state === 'error') return { reason: found.reason };
+      if (found.state === 'absent') return { reason: 'client_default_removed' };
+      return resolveEntry(found.entry);
+    },
+    get(clientID) { const found = lookup(clientID); return found.state === 'present' ? view(clientID, found.entry) : found.state === 'error' ? { client_id: clientID, error: found.reason } : null; },
+    list() { const all = readAll(); return all.error ? { error: all.error } : { clients: [...all.clients].map(([id, entry]) => view(id, entry)) }; },
+    // `by` is a non-secret label ("mcp" or "cli") recorded for operators.
+    set(clientID, rawTarget, { by = 'mcp' } = {}) {
+      if (!file) fail('clients_file_not_configured');
+      if (!validClientID(clientID)) fail('invalid_client_id');
+      const target = validateNotifyTarget(rawTarget);
+      const all = readAll();
+      if (all.error) fail(all.error);
+      if (!all.clients.has(clientID) && all.clients.size >= MAX_CLIENTS) fail('too_many_clients');
+      all.clients.set(clientID, { ...target, updated_at: new Date(now()).toISOString(), updated_by: by });
+      write(all.clients);
+      return view(clientID, all.clients.get(clientID));
+    },
+    clear(clientID) {
+      if (!file) fail('clients_file_not_configured');
+      const all = readAll();
+      if (all.error) fail(all.error);
+      const had = all.clients.delete(clientID);
+      if (had) write(all.clients);
+      return { client_id: clientID, cleared: had };
+    },
+  };
+}
+
+function writePrivateJSON(path, data) {
+  if (!privateDirectory(path)) throw Object.assign(Error('directory not private'), { reason: 'directory_not_private' });
+  const temporary = join(dirname(path), `.${basename(path)}.${randomBytes(6).toString('hex')}`);
+  const fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  try { writeSync(fd, JSON.stringify(data)); fsyncSync(fd); } finally { closeSync(fd); }
+  try { renameSync(temporary, path); } catch (error) { try { unlinkSync(temporary); } catch { /* ignored */ } throw error; }
+}
+
 // Private state file: owner-only directory and file, atomic replace, no symlinks.
 function loadState(path) {
   let fd;
@@ -192,13 +303,7 @@ function loadState(path) {
   } catch { return {}; }
   finally { if (fd !== undefined) closeSync(fd); }
 }
-function saveState(path, state) {
-  if (!privateDirectory(path)) throw Error('notify state directory not private');
-  const temporary = join(dirname(path), `.${basename(path)}.${randomBytes(6).toString('hex')}`);
-  const fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-  try { writeSync(fd, JSON.stringify({ version: 1, ...state })); fsyncSync(fd); } finally { closeSync(fd); }
-  try { renameSync(temporary, path); } catch (error) { try { unlinkSync(temporary); } catch { /* ignored */ } throw error; }
-}
+function saveState(path, state) { writePrivateJSON(path, { version: 1, ...state }); }
 
 // Human/agent readable one-line summary. Titles are untrusted session text.
 function summarize(type, fields) {
@@ -218,7 +323,7 @@ function summarize(type, fields) {
 }
 const slackEscape = text => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 function renderText(event) {
-  return `[workrelay] ${event.summary}\nNext: ${event.read.tool} ${JSON.stringify(event.read.arguments)}` +
+  return `[workrelay] ${event.summary}` + (event.read ? `\nNext: ${event.read.tool} ${JSON.stringify(event.read.arguments)}` : '') +
     (event.approval_url ? `\nApprove: ${event.approval_url}` : '');
 }
 // Body + content type for a target format. json is the canonical event.
@@ -228,14 +333,49 @@ export function renderNotifyBody(event, format = 'json') {
   return { body: JSON.stringify(event), contentType: 'application/json' };
 }
 
+// One POST of an event to a resolved target. Standard Webhooks headers when
+// the target has an hmac_secret: stable id (event_id), fresh timestamp and
+// signature per attempt. Resolves to the HTTP status; throws on network errors.
+export async function postNotifyEvent(target, event, { transport, now = Date.now }) {
+  const { body, contentType } = renderNotifyBody(event, target.format);
+  const timestamp = String(Math.floor(now() / 1000));
+  const response = await transport(target.url, { body, headers: { 'Content-Type': contentType,
+    'User-Agent': 'workrelay-notify/1', 'X-Workrelay-Event': event.type, 'X-Workrelay-Event-Id': event.event_id,
+    ...(target.hmac_secret ? { 'webhook-id': event.event_id, 'webhook-timestamp': timestamp,
+      'webhook-signature': signStandardWebhook(target.hmac_secret, event.event_id, timestamp, body) } : {}),
+    ...(target.header_name ? { [target.header_name]: target.header_value } : {}) } });
+  return response?.status ?? null;
+}
+
+// `workrelay.test`: sent only on request (notify tool action test, or the CLI)
+// so a newly set up listener can be verified end to end. Receivers ignore it.
+export function testNotifyEvent({ sessionID, serverId, scope, now = Date.now } = {}) {
+  return { type: 'workrelay.test', schema_version: EVENT_SCHEMA_VERSION, event_id: 'evt_' + randomBytes(12).toString('hex'), source: 'workrelay',
+    ...(sessionID ? { session_id: sessionID } : {}), ...(serverId ? { server_id: serverId } : {}), ...(scope ? { scope } : {}),
+    at: new Date(now()).toISOString(),
+    summary: 'Workrelay test event: this listener is set up correctly. No action needed.',
+    guidance: 'Verification only. Do not call any tool; real events have types workrelay.session.*.' };
+}
+
+// Sends a test event and reports the outcome (no secrets).
+export async function sendTestEvent(target, event, { transport, now = Date.now }) {
+  try {
+    const status = await postNotifyEvent(target, event, { transport, now });
+    return { sent: true, ok: status >= 200 && status < 300, status, event_id: event.event_id, ...redactTarget(target) };
+  } catch (error) {
+    return { sent: false, ok: false, delivery_error: error?.data?.reason ?? 'network_error', event_id: event.event_id, ...redactTarget(target) };
+  }
+}
+
 const BUSY = new Set(['running', 'blocked_on_permission']);
 
 /**
- * createSessionNotifier({ watch, settings, approvalUrl, serverId, defaults })
+ * createSessionNotifier({ watch, settings, approvalUrl, serverId, defaults, clients })
  * watch(session_id) -> operator-only session_watch projection (see managed_server.mjs).
- * defaults: createDefaultTargets(...) (optional gateway default targets).
+ * clients: createClientDefaults(...) (per-client self-registered listeners).
+ * defaults: createDefaultTargets(...) (optional operator fallback targets).
  */
-export function createSessionNotifier({ watch, settings = {}, approvalUrl, serverId, defaults = createDefaultTargets(), statePath,
+export function createSessionNotifier({ watch, settings = {}, approvalUrl, serverId, defaults = createDefaultTargets(), clients = createClientDefaults(), statePath,
   transport = createPinnedWebhookTransport({ timeoutMs: 10000 }), now = Date.now, log = () => {} } = {}) {
   if (typeof watch !== 'function') throw Error('session notifier requires watch');
   const stallDefault = (settings.stall_minutes ?? 10) * MINUTE;
@@ -244,7 +384,7 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
   const ttl = (settings.ttl_hours ?? 72) * 60 * MINUTE;
   const loaded = statePath ? loadState(statePath) : {};
   const targets = new Map(Object.entries(loaded.targets ?? {}).filter(([id, t]) => SID.test(id) && t && typeof t === 'object' &&
-    (typeof t.url === 'string' || typeof t.default_name === 'string' || t.default_pending === true)));
+    (typeof t.url === 'string' || typeof t.default_name === 'string' || t.default_pending === true || t.client_default === true && validClientID(t.client_id))));
   // Sessions opted out of gateway defaults -> expiry time.
   const optedOut = new Map(Object.entries(loaded.opt_out ?? {}).filter(([id, until]) => SID.test(id) && Number.isSafeInteger(until)));
   const persist = () => {
@@ -257,21 +397,22 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
     return until !== undefined;
   };
   // Effective delivery target: a per-call target, or a default resolved now.
-  const effective = t => t.default_name ? defaults.resolve(t.default_name) : t.url ? { target: { url: t.url, header_name: t.header_name,
-    header_value: t.header_value, hmac_secret: t.hmac_secret, format: t.format } } : { reason: 'default_pending' };
+  const effective = t => t.client_default ? clients.resolve(t.client_id) : t.default_name ? defaults.resolve(t.default_name) :
+    t.url ? { target: { url: t.url, header_name: t.header_name, header_value: t.header_value, hmac_secret: t.hmac_secret, format: t.format } } :
+    { reason: 'default_pending' };
+  const sourceOf = t => t.url ? 'per_call' : t.client_default ? 'client_default' : 'gateway_default';
   // Redacted view: never the URL path, header value or HMAC secret.
   function publicStatus(id, t) {
     if (!t) return { session_id: id, enabled: false, ...(isOptedOut(id) ? { opted_out: true } : {}) };
     const resolved = t.default_pending ? { reason: 'default_pending' } : effective(t);
     const target = resolved.target;
-    return { session_id: id, enabled: true, source: t.default_name || t.default_pending ? 'default' : 'call',
+    return { session_id: id, enabled: true, source: sourceOf(t),
+      ...(t.client_default ? { client_id: t.client_id } : {}),
       ...(t.default_name ? { default_target: t.default_name } : {}), ...(t.default_pending ? { pending: true } : {}),
-      configured: Boolean(target), ...(resolved.reason ? { reason: resolved.reason } : {}),
-      url_host: target ? new URL(target.url).host : null, secret_header: target?.header_name ?? null, signed: Boolean(target?.hmac_secret),
-      format: target?.format ?? 'json',
+      configured: Boolean(target), ...(resolved.reason ? { reason: resolved.reason } : {}), ...redactTarget(target),
       stall_minutes: Math.round((t.stall_ms ?? (resolved.stall_minutes ? resolved.stall_minutes * MINUTE : stallDefault)) / MINUTE),
       registered_at: new Date(t.registered_at).toISOString(), expires_at: new Date(t.expires_at).toISOString(),
-      delivered: t.delivered ?? 0, failed: t.failed ?? 0, last_delivery: t.last_delivery ?? null };
+      delivered: t.delivered ?? 0, failed: t.failed ?? 0, skipped: t.skipped ?? 0, last_delivery: t.last_delivery ?? null };
   }
 
   // A target is "settled" after its finished event until new work is seen.
@@ -288,7 +429,7 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
     t.registered_at = at; t.expires_at = Math.max(t.expires_at ?? 0, at + ttl);
     return t;
   }
-  const CALL_FIELDS = ['url', 'header_name', 'header_value', 'hmac_secret', 'format', 'stall_ms', 'default_name', 'default_pending', 'client_id'];
+  const CALL_FIELDS = ['url', 'header_name', 'header_value', 'hmac_secret', 'format', 'stall_ms', 'default_name', 'default_pending', 'client_id', 'client_default'];
   function set(sessionID, rawTarget, at = now()) {
     if (!SID.test(sessionID ?? '')) throw Object.assign(Error('invalid session'), { reason: 'invalid_session' });
     const target = validateNotifyTarget(rawTarget);
@@ -302,10 +443,18 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
     persist();
     return publicStatus(sessionID, t);
   }
-  function applyDefault(t, entry) {
+  function applyDefault(t, entry, clientID) {
     for (const key of CALL_FIELDS) delete t[key];
-    Object.assign(t, { default_name: entry.name, stall_ms: entry.stall_minutes ? entry.stall_minutes * MINUTE : undefined });
+    // client_id is kept so the match can be re-checked against current config.
+    Object.assign(t, { default_name: entry.name, client_id: clientID, stall_ms: entry.stall_minutes ? entry.stall_minutes * MINUTE : undefined });
   }
+  function applyClient(t, clientID, entry) {
+    for (const key of CALL_FIELDS) delete t[key];
+    Object.assign(t, { client_default: true, client_id: clientID, stall_ms: entry.stall_minutes ? entry.stall_minutes * MINUTE : undefined });
+  }
+  // A default whose source no longer exists counts as no target (a transient
+  // clients-file error does not).
+  const stale = t => t?.default_name !== undefined && !defaults.has(t.default_name) || t?.client_default === true && clients.lookup(t.client_id).state === 'absent';
   const bounded = (promise, ms) => {
     let timer;
     return Promise.race([promise.catch(() => null), new Promise(done => { timer = setTimeout(() => done(null), ms); timer.unref?.(); })]).finally(() => clearTimeout(timer));
@@ -317,50 +466,119 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
   // target and lifts the opt-out, but only when a default matches.
   async function attachDefault(sessionID, { client_id: clientID, at = now(), explicit = false, waitMs = 4000 } = {}) {
     if (!SID.test(sessionID ?? '')) return null;
+    // The caller's own registered listener comes first; no directory needed.
+    const own = clients.lookup(clientID);
     if (explicit) {
+      if (own.state === 'present') {
+        const t = ensure(sessionID, at); applyClient(t, clientID, own.entry); optedOut.delete(sessionID); persist();
+        return publicStatus(sessionID, t);
+      }
       if (!defaults.size || !defaults.mayMatch(clientID)) return { error: 'no_default_target' };
       const view = await bounded(watch(sessionID), waitMs);
       if (!view) return { error: 'session_unobservable' };
       const entry = defaults.match({ directory: view.directory, client_id: clientID });
       if (!entry) return { error: 'no_default_target' };
-      const t = ensure(sessionID, at); applyDefault(t, entry); optedOut.delete(sessionID); persist();
+      const t = ensure(sessionID, at); applyDefault(t, entry, clientID); optedOut.delete(sessionID); persist();
       return publicStatus(sessionID, t);
     }
-    const existing = targets.get(sessionID);
-    if (existing) return publicStatus(sessionID, existing);
-    if (!defaults.size || !defaults.mayMatch(clientID) || isOptedOut(sessionID, at)) return null;
+    const free = () => { const t = targets.get(sessionID); if (stale(t)) { targets.delete(sessionID); persist(); return true; } return !t; };
+    if (!free()) {
+      const t = targets.get(sessionID);
+      // An automatic target follows the delegating client's own listener;
+      // a per-call target is never replaced.
+      if (!t.url && own.state === 'present' && !(t.client_default && t.client_id === clientID)) { applyClient(t, clientID, own.entry); persist(); }
+      return publicStatus(sessionID, t);
+    }
+    if (isOptedOut(sessionID, at)) return null;
+    if (own.state === 'present') {
+      const t = ensure(sessionID, at); applyClient(t, clientID, own.entry); persist();
+      return publicStatus(sessionID, t);
+    }
+    if (!defaults.size || !defaults.mayMatch(clientID)) return null;
+    // Match BEFORE creating an entry, so a session in an unmatched directory
+    // never evicts a live target at max_targets.
+    const view = await bounded(watch(sessionID), waitMs);
+    if (!free()) return publicStatus(sessionID, targets.get(sessionID)); // set concurrently
+    if (isOptedOut(sessionID, at)) return null;
+    if (view) {
+      const entry = defaults.match({ directory: view.directory, client_id: clientID });
+      if (!entry) return null;
+      const t = ensure(sessionID, at); applyDefault(t, entry, clientID); persist();
+      return publicStatus(sessionID, t);
+    }
+    // Native read unavailable: resolve on a later tick, but never evict for it.
+    if (targets.size >= maxTargets) return null;
     const t = ensure(sessionID, at);
     Object.assign(t, { default_pending: true, client_id: clientID });
     persist();
-    await bounded(resolvePending(sessionID, t), waitMs);
-    return publicStatus(sessionID, targets.get(sessionID));
+    return publicStatus(sessionID, t);
   }
   async function resolvePending(sessionID, t, view) {
     if (!t?.default_pending) return;
     try { view ??= await watch(sessionID); } catch { return; } // retried on the next tick
     if (!t.default_pending || targets.get(sessionID) !== t) return;
-    const entry = defaults.match({ directory: view.directory, client_id: t.client_id });
-    if (entry) applyDefault(t, entry); else targets.delete(sessionID);
+    const own = clients.lookup(t.client_id);
+    const entry = own.state === 'present' ? null : defaults.match({ directory: view.directory, client_id: t.client_id });
+    if (own.state === 'present') applyClient(t, t.client_id, own.entry);
+    else if (entry) applyDefault(t, entry, t.client_id); else targets.delete(sessionID);
     persist();
   }
+  const hasDefaults = () => defaults.size > 0 || clients.any();
   function clear(sessionID, { optOut = true } = {}) {
     const had = targets.delete(sessionID);
-    if (optOut && defaults.size) optedOut.set(sessionID, now() + ttl);
-    if (had || optOut && defaults.size) persist();
-    return { session_id: sessionID, enabled: false, cleared: had, ...(optOut && defaults.size ? { opted_out: true } : {}) };
+    const out = optOut && hasDefaults();
+    if (out) optedOut.set(sessionID, now() + ttl);
+    if (had || out) persist();
+    return { session_id: sessionID, enabled: false, cleared: had, ...(out ? { opted_out: true } : {}) };
   }
   function get(sessionID) { return publicStatus(sessionID, targets.get(sessionID)); }
   // Status plus whether a gateway default would apply (bounded native read).
   async function status(sessionID, { client_id: clientID, waitMs = 4000 } = {}) {
     const current = get(sessionID);
-    if (current.enabled || !defaults.size || !defaults.mayMatch(clientID)) return current;
+    if (current.enabled) return current;
+    const guidance = current.opted_out ? 'This session opted out of defaults. Call set without url to re-attach the default.' :
+      'Delegating with create/message/resume attaches it automatically; or call set without url.';
+    const own = clients.lookup(clientID);
+    if (own.state === 'present') {
+      const resolved = clients.resolve(clientID);
+      return { ...current, default_available: { source: 'client_default', client_id: clientID, configured: Boolean(resolved.target),
+        ...(resolved.reason ? { reason: resolved.reason } : {}), ...redactTarget(resolved.target) }, guidance };
+    }
+    if (!defaults.size || !defaults.mayMatch(clientID)) return current;
     const view = await bounded(watch(sessionID), waitMs);
     const entry = view && defaults.match({ directory: view.directory, client_id: clientID });
     if (!entry) return { ...current, default_available: view ? null : 'unknown' };
     const resolved = defaults.resolve(entry.name);
-    return { ...current, default_available: { default_target: entry.name, configured: Boolean(resolved.target), ...(resolved.reason ? { reason: resolved.reason } : {}),
-      url_host: resolved.target ? new URL(resolved.target.url).host : null },
-    guidance: current.opted_out ? 'This session opted out of the gateway default. Call set without url to re-attach it.' : 'Delegating with create/message/resume attaches it automatically; or call set without url.' };
+    return { ...current, default_available: { source: 'gateway_default', default_target: entry.name, configured: Boolean(resolved.target),
+      ...(resolved.reason ? { reason: resolved.reason } : {}), ...redactTarget(resolved.target) }, guidance };
+  }
+
+  // Test event (action test): to the session's effective target, or the one a
+  // delegation would attach; or (no session) to the client's own default.
+  // Sent now, outside the outbox, and not counted in delivery stats.
+  const lastTest = new Map();
+  async function test({ session_id: sessionID, client_id: clientID } = {}) {
+    const key = sessionID ? `s:${sessionID}` : `c:${clientID}`;
+    if (now() - (lastTest.get(key) ?? -Infinity) < 10000) return { error: 'test_rate_limited' };
+    let resolved, source;
+    if (!sessionID) {
+      if (clients.lookup(clientID).state !== 'present') return { error: 'no_client_default' };
+      resolved = clients.resolve(clientID); source = 'client_default';
+    } else {
+      const t = targets.get(sessionID);
+      if (t) { resolved = t.default_pending ? { reason: 'default_pending' } : effective(t); source = sourceOf(t); }
+      else {
+        const available = (await status(sessionID, { client_id: clientID })).default_available;
+        if (!available || available === 'unknown') return { error: 'no_target' };
+        source = available.source;
+        resolved = source === 'client_default' ? clients.resolve(clientID) : defaults.resolve(available.default_target);
+      }
+    }
+    if (!resolved.target) return { error: 'target_not_configured', source, ...(resolved.reason ? { reason: resolved.reason } : {}) };
+    lastTest.set(key, now());
+    if (lastTest.size > 1000) lastTest.delete(lastTest.keys().next().value);
+    const event = testNotifyEvent({ sessionID, serverId, scope: sessionID ? 'session' : 'client', now });
+    return { ...(sessionID ? { session_id: sessionID } : { client_id: clientID }), source, ...await sendTestEvent(resolved.target, event, { transport, now }) };
   }
 
   // The delegating agent started/continued work (message/resume/steer).
@@ -396,37 +614,39 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
     if (t.deferred && now() - (t.last_limited_at ?? 0) >= minInterval) { const { type, fields } = t.deferred; enqueue(t, sessionID, type, fields, { limited: true }); }
   }
 
+  // Reasons that mean "deliberately no receiver": drop instead of retrying.
+  const INERT = new Set(['url_not_configured', 'default_target_removed', 'default_pending', 'client_default_removed']);
   async function deliver(sessionID, t) {
     const ready = (t.outbox ?? []).filter(item => item.next_at <= now());
-    if (!ready.length) return;
-    const resolved = effective(t);
-    if (!resolved.target) {
-      // Inert target (e.g. placeholder secrets): drop, never queue unbounded.
-      t.outbox = t.outbox.filter(item => !ready.includes(item));
-      t.skipped = (t.skipped ?? 0) + ready.length;
-      t.last_delivery = { at: new Date(now()).toISOString(), event: ready.at(-1).event.type, ok: false, error: resolved.reason ?? 'not_configured' };
-      return;
-    }
-    const target = resolved.target;
     // At most 3 sends per target per tick; targets are delivered concurrently.
     for (const item of ready.slice(0, 3)) {
+      // Re-check per send: a clear/set during an awaited send must take effect.
+      if (targets.get(sessionID) !== t || !t.outbox.includes(item)) return;
+      const resolved = effective(t);
+      if (!resolved.target && INERT.has(resolved.reason)) {
+        // Inert target (e.g. placeholder secrets): drop, never queue unbounded.
+        const dropped = t.outbox.filter(entry => entry.next_at <= now());
+        t.outbox = t.outbox.filter(entry => !dropped.includes(entry));
+        t.skipped = (t.skipped ?? 0) + dropped.length;
+        t.last_delivery = { at: new Date(now()).toISOString(), event: item.event.type, ok: false, error: resolved.reason };
+        return;
+      }
       item.attempts++;
-      try {
-        const { body, contentType } = renderNotifyBody(item.event, target.format);
-        // Standard Webhooks: stable id across retries, fresh timestamp/signature per attempt.
-        const timestamp = String(Math.floor(now() / 1000));
-        const response = await transport(target.url, { body, headers: { 'Content-Type': contentType,
-          'User-Agent': 'workrelay-notify/1', 'X-Workrelay-Event': item.event.type, 'X-Workrelay-Event-Id': item.event.event_id,
-          ...(target.hmac_secret ? { 'webhook-id': item.event.event_id, 'webhook-timestamp': timestamp,
-            'webhook-signature': signStandardWebhook(target.hmac_secret, item.event.event_id, timestamp, body) } : {}),
-          ...(target.header_name ? { [target.header_name]: target.header_value } : {}) } });
-        const ok = response?.status >= 200 && response.status < 300;
-        t.last_delivery = { at: new Date(now()).toISOString(), event: item.event.type, ok, status: response?.status ?? null };
-        if (ok || response?.status >= 400 && response.status < 500 && response.status !== 429) {
-          t.outbox = t.outbox.filter(entry => entry !== item); t[ok ? 'delivered' : 'failed'] = (t[ok ? 'delivered' : 'failed'] ?? 0) + 1; continue;
+      if (!resolved.target) {
+        // Transient (secrets file unreadable/invalid): retry with backoff so a
+        // fixed file still delivers the ask/completion.
+        t.last_delivery = { at: new Date(now()).toISOString(), event: item.event.type, ok: false, error: resolved.reason ?? 'not_configured' };
+      } else {
+        try {
+          const status = await postNotifyEvent(resolved.target, item.event, { transport, now });
+          const ok = status >= 200 && status < 300;
+          t.last_delivery = { at: new Date(now()).toISOString(), event: item.event.type, ok, status };
+          if (ok || status >= 400 && status < 500 && status !== 429) {
+            t.outbox = t.outbox.filter(entry => entry !== item); t[ok ? 'delivered' : 'failed'] = (t[ok ? 'delivered' : 'failed'] ?? 0) + 1; continue;
+          }
+        } catch (error) {
+          t.last_delivery = { at: new Date(now()).toISOString(), event: item.event.type, ok: false, error: error?.data?.reason ?? 'network_error' };
         }
-      } catch (error) {
-        t.last_delivery = { at: new Date(now()).toISOString(), event: item.event.type, ok: false, error: error?.data?.reason ?? 'network_error' };
       }
       // Asks and completion retry for ~25 minutes; other events 3 times.
       const important = IMPORTANT.has(item.event.type.slice('workrelay.session.'.length));
@@ -449,6 +669,20 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
       return;
     }
     if (t.default_pending) { await resolvePending(sessionID, t, view); if (targets.get(sessionID) !== t || t.default_pending) return; }
+    else if (!t.url) {
+      // Re-check an automatic target against the current client defaults and
+      // config: a newly registered client listener takes over, a removed one
+      // falls back to the gateway default, and narrowed, renamed or removed
+      // gateway entries re-match or detach instead of lingering.
+      const own = clients.lookup(t.client_id);
+      const stallOf = entry => entry.stall_minutes ? entry.stall_minutes * MINUTE : undefined;
+      if (own.state === 'present') { if (!t.client_default || stallOf(own.entry) !== t.stall_ms) applyClient(t, t.client_id, own.entry); }
+      else if (!(own.state === 'error' && t.client_default)) {
+        const entry = defaults.match({ directory: view.directory, client_id: t.client_id });
+        if (!entry) { targets.delete(sessionID); return; }
+        if (t.client_default || entry.name !== t.default_name || stallOf(entry) !== t.stall_ms) applyDefault(t, entry, t.client_id);
+      }
+    }
     const at = now();
     t.directory = typeof view.directory === 'string' ? view.directory : null;
     t.project_id = typeof view.project_id === 'string' ? view.project_id : null;
@@ -523,7 +757,7 @@ export function createSessionNotifier({ watch, settings = {}, approvalUrl, serve
     } finally { running = false; }
   }
   let timer;
-  return { set, clear, get, status, attachDefault, armed, tick, hasDefaults: () => defaults.size > 0,
+  return { set, clear, get, status, test, attachDefault, armed, tick, hasDefaults, hasGatewayDefaults: () => defaults.size > 0, clients,
     size: () => targets.size,
     start() { if (!timer) { timer = setInterval(() => { void tick().catch(() => {}); }, settings.poll_interval_ms ?? 30000); timer.unref?.(); } },
     stop() { clearInterval(timer); timer = undefined; } };
