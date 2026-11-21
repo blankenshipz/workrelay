@@ -357,7 +357,9 @@ const START_DENIAL_HINTS = {
 const startDenialHint = code => START_DENIAL_HINTS[code] ?? 'Creation was denied before anything was sent; no session exists. Retry this exact call to make a fresh attempt.';
 // The pre-send queue observation never delays a send by more than this.
 const QUEUE_STATE_TIMEOUT_MS = Number(process.env.WORKRELAY_QUEUE_STATE_TIMEOUT_MS) > 0 ? Number(process.env.WORKRELAY_QUEUE_STATE_TIMEOUT_MS) : 4000;
-const startOperation = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
+// Suffixes -m (first message) and -c<n> (fresh create attempts) are derived
+// from the start operation; a caller ID ending in one could collide with them.
+const startOperation = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/).refine(value => !/-(c\d+|m)$/.test(value), 'operation_id must not end in -m or -c<n>');
 // Auto operation ID: the same client/agent/project/text/reuse on the same UTC day
 // is one operation, so a retry after a timeout never starts twice.
 export const startOperationID = ({ clientID, agent, projectID, text, reuse, day = new Date().toISOString().slice(0, 10) }) =>
@@ -628,9 +630,10 @@ function mcp(config, invoke, events, managedReader, eventTools, audit, notifier)
           const progress = (extra = {}) => startStore.record(null, opKey, { session_id: null, created: false, rolled_over_from: rolledOver, message: false, digest, create_attempt: createAttempt, ...extra });
           const createFailure = (output, extra = {}) => reply({ ...output, stage: 'create', operation_id: op, create_operation_id: startCreateOperationID(op, createAttempt), created: false, ...extra }, true);
           let confirmed = false;
-          // At most two create calls per start: a stale denied receipt from an
-          // earlier attempt is followed by exactly one fresh attempt.
-          for (let pass = 0; pass < 2 && !confirmed; pass++) {
+          // Stale denied receipts (exit 0, read-only: nothing new is created)
+          // are walked past even if the attempt counter was lost from the
+          // best-effort store; at most ONE fresh create is made per call.
+          while (!confirmed) {
             if (createAttempt >= START_MAX_CREATE_ATTEMPTS) return createFailure({ error: 'create_retry_limit',
               guidance: `Creation was denied ${START_MAX_CREATE_ATTEMPTS} times for this operation; nothing was created. Ask the operator to investigate, or pass a new operation_id.` });
             const createOp = startCreateOperationID(op, createAttempt);
@@ -648,7 +651,7 @@ function mcp(config, invoke, events, managedReader, eventTools, audit, notifier)
               // create operation so a retry cannot reuse the dead receipt.
               const denial = { denial_code: createResult.denial_code ?? 'DENIAL_REASON_NOT_RECORDED', ...(createResult.attestation_check_id ? { attestation_check_id: createResult.attestation_check_id } : {}) };
               const deniedOp = createOp; createAttempt += 1; progress();
-              if (deniedReceipt && pass === 0) continue; // stale denial from an earlier call: try fresh now
+              if (deniedReceipt) continue; // stale denial from an earlier call: move on to a fresh attempt
               return reply({ error: 'create_denied', ...denial, stage: 'create', operation_id: op, create_operation_id: deniedOp, created: false,
                 guidance: startDenialHint(denial.denial_code), retry: 'Retry this exact call (same arguments); it makes a fresh create attempt and never reuses the denied one.' }, true);
             }

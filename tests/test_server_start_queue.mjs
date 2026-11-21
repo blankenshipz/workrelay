@@ -328,3 +328,21 @@ test('start: persistent denial is bounded', async t => {
   assert.equal(out.error, 'create_retry_limit');
   const denied = native.deniedOps.size; assert.equal(denied, 20);
 });
+
+test('start: a lost attempt counter walks past stale denied receipts (one fresh create per call); derived suffixes are rejected', async t => {
+  const { call, invoked, native, startFile } = await setup(t, { notify: false });
+  native.denyCreates = 2;
+  const a = (await call('workrelay_server_start', { project: 'Scanner', agent: 'L', text: 'x' })).result.structuredContent;
+  const b = (await call('workrelay_server_start', { project: 'Scanner', agent: 'L', text: 'x' })).result.structuredContent;
+  assert.equal(a.create_operation_id, a.operation_id); assert.equal(b.create_operation_id, a.operation_id + '-c1');
+  await fs.writeFile(startFile, JSON.stringify({ version: 1, latest: {}, ops: {} }), { mode: 0o600 }); // counter lost
+  const before = invoked.length;
+  const ok = (await call('workrelay_server_start', { project: 'Scanner', agent: 'L', text: 'x' })).result.structuredContent;
+  assert.equal(ok.created, true, JSON.stringify(ok)); assert.equal(ok.create_operation_id, a.operation_id + '-c2');
+  const op = a.operation_id;
+  assert.deepEqual(invoked.slice(before).map(input => input.operation_id), [op, op + '-c1', op + '-c2', op + '-m']);
+  for (const bad of ['job-m', 'job-c3']) {
+    const refused = await call('workrelay_server_start', { project: 'Scanner', agent: 'L', text: 'y', operation_id: bad });
+    assert.equal(refused.result.isError, true, bad);
+  }
+});

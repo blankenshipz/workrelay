@@ -10,7 +10,10 @@
   - A create denied before sending returns `error: "create_denied"` with `denial_code`, a per-code `guidance` hint and `create_operation_id`; nothing is recorded as reusable.
   - A retry makes a fresh create attempt (`<operation_id>-c<n>`, at most 20) instead of reusing the denied, never-created session. A store entry left by 0.4.0 pointing at such a session is repaired on the next call.
   - Uncertain, concurrently reserved or unconfirmed creates still reconcile the same create operation (never a duplicate session).
+  - Stale denied receipts are walked past even if the attempt counter in `server-start.json` was lost; at most one fresh create is made per call.
+  - Caller `operation_id` values ending in `-m` or `-c<n>` are rejected (they could collide with derived IDs).
   - `reuse: true` drops a latest session that no longer exists (native 404) and starts fresh (`rolled_over_from.reason: "gone"`). A session that is only unreadable right now still returns `reuse_session_unreadable`.
+- Managed create: a derived session that already exists natively before POST (e.g. ledger row lost) is now marked `uncertain` and reconciled, not denied, so it can never be mistaken for an absent session.
 
 ## 0.4.0 - 2026-11-20
 

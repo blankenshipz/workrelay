@@ -982,6 +982,17 @@ class CreationTests(unittest.TestCase):
         with self.assertRaises(BridgeError): self.create()
         self.assertEqual(sum(m == 'POST' for m, _, _ in self.calls), 1)
 
+    def test_preexisting_native_identity_is_uncertain_not_denied(self):
+        # r28: ledger row lost/restored while the derived session exists natively.
+        result = self.create(op='lost-ledger')
+        self.db.execute('DELETE FROM managed_operations')
+        posts = sum(m == 'POST' for m, _, _ in self.calls)
+        with self.assertRaises(BridgeError): self.create(op='lost-ledger')
+        row = self.db.execute("SELECT phase,denial_code FROM managed_operations WHERE operation='lost-ledger'").fetchone()
+        self.assertEqual(row, ('uncertain', None), 'never a denied receipt for an existing session')
+        self.assertEqual(self.create(op='lost-ledger'), {**result, 'phase': 'created'})
+        self.assertEqual(sum(m == 'POST' for m, _, _ in self.calls), posts, 'reconciled, never re-POSTed')
+
     def test_workspace_project_revocation_and_identity_denied(self):
         for args in ({'directory': '/'}, {'project_id': 'other'}):
             with self.assertRaises(BridgeError): self.create(**args)

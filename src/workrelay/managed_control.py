@@ -831,11 +831,18 @@ def create_session(db, config, client, authorize, operation_id, *, directory=Non
                     current.get('canonical') == project_root and
                     str(Path(project_root).resolve()) == project_root and str(Path(directory).resolve()) == directory):
                 raise GuardFailure('CREATE_PROJECT_WORKSPACE_MISMATCH')
-        require(get('/api/session/' + sid) is None, 'creation identity already exists')
+        identity_exists = get('/api/session/' + sid) is not None
         check()
     except Exception as exc:
         record_denial(db, binding, sid, operation_id, exc)
         raise
+    if identity_exists:
+        # The derived session already exists natively (e.g. the ledger row was
+        # lost or restored). That is not a pre-POST denial: a 'denied' receipt
+        # would let callers treat the session as absent and create another.
+        # Mark it uncertain so the same operation ID reconciles and verifies it.
+        db.execute("UPDATE managed_operations SET phase='uncertain' WHERE binding=? AND session=? AND operation=? AND phase='reserved'", (binding, sid, operation_id))
+        raise BridgeError('creation identity already exists; reconcile same operation ID, never blindly replay')
     db.execute("UPDATE managed_operations SET phase='sending' WHERE binding=? AND session=? AND operation=?", (binding, sid, operation_id))
     try:
         check(); reply = client.request('POST', '/api/session', body); check()
