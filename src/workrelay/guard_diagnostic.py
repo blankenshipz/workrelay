@@ -44,3 +44,61 @@ def plugin_evidence(guard):
             'state': status if type(status) is str and status in STATES else 'missing' if status is None else 'other'})
     except Exception:
         return None
+
+
+# UNEXPECTED_PREPOST evidence (r28). The denial code is the catch-all for any
+# non-guard exception before POST; record WHICH exception class, transport
+# failure kind and workrelay code site raised it. Only allowlisted class
+# names, a finite transport reason and this package's own module/function
+# names and line numbers are kept: never exception text, paths, IDs or data.
+EXCEPTIONS = frozenset(('BridgeError', 'TransportFailure', 'GuardFailure', 'ControlFailure', 'OperationLookupError',
+    'AttestationError', 'SupervisionError', 'ValueError', 'JSONDecodeError', 'KeyError', 'TypeError', 'AttributeError',
+    'IndexError', 'LookupError', 'UnicodeError', 'UnicodeDecodeError', 'OSError', 'FileNotFoundError', 'PermissionError',
+    'TimeoutError', 'TimeoutExpired', 'CalledProcessError', 'ConnectionError', 'RecursionError', 'OverflowError',
+    'ZeroDivisionError', 'NotImplementedError', 'RuntimeError', 'AssertionError', 'OperationalError',
+    'IntegrityError', 'DatabaseError', 'ProgrammingError'))
+TRANSPORT_REASONS = frozenset(('transport_timeout', 'transport_os_error', 'transport_exit', 'transport_output_too_large',
+    'transport_output_not_json', 'transport_response_malformed', 'native_http_status'))
+MODULES = frozenset(('cli', 'managed_control', 'attestor', 'supervision', 'guard_diagnostic', 'provider_diagnostic',
+    'event_store', 'oidc_store'))
+
+
+def _identifier(value):
+    return type(value) is str and 0 < len(value) <= 64 and value.isascii() and (value.isidentifier() or value == '<module>')
+
+
+def sanitize_unexpected(value):
+    try:
+        if not isinstance(value, dict) or value.get('reason') != 'unexpected_prepost':
+            return None
+        exception, transport, frames = value.get('exception'), value.get('transport'), value.get('frames')
+        clean = []
+        for frame in frames if isinstance(frames, list) else []:
+            if not isinstance(frame, dict):
+                continue
+            module, function, line = frame.get('module'), frame.get('function'), frame.get('line')
+            if type(module) is str and module in MODULES and _identifier(function) and type(line) is int and 0 < line <= 100000:
+                clean.append({'module': module, 'function': function, 'line': line})
+        return {'version': 1, 'reason': 'unexpected_prepost',
+                'exception': exception if type(exception) is str and exception in EXCEPTIONS else 'other',
+                'transport': transport if type(transport) is str and transport in TRANSPORT_REASONS else None,
+                'frames': clean[-4:]}
+    except Exception:
+        return None
+
+
+def unexpected_evidence(error):
+    """Class/site evidence for a non-guard pre-POST exception; never its text."""
+    try:
+        import traceback
+        from pathlib import Path
+        package = Path(__file__).resolve().parent
+        frames = []
+        for frame in traceback.extract_tb(getattr(error, '__traceback__', None)):
+            path = Path(frame.filename).resolve()
+            if path.parent == package and path.suffix == '.py':
+                frames.append({'module': path.stem, 'function': frame.name, 'line': frame.lineno})
+        return sanitize_unexpected({'reason': 'unexpected_prepost', 'exception': type(error).__name__,
+                                    'transport': getattr(error, 'transport_reason', None), 'frames': frames})
+    except Exception:
+        return None

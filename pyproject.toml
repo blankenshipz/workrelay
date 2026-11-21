@@ -1,6 +1,6 @@
 [project]
 name = "workrelay"
-version = "0.4.0"
+version = "0.4.1"
 description = "Connect personal agents to OpenCode"
 requires-python = ">=3.10"
 

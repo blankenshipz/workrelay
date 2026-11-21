@@ -337,6 +337,9 @@ print(json.dumps(r))`;
   return reader(['/__managed/authorize', '/__managed/authorize-create-project'].includes(input.path) && input.method === 'GET' && input.body === null ? 'authorize' : 'internal', input, authority.claims, observe);
 }
 
+const writeFully = (text, stream = process.stdout) => new Promise((resolve, reject) =>
+  stream.write(text, error => error ? reject(error) : resolve()));
+
 let providerDiagnostic;
 try {
   const config = JSON.parse(readFileSync(process.argv[2], 'utf8'));
@@ -356,7 +359,11 @@ try {
     const data = await managedRequest(input, config, (stage, action, status) => {
       if (providerDiagnostic && stage === 'native_status' && ['internal', 'attestation_metadata'].includes(action) && Number.isInteger(status) && status >= 100 && status <= 599) providerDiagnostic.http_status = status;
     });
-    process.stdout.write(JSON.stringify({ status: data === null ? 404 : 200, data, ...(providerDiagnostic ? { provider_diagnostic: providerDiagnostic } : {}) }));
+    // stdout to a pipe is asynchronous: exiting before the write drains
+    // truncates any response over the 64 KiB pipe buffer (e.g. an agent
+    // definition with a large permission ruleset), which surfaced as
+    // UNEXPECTED_PREPOST on create. Exit only after the write is flushed.
+    await writeFully(JSON.stringify({ status: data === null ? 404 : 200, data, ...(providerDiagnostic ? { provider_diagnostic: providerDiagnostic } : {}) }));
     process.exit(0);
   }
   const headers = { ...module.headers(endpoint), 'content-type': 'application/json' };

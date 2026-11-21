@@ -35,6 +35,13 @@ CONTROL_DENIAL_CODES = frozenset({
 })
 
 
+class TransportFailure(BridgeError):
+    """Guarded transport failure with a finite, secret-free reason for diagnostics."""
+    def __init__(self, message, reason):
+        super().__init__(message)
+        self.transport_reason = reason
+
+
 class GuardFailure(BridgeError):
     """Closed diagnostic at an explicit guard branch; no native error text."""
     def __init__(self, code, *, attestation_check_id=None):
@@ -145,10 +152,16 @@ class InstalledClient:
                         '/api/provider/anthropic': '/__managed/attestation-provider',
                         '/api/integration/anthropic': '/__managed/attestation-integration',
                         '/api/model': '/__managed/attestation-models'}.get(path, path)
-            result = subprocess.run([self.config["node_executable"], self.script, self.config["_private_path"]],
-                input=json.dumps({"method": method, "path": path, "body": body,
-                                  **self.config.get("_supervision_authority", {})}),
-                capture_output=True, text=True, timeout=20)
+            unavailable = "guarded local service request unavailable"
+            try:
+                result = subprocess.run([self.config["node_executable"], self.script, self.config["_private_path"]],
+                    input=json.dumps({"method": method, "path": path, "body": body,
+                                      **self.config.get("_supervision_authority", {})}),
+                    capture_output=True, text=True, timeout=20)
+            except subprocess.TimeoutExpired:
+                raise TransportFailure(unavailable, 'transport_timeout') from None
+            except OSError:
+                raise TransportFailure(unavailable, 'transport_os_error') from None
             if provider_request:
                 try:
                     diagnostic = json.loads(result.stdout).get('provider_diagnostic')
@@ -156,17 +169,29 @@ class InstalledClient:
                     self._provider_http_status = status if type(status) is int and 100 <= status <= 599 else None
                 except Exception:
                     pass
-            require(result.returncode == 0 and len(result.stdout) <= 2_000_000,
-                    "guarded local service request unavailable")
-            response = json.loads(result.stdout)
+            if result.returncode != 0:
+                raise TransportFailure(unavailable, 'transport_exit')
+            if len(result.stdout) > 2_000_000:
+                raise TransportFailure(unavailable, 'transport_output_too_large')
+            try:
+                response = json.loads(result.stdout)
+            except ValueError:
+                # e.g. truncated stdout from the transport (r28: >64 KiB pipe).
+                raise TransportFailure(unavailable, 'transport_output_not_json') from None
+            if not isinstance(response, dict) or "status" not in response:
+                raise TransportFailure(unavailable, 'transport_response_malformed')
             status = response["status"]
             if status == 404 and method == "GET":
                 return None
-            require(isinstance(status, int) and 200 <= status < 300,
-                    "OpenCode request failed (HTTP response)")
+            if not (isinstance(status, int) and 200 <= status < 300):
+                raise TransportFailure("OpenCode request failed (HTTP response)", 'native_http_status')
+            if "data" not in response:
+                raise TransportFailure(unavailable, 'transport_response_malformed')
             return response["data"]
-        except (OSError, subprocess.TimeoutExpired, ValueError, KeyError):
-            raise BridgeError("guarded local service request unavailable") from None
+        except (OSError, subprocess.TimeoutExpired):
+            raise TransportFailure("guarded local service request unavailable", 'transport_os_error') from None
+        except (ValueError, KeyError):
+            raise TransportFailure("guarded local service request unavailable", 'transport_response_malformed') from None
 
 
 def admission(config, client):

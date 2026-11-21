@@ -68,8 +68,10 @@ def record_denial(db, binding, session_id, operation_id, error):
     # Optional evidence is separate from the authoritative atomic denial update.
     # The row key and denied_at_ms provide exact operation/session correlation.
     try:
-        from .guard_diagnostic import sanitize
+        from .guard_diagnostic import sanitize, unexpected_evidence
         diagnostic = sanitize(getattr(error, 'guard_diagnostic', None)) if updated.rowcount == 1 and detail == 'GUARD_PLUGIN_STATE' else None
+        if updated.rowcount == 1 and code == 'UNEXPECTED_PREPOST':
+            diagnostic = unexpected_evidence(error)
         if diagnostic is not None:
             db.execute("UPDATE managed_operations SET guard_diagnostic=? WHERE binding=? AND session=? AND operation=? AND phase='denied' AND guard_diagnostic IS NULL",
                        (json.dumps(diagnostic, sort_keys=True), binding, session_id, operation_id))

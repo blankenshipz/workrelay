@@ -112,7 +112,7 @@ test('managed create model is the target agent default, independently re-resolve
   const other = root + '/other'; await mkdir(other, { mode: 0o700 });
   const profileModel = { providerID: 'anthropic', id: 'claude-haiku-5-5', variant: 'default' };
   const opus = { providerID: 'anthropic', id: 'claude-opus-5-5', variant: 'high' };
-  let agentModel = opus, agentID = 'harness-router', agentStatus = 200, posts = 0;
+  let agentModel = opus, agentID = 'harness-router', agentStatus = 200, posts = 0, agentPermission;
   const agentReads = [];
   const server = createServer(async (req, res) => {
     res.setHeader('content-type', 'application/json');
@@ -121,7 +121,8 @@ test('managed create model is the target agent default, independently re-resolve
     if (req.url.startsWith('/api/agent/')) {
       agentReads.push(req.url);
       if (agentStatus !== 200) { res.statusCode = agentStatus; return res.end(); }
-      return res.end(JSON.stringify({ location: { directory }, data: { id: agentID, ...(agentModel === undefined ? {} : { model: agentModel }) } }));
+      return res.end(JSON.stringify({ location: { directory }, data: { id: agentID, ...(agentModel === undefined ? {} : { model: agentModel }),
+        ...(agentPermission ? { permission: agentPermission } : {}) } }));
     }
     if (req.url === '/api/session' && req.method === 'POST') { posts++; let text = ''; for await (const chunk of req) text += chunk; return res.end(JSON.stringify({ data: { ...JSON.parse(text), projectID: 'current' } })); }
     res.statusCode = 404; res.end();
@@ -152,6 +153,21 @@ test('managed create model is the target agent default, independently re-resolve
 
     // Reserved create: exact configured agent at an authorized location only.
     const read = await invoke(agentGet(directory)); assert.equal(read.code, 0); assert.deepEqual(JSON.parse(read.out).data.data.model, opus);
+    // Regression (r28): a large agent definition (thousands of permission
+    // rules) must reach the caller whole, not truncated at the 64 KiB pipe buffer.
+    agentPermission = Array.from({ length: 4000 }, (_, i) => ({ permission: 'bash', pattern: `command-${i} --with-a-longer-wrapped-pattern *`, action: 'ask' }));
+    // Production callers (Python subprocess) read through a real OS pipe; Node's
+    // own spawn uses a socketpair with a larger buffer, so pipe through cat.
+    const large = await new Promise(resolve => {
+      const child = spawn('/bin/sh', ['-c', 'set -o pipefail 2>/dev/null; "$0" "$1" "$2" | cat', process.execPath,
+        fileURLToPath(new URL('../src/workrelay/transport.mjs', import.meta.url)), root + '/config.json'], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, NODE_NO_WARNINGS: '1' } });
+      let out = ''; child.stdout.on('data', chunk => { out += chunk; });
+      child.stdin.end(JSON.stringify({ ...agentGet(directory), managed: { session_id: sid, operation_id: operation, claims } })); child.on('close', code => resolve({ code, out }));
+    });
+    assert.equal(large.code, 0);
+    assert.ok(JSON.stringify(agentPermission).length > 2 * 65536, "fixture must exceed the pipe buffer");
+    assert.equal(JSON.parse(large.out).data.data.permission.length, 4000); assert.deepEqual(JSON.parse(large.out).data.data.model, opus);
+    agentPermission = undefined;
     const reads = agentReads.length;
     for (const denied of [agentGet(other), agentGet(directory, 'harness-builder'), agentGet('relative'),
       { ...agentGet(directory), path: agentGet(directory).path + '&location%5Bdirectory%5D=' + encodeURIComponent(other) },

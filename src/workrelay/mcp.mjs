@@ -341,6 +341,20 @@ const notifyFailure = reason => ({ isError: true, content: [{ type: 'text', text
 
 // workrelay_server_start: reuse rolls over to a fresh session above this context size.
 export const START_ROLLOVER_TOKENS = 150000;
+// A denied create never POSTed, so a retry may safely try a fresh create
+// operation (`<op>-c<n>`); bounded so a persistent denial cannot grow the ledger.
+export const START_MAX_CREATE_ATTEMPTS = 20;
+export const startCreateOperationID = (op, attempt) => attempt > 0 ? `${op}-c${attempt}` : op;
+const START_DENIAL_HINTS = {
+  UNEXPECTED_PREPOST: 'An unexpected error stopped creation before anything was sent; no session exists. Retry this exact call to make a fresh attempt. If it repeats, ask the operator to check the managed-control ledger guard_diagnostic for this create_operation_id.',
+  CREATE_CAPACITY_DENIED: 'Too many creations are pending for this server. Wait for them to settle, then retry this exact call.',
+  CREATE_PROJECT_WORKSPACE_MISMATCH: 'The project no longer matches its workspace on the server. Re-resolve the project with workrelay_server_projects, then retry.',
+  ATTESTATION_FAILED: 'The guarded model route could not be verified, so nothing was created. Retry shortly (the server may still be loading plugins); if it repeats, the operator must check the guard.',
+  QUOTA_DENIED: 'Included quota admission denied the creation; no paid fallback is used. Retry later.',
+  QUOTA_UNAVAILABLE: 'Quota state is unavailable; nothing was created. Retry shortly.',
+  AUTHORITY_UNAVAILABLE_OR_CHANGED: 'Managed authority changed during creation; nothing was created. Retry this exact call.',
+};
+const startDenialHint = code => START_DENIAL_HINTS[code] ?? 'Creation was denied before anything was sent; no session exists. Retry this exact call to make a fresh attempt.';
 // The pre-send queue observation never delays a send by more than this.
 const QUEUE_STATE_TIMEOUT_MS = Number(process.env.WORKRELAY_QUEUE_STATE_TIMEOUT_MS) > 0 ? Number(process.env.WORKRELAY_QUEUE_STATE_TIMEOUT_MS) : 4000;
 const startOperation = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
@@ -356,20 +370,31 @@ function createStartStore(file) {
     catch { return { version: 1, latest: {}, ops: {} }; }
   };
   const trim = (map, max) => Object.fromEntries(Object.entries(map).sort((a, b) => (a[1].at ?? 0) - (b[1].at ?? 0)).slice(-max));
+  const save = data => { try { writePrivateJSON(file, { version: 1, latest: trim(data.latest, 500), ops: trim(data.ops, 2000) }); } catch { /* reuse is best effort */ } };
   return {
     latest: key => file ? load().latest[key] : undefined,
     op: key => file ? load().ops[key] : undefined,
+    // Only a confirmed (native-readable) session may become "latest". A null
+    // latestKey records the operation's progress (e.g. a denied create
+    // attempt) without naming any session as reusable.
     record(latestKey, opKey, entry) {
       if (!file) return;
       const data = load(); const at = Date.now();
-      data.latest[latestKey] = { session_id: entry.session_id, at };
+      if (latestKey !== null && typeof entry.session_id === 'string') data.latest[latestKey] = { session_id: entry.session_id, at };
       data.ops[opKey] = { ...entry, at };
-      try { writePrivateJSON(file, { version: 1, latest: trim(data.latest, 500), ops: trim(data.ops, 2000) }); } catch { /* reuse is best effort */ }
+      save(data);
+    },
+    // Drop a latest entry, only if it still names this (gone) session.
+    forgetLatest(latestKey, sessionID) {
+      if (!file) return;
+      const data = load();
+      if (data.latest[latestKey]?.session_id !== sessionID) return;
+      delete data.latest[latestKey]; save(data);
     },
   };
 }
 function mcp(config, invoke, events, managedReader, eventTools, audit, notifier) {
-  const server = new McpServer({ name: 'workrelay', version: '0.4.0' },
+  const server = new McpServer({ name: 'workrelay', version: '0.4.1' },
     { ...(events ? { capabilities: { events: {} } } : {}),
       instructions: managedReader ? 'To start work in one call use workrelay_server_start {project, agent, text}; it returns session_id, status and queued_behind. Otherwise start with workrelay_server_discover({}) for explicitly authorized managed-server access, or workrelay_discover({}) for ordinary scoped work. Only a human operator answers permission asks; message/steer/resume report queued_behind ask|busy so you know your input is waiting. Server tools verify the pinned principal and client on every call. No enrollment is needed for approved server access. Message queues to the existing owner with native approvals and financial admission; interrupt is not rollback and does not cancel descendants. Reuse operation_id and identical inputs after uncertainty; do not blindly replay. When Events are enabled, session.completed/session.failed/session.needs_input accept the returned server_id and optional session_id; omitting session_id monitors the bound server. Events reconcile observed state, not transcript/history; idle is not completion and does not establish that a child completed before its parent became idle. Unsubscribe stops monitoring, not ordinary work.' + (notifier ? NOTIFY_ONBOARDING : '') :
         'Start with workrelay_discover({}) when asked to show available work. It needs no task key or grant ID. Follow returned actions and next_offset. Runs and enrolled sessions are not agent definitions. Never infer access to unlisted sessions.' });
@@ -563,10 +588,26 @@ function mcp(config, invoke, events, managedReader, eventTools, audit, notifier)
         if (previous && previous.digest !== undefined && previous.digest !== digest) return reply({ error: 'operation_id_conflict', operation_id: op,
           guidance: 'This operation_id was already used with different text, title or reuse. Use a new operation_id (or omit it) for new work.' });
         const replayed = previous?.message === true;
-        let sessionID = previous?.session_id, created = previous?.created ?? false, rolledOver = previous?.rolled_over_from ?? null, contextTokens = null;
+        let sessionID = previous?.session_id ?? undefined, created = previous?.created ?? false, rolledOver = previous?.rolled_over_from ?? null, contextTokens = null;
+        let createAttempt = Number.isSafeInteger(previous?.create_attempt) && previous.create_attempt >= 0 ? previous.create_attempt : 0;
+        // null = gone (native 404), undefined = unknown right now, true = readable.
+        const sessionExists = async id => {
+          try { const found = await managedReader('session_exists', { session_id: id }, claims); return found?.exists === true ? true : found?.exists === false ? false : undefined; }
+          catch { return undefined; }
+        };
+        // An operation bound to an existing (reused) session that was never
+        // messaged and is now gone is re-decided: nothing was sent to it.
+        if (sessionID && !created && !replayed && await sessionExists(sessionID) === false) {
+          startStore.forgetLatest(latestKey, sessionID); sessionID = undefined;
+        }
         if (!sessionID && reuse) {
           const latest = startStore.latest(latestKey)?.session_id;
-          if (latest) {
+          const exists = latest ? await sessionExists(latest) : undefined;
+          if (latest && exists === false) {
+            // Gone natively (deleted, or never actually created): drop it and start fresh.
+            startStore.forgetLatest(latestKey, latest);
+            rolledOver = { session_id: latest, reason: 'gone', context_tokens: null };
+          } else if (latest) {
             let info;
             try { await managedReader('session_check', { session_id: latest }, claims); info = await managedReader('session_context', { session_id: latest }, claims); }
             catch { return reply({ error: 'reuse_session_unreadable', operation_id: op, session_id: latest,
@@ -580,22 +621,55 @@ function mcp(config, invoke, events, managedReader, eventTools, audit, notifier)
           if (sessionID) startStore.record(latestKey, opKey, { session_id: sessionID, created: false, rolled_over_from: null, message: false, digest });
         }
         if (!sessionID || (created && !previous?.message)) {
-          // A new session (or a retry of one whose create was recorded).
-          const result = await invoke(config, 'managed-control', { operation_id: op, project_id: target.native_project_id,
-            title: title ?? (body.split('\n').find(line => line.trim()) ?? body).trim().slice(0, 80), action: 'create', claims });
-          const createResult = result?.error ? safeControlFailure(result) : safeControlResult(result);
-          if (createResult?.error || typeof createResult?.session_id !== 'string') return reply({ ...(createResult ?? { error: 'create_failed' }), stage: 'create', operation_id: op,
-            guidance: 'Retry this exact call (same arguments) to reconcile; it never creates twice.' }, true);
-          sessionID = createResult.session_id; created = true;
-          startStore.record(latestKey, opKey, { session_id: sessionID, created: true, rolled_over_from: rolledOver, message: false, digest });
+          // A new session (or a retry of one whose create was recorded). The
+          // session is recorded as created/latest ONLY after the create receipt
+          // says 'created' and the session is natively readable.
+          const createTitle = title ?? (body.split('\n').find(line => line.trim()) ?? body).trim().slice(0, 80);
+          const progress = (extra = {}) => startStore.record(null, opKey, { session_id: null, created: false, rolled_over_from: rolledOver, message: false, digest, create_attempt: createAttempt, ...extra });
+          const createFailure = (output, extra = {}) => reply({ ...output, stage: 'create', operation_id: op, create_operation_id: startCreateOperationID(op, createAttempt), created: false, ...extra }, true);
+          let confirmed = false;
+          // At most two create calls per start: a stale denied receipt from an
+          // earlier attempt is followed by exactly one fresh attempt.
+          for (let pass = 0; pass < 2 && !confirmed; pass++) {
+            if (createAttempt >= START_MAX_CREATE_ATTEMPTS) return createFailure({ error: 'create_retry_limit',
+              guidance: `Creation was denied ${START_MAX_CREATE_ATTEMPTS} times for this operation; nothing was created. Ask the operator to investigate, or pass a new operation_id.` });
+            const createOp = startCreateOperationID(op, createAttempt);
+            const result = await invoke(config, 'managed-control', { operation_id: createOp, project_id: target.native_project_id, title: createTitle, action: 'create', claims });
+            const createResult = result?.error ? safeControlFailure(result) : safeControlResult(result);
+            const deniedReceipt = !createResult?.error && createResult?.phase === 'denied';
+            // CONTROL_NOT_SENT also covers a live 'reserved' row (another call
+            // mid-create): only a recorded denial code proves the ledger row is
+            // 'denied', i.e. it never POSTed and never will.
+            const deniedNow = Boolean(createResult?.error) && createResult.code === 'CONTROL_NOT_SENT' &&
+              CONTROL_DENIAL_CODES.includes(createResult.denial_code);
+            if (deniedNow || deniedReceipt) {
+              // Denied before POST: no session exists and none will. Never
+              // record its derived session ID; the next attempt uses a fresh
+              // create operation so a retry cannot reuse the dead receipt.
+              const denial = { denial_code: createResult.denial_code ?? 'DENIAL_REASON_NOT_RECORDED', ...(createResult.attestation_check_id ? { attestation_check_id: createResult.attestation_check_id } : {}) };
+              const deniedOp = createOp; createAttempt += 1; progress();
+              if (deniedReceipt && pass === 0) continue; // stale denial from an earlier call: try fresh now
+              return reply({ error: 'create_denied', ...denial, stage: 'create', operation_id: op, create_operation_id: deniedOp, created: false,
+                guidance: startDenialHint(denial.denial_code), retry: 'Retry this exact call (same arguments); it makes a fresh create attempt and never reuses the denied one.' }, true);
+            }
+            if (createResult?.error || typeof createResult?.session_id !== 'string') return createFailure({ ...(createResult ?? { error: 'create_failed' }),
+              guidance: createResult?.code === 'CONTROL_UNCERTAIN' ? 'Creation may or may not have happened. Retry this exact call (same arguments) to reconcile; it never creates twice.' :
+                'Creation was not established. Retry this exact call (same arguments).' });
+            if (createResult.phase !== 'created') return createFailure({ error: 'create_unconfirmed', phase: typeof createResult.phase === 'string' ? createResult.phase : null,
+              guidance: 'The create receipt is not confirmed yet; nothing was sent. Retry this exact call (same arguments) to reconcile; it never creates twice.' });
+            if (await sessionExists(createResult.session_id) !== true) return createFailure({ error: 'create_unconfirmed', phase: 'created',
+              guidance: 'The new session could not be read back yet; nothing was sent. Retry this exact call (same arguments) to reconcile.' });
+            sessionID = createResult.session_id; created = true; confirmed = true;
+            startStore.record(latestKey, opKey, { session_id: sessionID, created: true, rolled_over_from: rolledOver, message: false, digest, create_attempt: createAttempt });
+          }
         }
         const queue = created && !replayed ? { queued_behind: null } : await queueStateFor(sessionID, claims);
         const result = await invoke(config, 'managed-control', { session_id: sessionID, operation_id: `${op}-m`, text: body, action: 'message', claims });
         let output = result?.error ? safeControlFailure(result) : safeControlResult(result);
         if (output?.error) return reply({ ...output, stage: 'message', operation_id: op, session_id: sessionID, created,
           guidance: 'The session exists; retry this exact call (same arguments) to reconcile the first message. It never creates or sends twice.' }, true);
-        startStore.record(latestKey, opKey, { session_id: sessionID, created, rolled_over_from: rolledOver, message: true, digest });
-        output = { operation_id: op, session_id: sessionID, status: output.phase ?? 'unknown', created, reused: !created,
+        startStore.record(latestKey, opKey, { session_id: sessionID, created, rolled_over_from: rolledOver, message: true, digest, create_attempt: createAttempt });
+        output = { operation_id: op, ...(created && createAttempt > 0 ? { create_operation_id: startCreateOperationID(op, createAttempt) } : {}), session_id: sessionID, status: output.phase ?? 'unknown', created, reused: !created,
           ...(replayed ? { replayed: true, replay_guidance: 'This exact start was already sent (same operation_id; the automatic one covers identical agent/project/text/reuse on the same UTC day); nothing new was sent. Pass a new operation_id to send the same text again.' } : {}),
           ...(rolledOver ? { rolled_over_from: rolledOver } : {}), ...(!created && contextTokens !== null ? { context_tokens: contextTokens } : {}),
           project: { project_id: target.project_id, label: target.label }, message: output, ...queueFields(queue, 'message'),

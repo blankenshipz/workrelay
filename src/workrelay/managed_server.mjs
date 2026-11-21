@@ -465,6 +465,24 @@ export function createManagedReader(expected, readBinding, { loadService = path 
         age_source: lastUser ? 'last_user_message' : 'unknown' };
       return { queued_behind: null };
     }
+    if (action === 'session_exists') {
+      // workrelay_server_start bookkeeping only: distinguish a session that is
+      // gone (native 404) from one that is merely unreadable right now. Returns
+      // a boolean, never session data; any other failure denies (fail closed).
+      if (!sid.test(input.session_id ?? '')) deny();
+      const response = await fetcher(new URL('/api/session/' + input.session_id, endpoint.url), { method: 'GET',
+        headers: service.headers(endpoint), redirect: 'manual', signal: AbortSignal.timeout(10000) });
+      if (response.status === 404) { await response.body?.cancel(); stillBound(); return { exists: false }; }
+      if (!response.ok) { await response.body?.cancel(); deny(); }
+      const stream = response.body.getReader(); const parts = []; let bytes = 0;
+      try { while (true) { const part = await stream.read(); if (part.done) break; bytes += part.value.length; if (bytes > 2000000) deny(); parts.push(part.value); } }
+      finally { await stream.cancel(); }
+      let session;
+      try { session = JSON.parse(Buffer.concat(parts).toString('utf8'))?.data; } catch { deny(); }
+      stillBound();
+      if (session?.id !== input.session_id) deny();
+      return { exists: true };
+    }
     if (action === 'session_context') {
       // Reuse check for workrelay_server_start: project, liveness and context size.
       if (!sid.test(input.session_id ?? '')) deny();

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.4.1 - 2026-11-20
+
+- Fix: managed create failed with `UNEXPECTED_PREPOST` whenever the target agent definition was larger than 64 KiB (e.g. a harness profile with a large permission ruleset). The guarded transport exited before its stdout pipe drained, truncating the response at 65536 bytes. It now exits only after the write is flushed.
+- Diagnostics: an `UNEXPECTED_PREPOST` denial now records secret-free evidence in the ledger `guard_diagnostic` column: the exception class (allowlisted, else `other`), a finite transport failure reason (`transport_output_not_json`, `transport_timeout`, ...) and the workrelay module/function/line sites. Never exception text, paths or IDs.
+- `workrelay_server_start` records a session as created (and as the agent's latest) only after the create receipt is `created` and the session is natively readable.
+  - A create denied before sending returns `error: "create_denied"` with `denial_code`, a per-code `guidance` hint and `create_operation_id`; nothing is recorded as reusable.
+  - A retry makes a fresh create attempt (`<operation_id>-c<n>`, at most 20) instead of reusing the denied, never-created session. A store entry left by 0.4.0 pointing at such a session is repaired on the next call.
+  - Uncertain, concurrently reserved or unconfirmed creates still reconcile the same create operation (never a duplicate session).
+  - `reuse: true` drops a latest session that no longer exists (native 404) and starts fresh (`rolled_over_from.reason: "gone"`). A session that is only unreadable right now still returns `reuse_session_unreadable`.
+
 ## 0.4.0 - 2026-11-20
 
 - `workrelay_server_message`/`steer`/`resume` now return `queued_behind`: `"ask"` when a live permission ask anywhere in the session tree is pending (only a human operator can answer it), `"busy"` when the session or a child is running, or `null`. Non-null values carry `queued_age_seconds` and `queued_age_source`. For `"ask"` there is also `queued_ask`, with the permission id, the session, the agent, whether it is in a child session, a short redacted summary (at most 120 characters), `parked`, and who can answer it. The state is observed just before the send, from the OpenCode session, active-run and permission APIs. When the harness park log `<harness_state_dir>/telemetry/permission-park.jsonl` exists, it is read (tail only, owner-only file) to mark the ask `parked` and to date it. Otherwise the ask age is a lower bound taken from the gateway's first sighting, which is now shared across the gateway's readers. If the state cannot be observed, the field is `queued_behind: null` with `queue_state: "unavailable"`.
