@@ -178,6 +178,8 @@ const createAgent = config => {
   return ['quick-builder', 'builder', 'harness-router'].includes(agent) ? agent : undefined;
 };
 
+const CREATE_AGENT_WARMUP_DELAYS_MS = [250, 500, 1000];
+
 // Independently re-resolve the creation model immediately before POST, with the
 // same policy as managed_control.create_model: the target agent's native model
 // at this location, else the profile model; 'profile' forces the profile model.
@@ -188,8 +190,17 @@ async function expectedCreateModel(config, directory, endpoint, headers) {
   if (source !== 'agent_default') return undefined;
   const agent = createAgent(config);
   if (agent === undefined) return undefined;
-  const response = await fetch(new URL(`/api/agent/${agent}?` + new URLSearchParams({ 'location[directory]': directory }), endpoint.url),
-    { headers, redirect: 'manual', signal: AbortSignal.timeout(5000) });
+  const url = new URL(`/api/agent/${agent}?` + new URLSearchParams({ 'location[directory]': directory }), endpoint.url);
+  let response = await fetch(url, { headers, redirect: 'manual', signal: AbortSignal.timeout(5000) });
+  // A location OpenCode evicted (or restarted) since the Python-side lookup
+  // answers 404 until its agent registry reloads. Only that is retried,
+  // briefly; this runs before the POST is forwarded.
+  for (const delay of CREATE_AGENT_WARMUP_DELAYS_MS) {
+    if (response.status !== 404) break;
+    await response.body?.cancel();
+    await new Promise(resolve => setTimeout(resolve, delay));
+    response = await fetch(url, { headers, redirect: 'manual', signal: AbortSignal.timeout(5000) });
+  }
   if (!response.ok) { await response.body?.cancel(); return undefined; }
   const data = (await boundedJSON(response))?.data;
   if (!data || typeof data !== 'object' || data.id !== agent) return undefined;

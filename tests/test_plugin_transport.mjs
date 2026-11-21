@@ -112,7 +112,7 @@ test('managed create model is the target agent default, independently re-resolve
   const other = root + '/other'; await mkdir(other, { mode: 0o700 });
   const profileModel = { providerID: 'anthropic', id: 'claude-haiku-5-5', variant: 'default' };
   const opus = { providerID: 'anthropic', id: 'claude-opus-5-5', variant: 'high' };
-  let agentModel = opus, agentID = 'harness-router', agentStatus = 200, posts = 0, agentPermission;
+  let agentModel = opus, agentID = 'harness-router', agentStatus = 200, posts = 0, agentPermission, coldAgentReads = 0;
   const agentReads = [];
   const server = createServer(async (req, res) => {
     res.setHeader('content-type', 'application/json');
@@ -120,6 +120,7 @@ test('managed create model is the target agent default, independently re-resolve
     if (req.url === '/api/project') return res.end(JSON.stringify([{ id: 'current', canonical: directory }]));
     if (req.url.startsWith('/api/agent/')) {
       agentReads.push(req.url);
+      if (coldAgentReads > 0) { coldAgentReads--; res.statusCode = 404; return res.end(); }
       if (agentStatus !== 200) { res.statusCode = agentStatus; return res.end(); }
       return res.end(JSON.stringify({ location: { directory }, data: { id: agentID, ...(agentModel === undefined ? {} : { model: agentModel }),
         ...(agentPermission ? { permission: agentPermission } : {}) } }));
@@ -185,17 +186,21 @@ test('managed create model is the target agent default, independently re-resolve
     assert.equal(await post(profileModel), 2); assert.equal(posts, 0, 'profile pin no longer overrides agent model');
     assert.equal(await post(opus), 0); assert.equal(posts, 1);
     agentModel = { ...opus, variant: 'low' }; assert.equal(await post(opus), 2, 'agent model drift blocks POST'); agentModel = opus;
+    // r31: a location evicted between lookup and POST answers 404 until its
+    // registry reloads; the pre-POST re-read retries that briefly.
+    coldAgentReads = 2; assert.equal(await post(opus), 0, 'cold location re-read retried'); assert.equal(posts, 2); assert.equal(coldAgentReads, 0);
+    agentStatus = 500; let readsBefore = agentReads.length; assert.equal(await post(opus), 2); assert.equal(agentReads.length, readsBefore + 1, 'non-404 is not retried'); agentStatus = 200;
     agentStatus = 404; assert.equal(await post(opus), 2); assert.equal(await post(profileModel), 2, 'unavailable agent never falls back'); agentStatus = 200;
     agentID = 'other'; assert.equal(await post(opus), 2, 'foreign agent definition denied'); agentID = 'harness-router';
-    agentModel = undefined; assert.equal(await post(profileModel), 0, 'agent without model falls back to profile'); assert.equal(posts, 2);
+    agentModel = undefined; assert.equal(await post(profileModel), 0, 'agent without model falls back to profile'); assert.equal(posts, 3);
     agentModel = opus;
     await writeConfig({ managed_create_model: 'profile' });
     const before = agentReads.length;
-    assert.equal(await post(opus), 2); assert.equal(await post(profileModel), 0, 'explicit profile override'); assert.equal(posts, 3);
+    assert.equal(await post(opus), 2); assert.equal(await post(profileModel), 0, 'explicit profile override'); assert.equal(posts, 4);
     assert.equal(agentReads.length, before, 'profile override needs no agent read');
     await writeConfig({ managed_create_model: 'bogus' }); assert.equal(await post(profileModel), 2); assert.equal(await post(opus), 2);
     await writeConfig({ agent: '../session' }); assert.equal(await post(opus), 2);
-    assert.equal(posts, 3);
+    assert.equal(posts, 4);
     // A non-reserved create cannot read agent definitions.
     await writeConfig({});
     assert.equal((await invoke(agentGet(directory))).code, 2);

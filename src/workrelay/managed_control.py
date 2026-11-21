@@ -642,8 +642,11 @@ def anthropic_pins_configured(config):
             all(isinstance(value, str) and re.fullmatch(r'[0-9a-f]{64}', value) for value in pins.values()))
 
 
-# Seconds between native-404 agent lookups on a cold location; ~7.5s bound.
+# Seconds between native-404 agent lookups on a cold location (~7.5 s of
+# sleeps). The deadline bounds total retry time, including the guarded reads,
+# well inside the gateway's 60 s bridge kill.
 AGENT_WARMUP_DELAYS = (0.5, 1.0, 2.0, 4.0)
+AGENT_WARMUP_DEADLINE = 20.0
 
 
 def create_model(config, directory, get):
@@ -663,6 +666,7 @@ def create_model(config, directory, get):
     agent = config.get('agent', 'quick-builder')
     require(agent in CREATE_AGENTS, 'invalid attested create route')
     path = f'/api/agent/{agent}?' + urlencode({'location[directory]': directory})
+    started = time.monotonic()
     found = get(path)
     # A cold OpenCode location (first request for that directory since the
     # service started) answers the agent lookup with 404 before its config and
@@ -671,7 +675,7 @@ def create_model(config, directory, get):
     # any POST; get() re-checks authority each time. A 2xx with a foreign or
     # malformed definition is a verdict and is never retried.
     for delay in AGENT_WARMUP_DELAYS:
-        if found is not None:
+        if found is not None or time.monotonic() - started + delay > AGENT_WARMUP_DEADLINE:
             break
         time.sleep(delay)
         found = get(path)

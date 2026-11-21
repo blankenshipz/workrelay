@@ -5,6 +5,8 @@
 ## 0.4.2 - 2026-11-20
 
 - Fix: the first managed create (and so the first `workrelay_server_start`) for a project directory OpenCode had not touched since it started could fail with `UNEXPECTED_PREPOST`. On such a cold location OpenCode boots the location and answers the target agent lookup (`GET /api/agent/<agent>`) with 404 before its config and plugins have populated the agent registry. A native 404 on that lookup is now retried with bounded backoff (0.5, 1, 2, 4 s) before any POST, re-checking authority on each read. A 2xx with a foreign or malformed definition is still denied at once, and a persistent 404 still denies after the bound.
+  - Total retry time is capped by a 20 s monotonic deadline (including the guarded reads), well inside the gateway's 60 s bridge limit.
+  - The transport's independent re-resolution of the agent model just before the POST is forwarded also retries a native 404 briefly (0.25, 0.5, 1 s). That covers a location evicted between the lookup and the POST, which previously left the operation `uncertain`.
 
 ## 0.4.1 - 2026-11-20
 

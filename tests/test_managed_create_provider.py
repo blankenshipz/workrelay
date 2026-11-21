@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from workrelay.attestor import ANTHROPIC_PIN_PATHS
-from workrelay.cli import BridgeError, GuardFailure
+from workrelay.cli import BridgeError, GuardFailure, TransportFailure
 from workrelay import managed_control
 from workrelay.managed_control import AGENT_WARMUP_DELAYS, create_body, create_session, creation_session_id
 
@@ -92,6 +92,7 @@ class CreateModelResolutionTest(unittest.TestCase):
                       'model': copy.deepcopy(OPUS)}
         self.sessions = {}; self.calls = []
         self.answer_any_agent = False
+        self.agent_failure_after = None  # raise TransportFailure on this agent read number
         self.cold_agent_reads = 0  # native 404s before the location's agent registry loads
         sleeper = mock.patch.object(managed_control.time, 'sleep'); self.sleep = sleeper.start(); self.addCleanup(sleeper.stop)
 
@@ -102,9 +103,13 @@ class CreateModelResolutionTest(unittest.TestCase):
         self.calls.append((method, path, copy.deepcopy(body)))
         if path == '/api/project':
             return [{'id': 'project', 'canonical': str(self.workspace)}]
+        if method == 'GET' and path.startswith('/api/location?'):
+            return {'directory': str(self.workspace), 'project': {'id': 'project', 'canonical': str(self.workspace)}}
         if method == 'GET' and path.startswith('/api/agent/'):
             parts = urlsplit(path)
             self.assertEqual(parse_qs(parts.query), {'location[directory]': [str(self.workspace)]})
+            if self.agent_failure_after is not None and len(self.agent_reads()) >= self.agent_failure_after:
+                raise TransportFailure('guarded local service request unavailable', 'transport_timeout')
             if self.cold_agent_reads > 0:
                 self.cold_agent_reads -= 1
                 return None  # cold location: registry not yet populated (native 404)
@@ -207,6 +212,38 @@ class CreateModelResolutionTest(unittest.TestCase):
             create_session(self.db, self.config, self, authorize, 'authority', directory=str(self.workspace),
                            title='demo', project_id='project')
         self.assertEqual(self.posts(), [])
+        phase = self.db.execute("SELECT phase FROM managed_operations WHERE operation='authority'").fetchone()[0]
+        self.assertEqual(phase, 'denied')
+        reads = len(self.agent_reads())
+        # The post-read authority check aborts: no sleep follows the last read.
+        self.assertLess(reads, 1 + len(AGENT_WARMUP_DELAYS)); self.assertEqual(self.sleep.call_count, reads - 1)
+
+    def test_non_404_failure_during_cold_retry_denies_without_more_sleeps(self):
+        self.cold_agent_reads = 10; self.agent_failure_after = 3  # third read fails
+        self.assert_denied_without_post('transport-fails', TransportFailure)
+        self.assertEqual(len(self.agent_reads()), 3); self.assertEqual(self.sleep.call_count, 2)
+
+    def test_retry_stops_at_monotonic_deadline(self):
+        self.agent = None
+        # Clock by reads made: t=0 at start, t=5 after read 1, t=19.5 after read 2.
+        clock = lambda: (0.0, 5.0, 19.5)[min(len(self.agent_reads()), 2)]
+        with mock.patch.object(managed_control.time, 'monotonic', side_effect=clock):
+            self.assert_denied_without_post('deadline')
+        # After read 1: 5+0.5 <= 20, retry. After read 2: 19.5+1.0 > 20, stop.
+        self.assertEqual(len(self.agent_reads()), 2); self.assertEqual(self.sleep.call_count, 1)
+
+    def test_profile_policy_never_looks_up_or_sleeps(self):
+        self.config['managed_create_model'] = 'profile'; self.cold_agent_reads = 5
+        self.assertEqual(self.create('profile-cold')['phase'], 'created')
+        self.assertEqual(self.agent_reads(), []); self.sleep.assert_not_called()
+
+    def test_cold_retry_on_native_project_scope(self):
+        # Production (cli managed-control create) always passes the native-project authorizer.
+        self.cold_agent_reads = 3
+        result = create_session(self.db, self.config, self, self.authorize, 'native-cold', title='demo', project_id='project',
+                                authorize_native_projects=lambda: BINDING)
+        self.assertEqual(result['phase'], 'created'); self.assertEqual(len(self.posts()), 1)
+        self.assertEqual(len(self.agent_reads()), 4)
 
     def test_resolved_agent_model_gets_same_route_checks(self):
         for index, model in enumerate(({'providerID': 'other', 'id': 'x'}, {**OPUS, 'apiKey': 'k'},
