@@ -642,6 +642,10 @@ def anthropic_pins_configured(config):
             all(isinstance(value, str) and re.fullmatch(r'[0-9a-f]{64}', value) for value in pins.values()))
 
 
+# Seconds between native-404 agent lookups on a cold location; ~7.5s bound.
+AGENT_WARMUP_DELAYS = (0.5, 1.0, 2.0, 4.0)
+
+
 def create_model(config, directory, get):
     """Resolve the model stamped on a new managed session (no inference).
 
@@ -658,7 +662,19 @@ def create_model(config, directory, get):
         return config.get('model')
     agent = config.get('agent', 'quick-builder')
     require(agent in CREATE_AGENTS, 'invalid attested create route')
-    found = get(f'/api/agent/{agent}?' + urlencode({'location[directory]': directory}))
+    path = f'/api/agent/{agent}?' + urlencode({'location[directory]': directory})
+    found = get(path)
+    # A cold OpenCode location (first request for that directory since the
+    # service started) answers the agent lookup with 404 before its config and
+    # plugins have populated the agent registry (r31: 404 at +3 ms, registry
+    # ready ~600 ms later). Only a native 404 is retried, read-only and before
+    # any POST; get() re-checks authority each time. A 2xx with a foreign or
+    # malformed definition is a verdict and is never retried.
+    for delay in AGENT_WARMUP_DELAYS:
+        if found is not None:
+            break
+        time.sleep(delay)
+        found = get(path)
     data = found.get('data') if isinstance(found, dict) else None
     require(isinstance(data, dict) and data.get('id') == agent, 'target agent definition unavailable')
     return config.get('model') if data.get('model') is None else data['model']

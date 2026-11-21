@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.4.2 - 2026-11-20
+
+- Fix: the first managed create (and so the first `workrelay_server_start`) for a project directory OpenCode had not touched since it started could fail with `UNEXPECTED_PREPOST`. On such a cold location OpenCode boots the location and answers the target agent lookup (`GET /api/agent/<agent>`) with 404 before its config and plugins have populated the agent registry. A native 404 on that lookup is now retried with bounded backoff (0.5, 1, 2, 4 s) before any POST, re-checking authority on each read. A 2xx with a foreign or malformed definition is still denied at once, and a persistent 404 still denies after the bound.
+
 ## 0.4.1 - 2026-11-20
 
 - Fix: managed create failed with `UNEXPECTED_PREPOST` whenever the target agent definition was larger than 64 KiB (e.g. a harness profile with a large permission ruleset). The guarded transport exited before its stdout pipe drained, truncating the response at 65536 bytes. It now exits only after the write is flushed.

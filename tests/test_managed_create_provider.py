@@ -3,12 +3,14 @@ import hashlib
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from workrelay.attestor import ANTHROPIC_PIN_PATHS
 from workrelay.cli import BridgeError, GuardFailure
-from workrelay.managed_control import create_body, create_session, creation_session_id
+from workrelay import managed_control
+from workrelay.managed_control import AGENT_WARMUP_DELAYS, create_body, create_session, creation_session_id
 
 BINDING = 'a' * 64
 FULL_PINS = {'anthropic': {name: 'b' * 64 for name in ANTHROPIC_PIN_PATHS}}
@@ -89,6 +91,9 @@ class CreateModelResolutionTest(unittest.TestCase):
         self.agent = {'id': 'harness-router', 'name': 'harness-router', 'mode': 'primary', 'hidden': False,
                       'model': copy.deepcopy(OPUS)}
         self.sessions = {}; self.calls = []
+        self.answer_any_agent = False
+        self.cold_agent_reads = 0  # native 404s before the location's agent registry loads
+        sleeper = mock.patch.object(managed_control.time, 'sleep'); self.sleep = sleeper.start(); self.addCleanup(sleeper.stop)
 
     def authorize(self):
         return BINDING
@@ -100,7 +105,10 @@ class CreateModelResolutionTest(unittest.TestCase):
         if method == 'GET' and path.startswith('/api/agent/'):
             parts = urlsplit(path)
             self.assertEqual(parse_qs(parts.query), {'location[directory]': [str(self.workspace)]})
-            if self.agent is None or parts.path != '/api/agent/' + self.agent['id']:
+            if self.cold_agent_reads > 0:
+                self.cold_agent_reads -= 1
+                return None  # cold location: registry not yet populated (native 404)
+            if self.agent is None or (not self.answer_any_agent and parts.path != '/api/agent/' + self.agent['id']):
                 return None  # native 404
             return {'location': {'directory': str(self.workspace)}, 'data': copy.deepcopy(self.agent)}
         if method == 'GET':
@@ -162,6 +170,43 @@ class CreateModelResolutionTest(unittest.TestCase):
         self.assert_denied_without_post('missing')
         self.agent = {'id': 'harness-builder', 'model': copy.deepcopy(OPUS)}
         self.assert_denied_without_post('foreign')
+
+    def test_cold_location_agent_404_is_retried_before_post(self):
+        # r31: first request for a directory boots the location and answers the
+        # agent lookup 404 before plugins populate the registry.
+        self.cold_agent_reads = 2
+        result = self.create('cold')
+        self.assertEqual(result['phase'], 'created')
+        self.assertEqual(self.sessions[result['session_id']]['model'], OPUS)
+        self.assertEqual(len(self.agent_reads()), 3)
+        self.assertEqual(len(self.posts()), 1)
+        self.assertEqual([call.args[0] for call in self.sleep.call_args_list], list(AGENT_WARMUP_DELAYS[:2]))
+        # Exactly one session; a retry of the same operation returns the receipt.
+        self.assertEqual(self.create('cold'), result); self.assertEqual(len(self.posts()), 1)
+
+    def test_persistent_agent_404_denies_after_bounded_retries(self):
+        self.agent = None
+        self.assert_denied_without_post('gone')
+        self.assertEqual(len(self.agent_reads()), len(AGENT_WARMUP_DELAYS) + 1)
+        self.assertEqual(self.sleep.call_count, len(AGENT_WARMUP_DELAYS))
+
+    def test_foreign_agent_definition_is_not_retried(self):
+        self.agent = {'id': 'harness-builder', 'model': copy.deepcopy(OPUS)}
+        self.config['agent'] = 'harness-router'
+        self.answer_any_agent = True  # 2xx carrying a different definition
+        self.assert_denied_without_post('foreign-once')
+        self.sleep.assert_not_called()
+
+    def test_authority_change_during_cold_retry_aborts_without_post(self):
+        self.cold_agent_reads = 10
+        calls = {'n': 0}
+        def authorize():
+            calls['n'] += 1
+            return BINDING if calls['n'] < 8 else 'other-binding'
+        with self.assertRaises(BridgeError):
+            create_session(self.db, self.config, self, authorize, 'authority', directory=str(self.workspace),
+                           title='demo', project_id='project')
+        self.assertEqual(self.posts(), [])
 
     def test_resolved_agent_model_gets_same_route_checks(self):
         for index, model in enumerate(({'providerID': 'other', 'id': 'x'}, {**OPUS, 'apiKey': 'k'},
